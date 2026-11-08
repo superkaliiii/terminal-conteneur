@@ -157,6 +157,15 @@ class Keys(unittest.TestCase):
         with self.assertRaises(ValueError):
             ct.chord("ctrl+nope")
 
+    def test_viewer_keys_all_map_to_keysyms(self):
+        """Every key the terminal viewer can decode has an X keysym (else typing it in view would be lost)."""
+        names = set(ct.CSI_KEYS.values()) | set(ct.TILDE_KEYS.values()) | {"ret", "tab", "backspace", "esc"}
+        for n in names:
+            self.assertTrue(ct.chord(n), n)
+        events = ct.parse_input("a\x1b[1;5A\x03\x1b[<0;10;5M\x1d")
+        self.assertEqual(events, [("text", "a"), ("key", "ctrl+up"), ("key", "ctrl+c"), ("mouse", 0, 10, 5, True), ("quit",)])
+        self.assertEqual(ct.chord("ctrl+up"), [0xFFE3, 0xFF52])
+
     def test_png(self):
         data = ct.png(bytes([255, 0, 0] * 6), 3, 2)
         self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")

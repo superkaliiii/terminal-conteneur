@@ -4,8 +4,8 @@ Containers with a desktop and a shell, for people and computer-use agents. The c
 [terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm): same command and
 MCP shape, independent of it (each installs and works alone), and able to show its VMs when both are installed.
 
-Status: **phase 2a** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
-screen tools and a first MCP server. Terminal viewer, quota, networks, sandbox, orchestration (desired state,
+Status: **phase 2** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
+screen tools, terminal viewer and a first MCP server. Quota, networks, sandbox, orchestration (desired state,
 restarts, replicas) and dashboards (terminal and web) come next.
 
 ## Requirements
@@ -20,6 +20,8 @@ restarts, replicas) and dashboards (terminal and web) come next.
 | `create NAME [--image IMAGE] [--cpus N] [--memory GiB] [-- CMD...]` | create a container (default image `debian:stable-slim`, pulled if missing); a named volume keeps `/data` |
 | `create NAME --desktop [--image IMAGE] [--width 1280 --height 800]` | the same image with a desktop: Xvnc + Openbox + xterm added on top (built once per base, cached as `tct-desktop:<base>`) |
 | `action NAME screenshot\|click\|move\|drag\|scroll\|type\|key\|wait\|status ...` | drive the desktop, same arguments as terminal-vm (`screenshot --output`, `click X Y [--button] [--double]`, `drag X Y X2 Y2`, `scroll --dy N`, `type TEXT`, `key CHORD`, `wait --stable --timeout`) |
+| `view NAME [--read-only]` | the desktop inside the terminal, keyboard and mouse: Kitty graphics (Kitty, Ghostty, WezTerm) or Sixel (Windows Terminal, also from WSL; foot, mlterm); Ctrl+] exits, Ctrl+O opens the native window |
+| `show NAME` | native window: TigerVNC's viewer on the desktop's unix socket |
 | `mcp NAME` | stdio MCP server for one container: `screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `status`, `exec` (input tools take `screenshot: true`) |
 | `start NAME`, `stop NAME [--timeout 10]`, `rm NAME` | lifecycle; `rm` also deletes the `/data` volume |
 | `ls`, `status NAME` | JSON state of terminal-ct's containers |

@@ -13,13 +13,18 @@ labels; containers without them are never touched.
   exec NAME [--timeout 60] CMD...                     run a command, JSON reply (exit code, stdout, stderr)
   action NAME screenshot|click|move|drag|scroll|type|key|wait|status ...   desktop containers
   mcp NAME                                            stdio MCP server (screen tools + exec)
+  view NAME [--read-only]   terminal viewer: Kitty graphics or Sixel (Windows Terminal, foot); Ctrl+] exits
+  show NAME                 native window (TigerVNC viewer, through the desktop's unix socket)
   image ls | image pull REF | image build NAME DIR | image rm NAME
 Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if installed, else docker).
 """
-import argparse, base64, contextlib, io, json, os, re, shutil, socket, struct, subprocess, sys, time, zlib
+import argparse, base64, collections, contextlib, io, json, os, queue, re, shutil, socket, struct, \
+    subprocess, sys, threading, time, zlib
 
 VERSION = "0.2.0"
 WINDOWS = os.name == "nt"
+if not WINDOWS:
+    import fcntl, termios, tty  # terminal viewer only
 _DATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~")) if WINDOWS else \
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
 STORE = os.environ.get("TERMINAL_CT_HOME") or os.path.join(_DATA, "terminal-ct")
@@ -515,6 +520,372 @@ def _pixels(name):
         r.close()
 
 
+# ---------- interactive terminal viewer (from terminal-vm) ----------
+
+CSI_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end",
+            "P": "f1", "Q": "f2", "R": "f3", "S": "f4"}
+TILDE_KEYS = {"2": "insert", "3": "delete", "5": "pgup", "6": "pgdn", "15": "f5", "17": "f6", "18": "f7",
+              "19": "f8", "20": "f9", "21": "f10", "23": "f11", "24": "f12"}
+_MOUSE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+_CELL = re.compile(r"\x1b\[6;(\d+);(\d+)t")  # reply to CSI 16 t: cell height, width in pixels
+_CSI = re.compile(r"\x1b[\[O](\d*)(?:;(\d+))?([A-Za-z~])")
+
+
+def parse_input(data):
+    """Terminal bytes (decoded) -> events: ("text", s) ("key", chord) ("mouse", code, x, y, pressed) ("quit",) ("show",)."""
+    ev, i = [], 0
+    while i < len(data):
+        c = data[i]
+        if c == "\x1b":
+            m = _MOUSE.match(data, i)
+            if m:
+                ev.append(("mouse", int(m[1]), int(m[2]), int(m[3]), m[4] == "M")); i = m.end(); continue
+            m = _CELL.match(data, i)
+            if m:
+                ev.append(("cell", int(m[1]), int(m[2]))); i = m.end(); continue
+            m = _CSI.match(data, i)
+            if m:
+                num, mod, final = m.groups()
+                name = TILDE_KEYS.get(num) if final == "~" else CSI_KEYS.get(final)
+                if name:
+                    bits = int(mod) - 1 if mod else 0
+                    mods = [k for b, k in ((4, "ctrl"), (2, "alt"), (1, "shift")) if bits & b]
+                    ev.append(("key", "+".join(mods + [name])))
+                i = m.end(); continue
+            if i + 1 < len(data) and data[i + 1].isprintable():
+                ev.append(("key", "alt+" + data[i + 1])); i += 2; continue
+            ev.append(("key", "esc")); i += 1; continue
+        if c == "\x1d":
+            ev.append(("quit",))
+        elif c == "\x0f":
+            ev.append(("show",))
+        elif c in "\r\n":
+            ev.append(("key", "ret"))
+        elif c == "\t":
+            ev.append(("key", "tab"))
+        elif c in "\x7f\x08":
+            ev.append(("key", "backspace"))
+        elif ord(c) < 32:
+            ev.append(("key", "ctrl+" + chr(ord(c) + 96)))
+        elif ev and ev[-1][0] == "text":
+            ev[-1] = ("text", ev[-1][1] + c)
+        else:
+            ev.append(("text", c))
+        i += 1
+    return ev
+
+
+def graphics():
+    """Inline image protocol of this terminal, from its environment (no query round-trip): kitty, sixel or None.
+    WT_SESSION: Windows Terminal (Sixel since 1.22), also passed into WSL."""
+    e = os.environ
+    if "KITTY_WINDOW_ID" in e or e.get("TERM") == "xterm-kitty" or e.get("TERM_PROGRAM", "").lower() in ("ghostty", "wezterm"):
+        return "kitty"
+    if "WT_SESSION" in e or e.get("TERM") in ("foot", "foot-extra", "mlterm") or e.get("TERM_PROGRAM") == "mintty":
+        return "sixel"
+    return None
+
+
+def term_geometry(cell=(20, 10)):
+    """cols, rows, cell width and height in pixels. cell: (height, width) as the terminal answered CSI 16 t,
+    used when the tty gives no pixel size (Windows consoles, some terminals)."""
+    xp = yp = 0
+    try:
+        rows, cols, xp, yp = struct.unpack("HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b"\0" * 8))
+    except (OSError, NameError):  # NameError: no fcntl on Windows
+        cols, rows = shutil.get_terminal_size()
+    return cols, rows, (xp / cols if xp else cell[1]), (yp / rows if yp else cell[0])
+
+
+def fit(w, h, cols, rows, cw, ch):
+    """Cells used to show a w x h image in cols x (rows-1) cells, keeping its aspect ratio."""
+    scale = min(cols * cw / w, (rows - 1) * ch / h)
+    return max(1, int(w * scale / cw)), max(1, int(h * scale / ch))
+
+
+# 15-bit colour key, 5 bits per channel (4 bits banded smooth gradients): r << 10 | g << 5 | b, as two bytes
+_HI_R, _HI_G = bytes(v >> 3 << 2 for v in range(256)), bytes(v >> 6 for v in range(256))
+_LO_G, _LO_B = bytes((v >> 3 & 7) << 5 for v in range(256)), bytes(v >> 3 for v in range(256))
+_IS = [bytes(int(i == c) for i in range(256)) for c in range(256)]
+_RLE = re.compile(rb"(.)\1{3,}")
+
+
+def colour_keys(line):
+    """RGB bytes -> one 15-bit colour key per pixel, as a memoryview of ints (byte sums never carry)."""
+    n, keys = len(line) // 3, bytearray(2 * len(line) // 3)
+    r, g, b = line[0::3], line[1::3], line[2::3]
+    keys[1::2] = (int.from_bytes(r.translate(_HI_R), "big") + int.from_bytes(g.translate(_HI_G), "big")).to_bytes(n, "big")
+    keys[0::2] = (int.from_bytes(g.translate(_LO_G), "big") + int.from_bytes(b.translate(_LO_B), "big")).to_bytes(n, "big")
+    return memoryview(keys).cast("H")  # native order is little-endian on x86/ARM: low byte first
+
+
+def make_palette(rgb, w, h, size=255):
+    """The screen's most frequent colours (15-bit keys) and a key -> register table (255: not mapped yet).
+    An adaptive palette keeps interface colours nearly exact, where a fixed cube needed a grainy dither."""
+    counts = collections.Counter()
+    for y in range(0, h, 2):  # every other row ranks the colours just as well, in half the time
+        counts.update(colour_keys(rgb[y * w * 3:(y + 1) * w * 3]))
+    keys = [k for k, _ in counts.most_common(size)]
+    lut = bytearray(b"\xff" * 32768)
+    for i, k in enumerate(keys):
+        lut[k] = i
+    return keys, lut, {}
+
+
+def _nearest(palette, k):
+    """Nearest register to colour key k. Smoothing small text brings thousands of in-between shades per new
+    screen: the palette's components are unpacked once (cells[None]) and the search is a flat min over tuples
+    (~45 us), which a per-shade lambda made 20 times slower."""
+    keys, _, cells = palette
+    if None not in cells:
+        cells[None] = [(i, q >> 10, q >> 5 & 31, q & 31) for i, q in enumerate(keys)]
+    r, g, b = k >> 10, k >> 5 & 31, k & 31
+    return min(((r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2, i) for i, pr, pg, pb in cells[None])[1]
+
+
+_HALF = bytes(v >> 1 for v in range(256))
+
+
+def _blend(a, b):
+    """Byte-wise average of two equal-length byte strings (halves summed as big integers: no carry)."""
+    return (int.from_bytes(a.translate(_HALF), "big") + int.from_bytes(b.translate(_HALF), "big")).to_bytes(len(a), "big")
+
+
+def sixel_rows(rgb, w, h, W, H, palette, old=None, prev=None):
+    """RGB bytes (w x h) -> W x H rows of palette registers. Shrinking averages each pixel with its right and lower
+    neighbours first, so 1-pixel strokes of small text soften instead of vanishing with the skipped columns; growing
+    is nearest-neighbour. No per-pixel Python loop except map(): bytes.translate and big-integer sums work on whole
+    rows. prev: the rows this returned for the frame old (same sizes): rows whose source lines did not change are
+    reused, so a moving pointer costs a few lines, not a frame. Colours missing from the palette get their nearest
+    register."""
+    lut = palette[1]
+    xs, rows, cache, row_len = [x * w // W for x in range(W)], [], {}, w * 3
+    taps = 2 if H < h else 1  # source lines behind one output line
+
+    def source(y):
+        line = rgb[y * row_len:(y + 1) * row_len]
+        return _blend(line, line[3:] + line[-3:]) if W < w else line
+    for Y, y in enumerate(y * h // H for y in range(H)):
+        span = slice(y * row_len, min(y + taps, h) * row_len)
+        if prev and old[span] == rgb[span]:
+            rows.append(prev[Y]); continue
+        if y not in cache:
+            line = source(y) if taps == 1 or y + 1 >= h else _blend(source(y), source(y + 1))
+            mv = colour_keys(line)
+            vals = mv if W == w else map(mv.__getitem__, xs)
+            row = bytes(map(lut.__getitem__, vals))
+            if 255 in row:  # colours not in the palette yet: map them, then this row again
+                vals = mv if W == w else list(map(mv.__getitem__, xs))
+                for k in set(vals):
+                    if lut[k] == 255:
+                        lut[k] = _nearest(palette, k)
+                row = bytes(map(lut.__getitem__, vals))
+            cache[y] = row
+        rows.append(cache[y])
+    return rows
+
+
+def changed(old, new, gap=20):
+    """Boxes (x0, y0, x1, y1) around the bytes that differ between two equal-sized row lists: one per run of
+    changed rows (runs closer than gap rows merge), so a pointer that jumped redraws two small boxes, not one big."""
+    ys = [y for y, (a, b) in enumerate(zip(old, new)) if a != b]
+    runs = []
+    for y in ys:
+        if runs and y - runs[-1][-1] <= gap:
+            runs[-1].append(y)
+        else:
+            runs.append([y])
+    boxes, n = [], len(new[0])
+    for run in runs:
+        x0, x1 = n, 0
+        for y in run:  # xor of the rows as big integers: lowest and highest differing byte, no per-byte loop
+            d = int.from_bytes(old[y], "big") ^ int.from_bytes(new[y], "big")
+            x0, x1 = min(x0, n - 1 - (d.bit_length() - 1) // 8), max(x1, n - ((d & -d).bit_length() - 1) // 8)
+        boxes.append((x0, run[0], x1, run[-1] + 1))
+    return boxes
+
+
+def sixel(rows, keys):
+    """Rows of palette registers, all the same length -> DEC Sixel image; keys: the palette's 15-bit colours."""
+    n = len(rows[0])
+    out = [b'\x1bPq"1;1;%d;%d' % (n, len(rows))]
+    pct = lambda v: round(v * 100 / 31)
+    out += [b"#%d;2;%d;%d;%d" % (i, pct(keys[i] >> 10), pct(keys[i] >> 5 & 31), pct(keys[i] & 31))
+            for i in sorted(set(b"".join(rows)))]  # only the registers this image uses
+    offset = int.from_bytes(b"?" * n, "big")  # sixel characters start at '?' (63)
+    for y in range(0, len(rows), 6):
+        band, layers = rows[y:y + 6], []
+        for c in set(b"".join(band)):  # colours present in this band
+            bits = sum(int.from_bytes(r.translate(_IS[c]), "big") << k for k, r in enumerate(band)) + offset
+            layers.append(b"#%d" % c + _RLE.sub(lambda m: b"!%d%c" % (len(m[0]), m[1][0]), bits.to_bytes(n, "big")))
+        out.append(b"$".join(layers) + b"-")
+    return b"".join(out) + b"\x1b\\"
+
+
+def raw_terminal():
+    """Raw keyboard and mouse input; returns the function that restores the terminal."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    return lambda: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def show(name):
+    """Native window: TigerVNC's viewer opens the desktop's unix socket directly."""
+    viewer = shutil.which("vncviewer") or shutil.which("xtigervncviewer")
+    if not viewer:
+        raise SystemExit("no VNC viewer: install TigerVNC's (Debian: sudo apt install tigervnc-viewer)")
+    desktop(name).close()  # running, with a desktop
+    subprocess.Popen([viewer, os.path.join(STORE, name, "run", "vnc.sock")], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    print(json.dumps({"shown": name}))
+
+
+def view(name, fps=30, read_only=False):
+    """Interactive terminal viewer (adapted from terminal-vm): Kitty graphics or Sixel, keyboard and mouse.
+    Ctrl+] exits, Ctrl+O opens the native window."""
+    proto = graphics()
+    if not proto:
+        print("This terminal shows no inline images (Kitty or Sixel); opening the native window instead.", file=sys.stderr)
+        return show(name)
+    r, out = desktop(name), sys.stdout.buffer  # its own connection: agents keep working while someone watches
+    restore = raw_terminal()
+    keys = queue.Queue()
+
+    def reader():
+        while True:
+            chunk = os.read(sys.stdin.fileno(), 65536)
+            keys.put(chunk)
+            if not chunk:
+                return
+    threading.Thread(target=reader, daemon=True).start()
+    # alt screen, hide cursor, all mouse motion as SGR (in pixels where the terminal can), ask the cell size in pixels
+    out.write(b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h" + (b"\x1b[?1016h" if proto == "kitty" else b"") + b"\x1b[16t")
+    last, geom, cell, shown, prev_rgb = None, None, (20, 10), None, b""
+    stale, mapped0 = False, 0
+    active = time.monotonic()  # last screen change or input: capture at fps for 2 s after it, at 5 Hz when idle
+    try:
+        while True:
+            try:
+                r.refresh()
+            except (OSError, RuntimeError):  # desktop restarted or stopped: reconnect while it runs
+                r.close()
+                try:
+                    r = desktop(name)
+                except (RuntimeError, SystemExit):
+                    return
+                continue
+            w, h, rgb = r.w, r.h, r.rgb()
+            data = png(rgb, w, h) if proto == "kitty" else rgb
+            g = term_geometry(cell)
+            if data != last or g != geom:
+                active = time.monotonic()
+                cols, rows, cw, ch = g
+                if g != geom:  # a fresh alternate screen: ED 2 leaves Sixel images behind in Windows Terminal
+                    out.write(b"\x1b[?1049l\x1b[?1049h\x1b[2J")
+                    shown = None
+                last, geom = data, g
+                if proto == "kitty":
+                    cu, ru = fit(w, h, cols, rows, cw, ch)
+                    dw, dh = cu * cw, ru * ch
+                    ox, oy = (cols - cu) // 2, (rows - 1 - ru) // 2
+                    b64 = base64.standard_b64encode(data)
+                    out.write(b"\x1b[%d;%dH" % (oy + 1, ox + 1))
+                    for i in range(0, len(b64), 4096):
+                        head = b"a=T,f=100,i=1,c=%d,r=%d,C=1,q=2," % (cu, ru) if i == 0 else b""
+                        out.write(b"\x1b_G%sm=%d;%s\x1b\\" % (head, i + 4096 < len(b64), b64[i:i + 4096]))
+                else:  # Sixel has no scaling: scale here to fill the window above the status line
+                    # shortcut: at most 2x up, the cost grows with the output; raise it for very large windows
+                    scale = min(cols * cw / w, (rows - 1) * ch / h, 2)
+                    dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
+                    ox, oy = int((cols * cw - dw) / 2 // cw), int(((rows - 1) * ch - dh) / 2 // ch)
+                    same = shown is not None and len(prev_rgb) == len(data)
+                    if not same:  # palette built at start and on resize only
+                        palette = make_palette(data, w, h)
+                    frame = sixel_rows(data, w, h, dw, dh, palette, prev_rgb, shown) if same else sixel_rows(data, w, h, dw, dh, palette)
+                    prev_rgb = data
+                    mapped = len(palette[1]) - palette[1].count(255)
+                    if not same:
+                        mapped0 = mapped
+                    stale = mapped - mapped0 > 400
+                    boxes = [(0, 0, dw, dh)] if shown is None or cw % 1 or ch % 1 else changed(shown, frame, int(ch))
+                    for box in boxes:  # redraw only the cells that changed
+                        cw_, ch_ = int(cw), int(ch)
+                        x0, y0 = box[0] // cw_ * cw_, box[1] // ch_ * ch_
+                        y1 = min(dh, y0 + -(-(box[3] - y0) // 6) * 6)
+                        out.write(b"\x1b[%d;%dH" % (oy + y0 // ch_ + 1, ox + x0 // cw_ + 1))
+                        out.write(sixel([row[x0:box[2]] for row in frame[y0:y1]], palette[0]))
+                    shown = frame
+                out.write(f"\x1b[{rows};1H\x1b[2K\x1b[2m {name} · {w}x{h} · Ctrl+] exit · Ctrl+O window\x1b[0m".encode())
+                out.flush()
+            try:
+                chunk = keys.get(timeout=1 / fps if time.monotonic() - active < 2 else 0.2)
+                active = time.monotonic()
+                while not keys.empty() and chunk:
+                    chunk += keys.get_nowait()
+            except queue.Empty:
+                if stale and time.monotonic() - active > 2:
+                    last = shown = None
+                    stale = False
+                continue
+            if not chunk:
+                return
+            events = parse_input(chunk.decode("utf-8", "replace"))
+            motion = lambda e: e[0] == "mouse" and e[1] & 32 and e[1] & 3 == 3
+            for i, e in enumerate(events):
+                if e[0] == "quit":
+                    return
+                if e[0] == "cell":
+                    cell = e[1:]
+                elif e[0] == "show":
+                    try:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            show(name)
+                    except SystemExit as err:
+                        out.write(f"\x1b[{rows};1H\x1b[2K\x1b[33m {err}\x1b[0m".encode()); out.flush()
+                elif read_only:
+                    continue
+                elif e[0] == "text":
+                    for c in e[1]:
+                        if c.isprintable():
+                            k = char_keysym(c); r.key(k, True); r.key(k, False)
+                elif e[0] == "key":
+                    try:
+                        ks = chord(e[1])
+                    except ValueError:
+                        continue
+                    for k in ks:
+                        r.key(k, True)
+                    for k in reversed(ks):
+                        r.key(k, False)
+                elif e[0] == "mouse":
+                    if motion(e) and i + 1 < len(events) and motion(events[i + 1]):
+                        continue  # only the latest of a run of moves
+                    code, px, py, pressed = e[1:]
+                    if proto == "sixel":  # 1-based cells
+                        px, py = (px - 0.5) * cw, (py - 0.5) * ch
+                    x, y = (px - ox * cw) * w / dw, (py - oy * ch) * h / dh
+                    if not (0 <= x < w and 0 <= y < h):
+                        continue
+                    if code & 64:  # wheel: buttons 4 (up) and 5 (down)
+                        b = 8 if code & 1 == 0 else 16
+                        r.pointer(x, y, r.mask | b); r.pointer(x, y, r.mask & ~b)
+                    elif code & 32 or code & 3 == 3:
+                        r.pointer(x, y)  # motion keeps the buttons held
+                    else:
+                        b = (1, 2, 4)[code & 3]
+                        r.pointer(x, y, (r.mask | b) if pressed else (r.mask & ~b))
+    finally:
+        try:
+            r.pointer(getattr(r, "x", 0), getattr(r, "y", 0), 0)  # release held buttons
+        except OSError:
+            pass
+        r.close()
+        out.write((b"\x1b_Ga=d,i=1\x1b\\" if proto == "kitty" else b"") + b"\x1b[?1016l\x1b[?1006l\x1b[?1003l\x1b[?25h\x1b[?1049l")
+        out.flush()
+        restore()
+
+
 # ---------- MCP (stdio JSON-RPC) ----------
 
 def _schema(props, required=()):
@@ -628,6 +999,8 @@ def main(argv=None):
     a.add_argument("--x", type=float); a.add_argument("--y", type=float)
     a.add_argument("--timeout", type=float, default=30); a.add_argument("--stable", type=float, default=1)
     sub.add_parser("mcp").add_argument("name")
+    for n in ("view", "show"):
+        v = sub.add_parser(n); v.add_argument("name"); v.add_argument("--read-only", action="store_true")
     for n in ("start", "rm", "status"):
         sub.add_parser(n).add_argument("name")
     s = sub.add_parser("stop"); s.add_argument("name"); s.add_argument("--timeout", type=int, default=10)
@@ -648,6 +1021,11 @@ def main(argv=None):
     if o.cmd == "create":
         return create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width, height=o.height)
     if o.cmd == "mcp": return mcp(o.name)
+    if o.cmd == "show": return show(o.name)
+    if o.cmd == "view":
+        if WINDOWS:
+            raise SystemExit("view runs on a Linux host or in WSL (Windows Terminal shows it there through Sixel)")
+        return view(o.name, read_only=o.read_only)
     if o.cmd == "action":
         try:
             nums = [float(v) for v in o.args] if o.tool in ("click", "move", "drag") else []
