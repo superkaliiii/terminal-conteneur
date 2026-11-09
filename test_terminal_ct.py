@@ -16,6 +16,9 @@ class FakeNode(ct.Node):
             "alpine:3.20": {"Config": {"Cmd": ["/bin/sh"]}},
             "nginx": {"Config": {"Entrypoint": ["/docker-entrypoint.sh"], "Cmd": ["nginx", "-g", "daemon off;"]}}}
 
+    def host(self):  # fixed: on Linux the real one reads this machine (a 4-core CI runner: quota of 3 CPUs)
+        return 8, 16.0, ct.STORE if os.path.isdir(ct.STORE) else os.path.dirname(ct.STORE)
+
     def pipe(self, args, stdin=None, stdout=None):
         self.calls.append(["pipe", *args])
         if stdout:
