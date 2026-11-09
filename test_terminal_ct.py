@@ -59,6 +59,8 @@ class FakeNode(ct.Node):
             self.objects.pop(args[-1], None)
         elif args[0] == "exec":
             out, code = "hi\n", getattr(self, "exec_code", 0)
+        elif args[0] == "logs":
+            out = "".join(f"line {i}\n" for i in range(int(args[args.index("--tail") + 1])))
         elif args[0] == "stats":
             out = "\n".join(f"{n}|12.5%|512MiB / 1GiB|7" for n in args[4:])
         elif args[:2] == ["network", "create"]:
@@ -542,6 +544,54 @@ class Orchestration(unittest.TestCase):
         self.assertEqual(out["resumed"][-1], {"daemon": "test"})
 
 
+class Dashboard(unittest.TestCase):
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
+        self.p = unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test")
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_data_and_text(self):
+        ct.apply({"stack": "lab", "services": {"web": {"image": "alpine:3.20", "replicas": 2,
+                                                       "health": {"exec": "true"}}}})
+        quiet(ct.create, "solo", sandbox=True, project="other")
+        d = ct.dashboard_data()
+        web = next(r for r in d["rows"] if r["name"] == "lab-web-1")
+        self.assertEqual((web["status"], web["health"], web["stack"], web["cpu_percent"], web["used_memory_gb"]),
+                         ("running", "ok", "lab/web/1", 12.5, 0.5))
+        self.assertEqual(next(r for r in d["rows"] if r["name"] == "solo")["flags"], "S")
+        text = ct.dashboard_text(d, 160)
+        self.assertIn("lab-web-2", text); self.assertIn("events", text); self.assertNotIn("\x1b[", text)
+        colour = ct.dashboard_text(d, 160, selected=0, ansi=True, message="done")
+        self.assertIn("\x1b[32m", colour); self.assertIn("q quit", colour); self.assertTrue(colour.endswith("done"))
+        self.assertTrue(all(len(l) <= 60 for l in ct.dashboard_text(d, 60).splitlines()))   # fits the width
+        scoped = ct.dashboard_data("other")
+        self.assertEqual([r["name"] for r in scoped["rows"]], ["solo"])
+        self.assertEqual((scoped["quota"]["cpus"]["used"], scoped["quota"]["disk_gb"]["used"]), (0, "-"))  # its own
+
+    def test_tall_lists_fit_the_screen(self):
+        for i in range(30):
+            quiet(ct.create, f"c{i:02}")
+        d = ct.dashboard_data()
+        text = ct.dashboard_text(d, 150, selected=25, ansi=True, height=24)
+        self.assertLessEqual(len(text.splitlines()), 24)
+        self.assertIn("c25", text); self.assertNotIn("c00", text)                       # scrolled to the selection
+
+    def test_mcp_dashboard_and_logs(self):
+        quiet(ct.create, "mine")
+        ct.agent_call("ct_create", {"name": "job"}, lambda m, c: None, project="p")
+        text = ct.agent_call("dashboard", {}, lambda m, c: None, project="p")
+        self.assertIn("job", text); self.assertNotIn("mine", text)                       # its project only
+        self.assertEqual(ct.agent_call("ct_logs", {"name": "job", "n": 3}, None, project="p"), "line 0\nline 1\nline 2\n")
+        with self.assertRaisesRegex(RuntimeError, "terminal-ct logs mine"):                # the user's: asked
+            ct.agent_call("ct_logs", {"name": "mine"}, lambda m, c: (_ for _ in ()).throw(RuntimeError(c)))
+        self.assertEqual(ct._age(None), "-"); self.assertEqual([ct._age(s) for s in (5, 300, 7300, 200000)],
+                                                               ["5s", "5m", "2h", "2d"])
+
+
 class SnapshotsAndClones(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
@@ -794,7 +844,7 @@ class Desktop(unittest.TestCase):
                              "terminal-ct.desktop=1", f"{os.path.join(self.tmp, 'd', 'run')}:/run/tct"):
                     self.assertIn(want, joined)
                 self.assertEqual(args[-4], "tct-desktop:alpine-3.20")
-                self.assertEqual(args[-3:-1], ["sh", "-c"]); self.assertTrue(args[-1].endswith("exec " + ct.DESKTOP_ENTRY))
+                self.assertEqual(args[-3:-1], ["sh", "-c"]); self.assertIn("xterm -maximized", args[-1])
                 if engine == "podman":
                     self.assertIn("--userns=keep-id", args); self.assertIn("tct-d-data:/data:U", args)
                 else:  # docker: the volume is handed to the user before the desktop runs as them

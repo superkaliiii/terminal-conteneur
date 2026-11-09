@@ -25,6 +25,7 @@ labels; containers without them are never touched.
   resume [--stay]  |  autostart [on|off]     start again what was running before a restart; at each logon
   apply FILE [--project P] | scale STACK SERVICE N | stack ls|show|rm [STACK] | events [--stack S] [-n 50] [--follow]
   daemon run|start|stop|status | prune      desired state kept by the daemon (restarts, health, ttl); stale images
+  dash [--project P]  |  logs NAME [-n 100]    live dashboard (keys: s start, t stop, r rm, +/- scale, l logs, v view)
   snapshot NAME save|load|rm TAG | snapshot NAME ls     file system + /data (load: stopped container)
   clone SRC NEW [--project P]                          NEW from SRC as it is (files and a copy of /data)
   push NAME LOCAL PATH | pull NAME PATH LOCAL          copy files in or out
@@ -36,7 +37,7 @@ Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if inst
 import argparse, base64, calendar, collections, contextlib, hashlib, io, json, os, queue, re, secrets, shlex, shutil, socket, struct, \
     subprocess, sys, threading, time, zlib
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 WINDOWS = os.name == "nt"
 if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
@@ -329,9 +330,7 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
         # LANG: without UTF-8, xterm wrote é as Latin-1
         extra += ["-e", "LANG=C.UTF-8", "-e", f"TCT_WIDTH={spec['width']}", "-e", f"TCT_HEIGHT={spec['height']}",
                   "-v", f"{os.path.join(ct_dir(name), 'run')}:/run/tct"]
-        # X locks left in a file system committed while the desktop ran (snapshot, clone): their PID is alive again
-        # in the new container (same small numbers), and Xvnc refused to start
-        cmd = ["sh", "-c", f"rm -f /tmp/.X0-lock /tmp/.X11-unix/X0; exec {DESKTOP_ENTRY}"]
+        cmd = ["sh", "-c", DESKTOP_RUN]
     else:
         entry, default = image_cmd(image)
         # a bare shell as the main process exits at once without a terminal: keep such containers alive instead
@@ -446,16 +445,21 @@ def remake(name, info, keep=False, **change):
 # ---------- desktop image ----------
 DESKTOP_ENTRY = "/usr/local/bin/tct-desktop"
 # Xvnc listens only on a unix socket in a host folder only the user can open: no TCP port, no password to keep.
-ENTRY_SCRIPT = """#!/bin/sh
-rm -f /run/tct/vnc.sock
+# The desktop: given to each container as its command (sh -c), so a change here reaches new and remade containers
+# without rebuilding the cached images (whose /usr/local/bin/tct-desktop holds the first version).
+DESKTOP_RUN = """rm -f /run/tct/vnc.sock /tmp/.X0-lock /tmp/.X11-unix/X0
 Xvnc :0 -geometry "${TCT_WIDTH:-1280}x${TCT_HEIGHT:-800}" -depth 24 -rfbport -1 -rfbunixpath /run/tct/vnc.sock \\
      -SecurityTypes None -AlwaysShared -desktop "$(hostname)" &
 export DISPLAY=:0
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -S /tmp/.X11-unix/X0 ] && break; sleep 0.2; done
-openbox --startup xterm &  # started together, xterm's window stayed unmanaged (not drawn) until a click
+openbox --startup 'xterm -maximized' &  # filling the screen, also after the viewer resizes it
 trap 'trap "" TERM INT; kill 0 2>/dev/null; wait; exit 0' TERM INT  # a requested stop exits 0, not as a crash
 wait
 """
+# (X locks removed first: a file system committed while the desktop ran (snapshot, clone) kept them, their PID was
+# alive again in the new container, and Xvnc refused to start. openbox and xterm started together left xterm's
+# window unmanaged, not drawn until a click: hence --startup.)
+ENTRY_SCRIPT = "#!/bin/sh\n" + DESKTOP_RUN
 DESKTOP_PACKAGES = {  # family: install command (Xvnc, Openbox, a terminal, a font)
     "debian": "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
               "tigervnc-standalone-server openbox xterm fonts-dejavu-core && rm -rf /var/lib/apt/lists/*",
@@ -762,9 +766,8 @@ def resources(name, cpus=None, memory=None, lock=True):
     return {"name": name, "status": c["status"], "cpus": c["cpus"], "memory_gb": c["memory_gb"]}
 
 
-def top():
-    """Real use of each running container (CPU % of one core, memory, processes) next to its ceiling, and the quota."""
-    infos = [c for c in raw_containers() if running(c)]
+def _stats(infos):
+    """{engine name: cpu_percent, used_memory_gb, pids} of running containers, from one `stats` call."""
     stats = {}
     if infos:
         out = node().run(["stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}",
@@ -775,6 +778,13 @@ def top():
                 stats[p[0].strip()] = {"cpu_percent": float(p[1].strip().rstrip("%") or 0),
                                        "used_memory_gb": round(parse_size(p[2].split("/")[0]) / 2 ** 30, 3),
                                        "pids": int(p[3]) if p[3].strip().isdigit() else None}
+    return stats
+
+
+def top():
+    """Real use of each running container (CPU % of one core, memory, processes) next to its ceiling, and the quota."""
+    infos = [c for c in raw_containers() if running(c)]
+    stats = _stats(infos)
     rows = []
     for c in infos:
         n = normalize(c)
@@ -1500,6 +1510,12 @@ def daemon(cmd="status"):
     if cmd == "start":
         if daemon_alive():
             return "running"
+        # a daemon asked to stop may still end its pass with the lock held: wait for it, or the new one would sit on
+        # the lock without a beat, and look stopped
+        for _ in range(120):  # only while one is ending (its stop file there): a crashed one's lock goes stale
+            if not (os.path.isdir(os.path.join(STORE, ".daemon.lock")) and os.path.exists(_daemon_file("stop"))):
+                break
+            time.sleep(0.5)
         with contextlib.suppress(OSError):
             os.remove(_daemon_file("stop"))
         os.makedirs(STORE, exist_ok=True)
@@ -1522,7 +1538,10 @@ def daemon(cmd="status"):
 
         def beat():  # its own thread: a long pass (a desktop image build) must not make the daemon look dead
             while True:
-                _write_atomic(_daemon_file("beat"), f"{time.time()} {os.getpid()}")
+                try:
+                    _write_atomic(_daemon_file("beat"), f"{time.time()} {os.getpid()}")
+                except OSError as e:  # never let the beat die while the daemon works: it would look stopped
+                    print(f"{time.strftime('%H:%M:%S')} beat: {e}", file=sys.stderr, flush=True)
                 time.sleep(TICK)
         threading.Thread(target=beat, daemon=True).start()
         event("daemon_started", detail=f"pid {os.getpid()}")
@@ -1540,6 +1559,260 @@ def daemon(cmd="status"):
             os.remove(_daemon_file("stop"))
             os.remove(_daemon_file("beat"))
         event("daemon_stopped")
+
+
+# ---------- dashboards: the terminal one (dash) and its text for agents (MCP dashboard) ----------
+
+def logs(name, n=100):
+    """The container's last N lines of output (stdout and stderr)."""
+    find(name)
+    r = node().run(["logs", "--tail", str(max(1, min(int(n), 10000))), PREFIX + name], check=False)
+    return (r.stdout or "") + (r.stderr or "")
+
+
+def _age(sec):
+    if sec is None:
+        return "-"
+    sec = max(0, int(sec))
+    return f"{sec}s" if sec < 120 else f"{sec // 60}m" if sec < 7200 else f"{sec // 3600}h" if sec < 172800 else f"{sec // 86400}d"
+
+
+def dashboard_data(project=None, with_quota=True):
+    """Everything the dashboards show: each container (state, health, stack and replica, CPU and memory used next
+    to its ceiling, age, restarts, flags), the daemon, the quota (an agent's project: its use and the room left),
+    the latest events."""
+    infos = [c for c in raw_containers() if under(labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT, project)]
+    stats = _stats([c for c in infos if running(c)])
+    st, now = _state(), time.time()  # read only: a snapshot of the reconciler's memory
+    services = {}
+    for sname in stacks():
+        with contextlib.suppress(SystemExit):
+            services[sname] = load_stack(sname)["services"]
+    rows = []
+    for c in infos:
+        n, lab = normalize(c), labels_of(c)
+        mem = st.get(n["name"], {})
+        svc = services.get(lab.get(f"{LABEL}.stack"), {}).get(lab.get(f"{LABEL}.service")) or {}
+        health = ("unhealthy" if mem.get("unhealthy") else f"failing {mem['health_fails']}" if mem.get("health_fails")
+                  else "ok" if svc.get("health") and running(c) else "-")
+        s_ = stats.get(c.get("Name", "").lstrip("/"), {})
+        rows.append({"name": n["name"], "status": n["status"], "health": health, "project": n["project"],
+                     "stack": "/".join(lab.get(f"{LABEL}.{k}", "") for k in ("stack", "service", "replica"))
+                     if lab.get(f"{LABEL}.stack") else "",
+                     "cpu_percent": s_.get("cpu_percent"), "cpus": n["cpus"], "used_memory_gb": s_.get("used_memory_gb"),
+                     "memory_gb": n["memory_gb"], "age": now - _started(c) if running(c) and _started(c) else None,
+                     "restarts": mem.get("restarts", 0),
+                     "flags": "".join(f for f, on in (("D", n.get("desktop")), ("S", n.get("sandbox")),
+                                                      ("I", n["internet"]), ("A", n["created_by"] == "agent")) if on)})
+    q = None
+    if with_quota:
+        q = quota()
+        if project:  # its own use, and what is left all told
+            use = {"cpus": 0, "memory_gb": 0, "containers": 0}
+            for c in infos:
+                if running(c):
+                    cpus, m = allotted(c)
+                    use["cpus"] += cpus; use["memory_gb"] += m; use["containers"] += 1
+            q = {k: {"limit": v["limit"], "free": v["free"], "used": round(use[k], 1) if k in use else "-"}
+                 for k, v in q.items()}
+    return {"engine": node().engine, "daemon": daemon_alive(), "project": project, "rows": sorted(rows, key=lambda r: r["name"]),
+            "quota": q, "events": events(n=8, project=project)}
+
+
+_COLOURS = {"running": "32", "created": "33", "paused": "33", "exited": "31", "unhealthy": "31", "ok": "32"}
+
+
+def dashboard_text(d, width=120, selected=None, ansi=False, message="", height=None):
+    """The dashboard as text: plain for agents, with colours and a selection for the terminal. height: the rows
+    shown are cut to fit, scrolled to keep the selection in view."""
+    col = (lambda s, c: f"\x1b[{c}m{s}\x1b[0m" if c else s) if ansi else (lambda s, c: s)
+    out = []
+    q = d.get("quota") or {}
+    quota_s = "  ".join(f"{k.replace('_gb', '')} {v['used'] if 'used' in v else '?'}/{v['limit']}" for k, v in q.items())
+    top_line = (f"terminal-ct {VERSION}  {d['engine']}  daemon {'running' if d['daemon'] else 'stopped'}"
+                + (f"  project {d['project']}" if d.get("project") else "") + (f"  quota {quota_s}" if quota_s else ""))
+    out.append(col(top_line[:width], "1"))
+    head = f"  {'NAME':<22} {'STATUS':<8} {'HEALTH':<10} {'STACK':<18} {'CPU%':>6} {'CPUS':>5} {'MEM GiB':>11} {'AGE':>5} {'RST':>3} {'FLAGS':<5} PROJECT"
+    out.append(col(head[:width], "7" if ansi else None))
+    rows = list(enumerate(d["rows"]))
+    if height:  # header 2, events title + 8, footer 3
+        room = max(3, height - 2 - 2 - len(d["events"]) - (4 if ansi else 0))
+        if len(rows) > room:
+            first = max(0, min((selected or 0) - room // 2, len(rows) - room))
+            rows = rows[first:first + room]
+    for i, r in rows:
+        mem = f"{r['used_memory_gb'] if r['used_memory_gb'] is not None else '-'}/{r['memory_gb']}"
+        cpu = "-" if r["cpu_percent"] is None else f"{r['cpu_percent']:.1f}"
+        line = (f"{'>' if i == selected else ' '} {r['name'][:22]:<22} {r['status'][:8]:<8} {r['health'][:10]:<10} "
+                f"{r['stack'][:18]:<18} {cpu:>6} {str(r['cpus'])[:5]:>5} {mem[:11]:>11} {_age(r['age']):>5} "
+                f"{r['restarts']:>3} {r['flags']:<5} {r['project']}")[:width]
+        if ansi:
+            line = line.replace(f" {r['status'][:8]:<8} ", " " + col(f"{r['status'][:8]:<8}", _COLOURS.get(r["status"])) + " ", 1)
+            line = col(line, "1") if i == selected else line
+        out.append(line)
+    if not d["rows"]:
+        out.append("  (no containers" + (f" in project {d['project']}" if d.get("project") else "") + ")")
+    out.append("")
+    out.append(col("events", "1"))
+    for e in d["events"]:
+        out.append(f"  {e['time'][11:]} {e['event']:<12} {e.get('container', e.get('stack', '')):<22} {e.get('detail', '')}"[:width])
+    if ansi:
+        out.append("")
+        out.append(col("up/down select  s start  t stop  r remove  +/- scale  l logs  v view  q quit", "2"))
+        if message:
+            out.append(message[:width])
+    return "\n".join(out)
+
+
+def _poll_keys(timeout=0.2):
+    """Keyboard events waiting now (as parse_input gives them), polled so the reader can pause while the viewer
+    owns the keyboard: POSIX raw input, or msvcrt on Windows."""
+    if WINDOWS:
+        import msvcrt
+        out, end = [], time.time() + timeout
+        while time.time() < end and not out:
+            while msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):
+                    k = {"H": "up", "P": "down"}.get(msvcrt.getwch())
+                    if k:
+                        out.append(("key", k))
+                elif ch in ("\x03", "\x1d"):  # Ctrl+C, Ctrl+]
+                    out.append(("quit",))
+                else:
+                    out.append(("text", ch))
+            time.sleep(0.02)
+        return out
+    import select
+    fd = sys.stdin.fileno()
+    if not select.select([fd], [], [], timeout)[0]:
+        return []
+    return parse_input(os.read(fd, 1024).decode("utf-8", "replace"))
+
+
+def dash(project=None, refresh=2.0):
+    """Live dashboard in the terminal; acts on the selected container. q or Ctrl+] quits."""
+    if not sys.stdin.isatty():
+        raise SystemExit("dash needs a terminal (agents: the MCP tool dashboard)")
+    data = {"d": dashboard_data(project), "gen": 0}
+    sel, msg, confirm = 0, "", None
+    stop_, paused, keys, dirty = threading.Event(), threading.Event(), queue.Queue(), threading.Event()
+
+    def collect():  # quota every 5th refresh: it measures the disk
+        k = 0
+        while not stop_.wait(refresh):
+            gen = data["gen"]
+            with contextlib.suppress(Exception, SystemExit):
+                d = dashboard_data(project, with_quota=k % 5 == 0)
+                if d["quota"] is None:
+                    d["quota"] = data["d"].get("quota")
+                if gen == data["gen"]:  # an action since this pass began: its fresher state stays
+                    data["d"] = d
+                    dirty.set()
+            k += 1
+
+    def read():
+        while not stop_.is_set():
+            if paused.is_set():  # the viewer owns the keyboard now
+                time.sleep(0.1)
+                continue
+            try:
+                evs = _poll_keys()
+            except OSError:  # the terminal went away
+                keys.put(("quit",)); dirty.set()
+                return
+            for e in evs:
+                if e[0] == "text":  # one event per character: "ry" typed fast, or + held down
+                    for ch in e[1]:
+                        keys.put(("text", ch))
+                else:
+                    keys.put(e)
+                dirty.set()
+
+    def act(fn, *a):
+        try:
+            r = fn(*a)
+            r = json.dumps(r if r is not None else {})[:200]
+        except (SystemExit, Exception) as e:
+            r = f"error: {e}"
+        data["gen"] += 1
+        with contextlib.suppress(Exception, SystemExit):  # the new state at once, not at the next refresh
+            data["d"] = dict(dashboard_data(project, with_quota=False), quota=data["d"].get("quota"))
+        return r
+
+    def drain():
+        while not keys.empty():
+            keys.get_nowait()
+
+    def scale_by(r, step):
+        stack, svc, _ = r["stack"].split("/")
+        n = load_stack(stack)["services"][svc].get("replicas", 1)
+        return scale(stack, svc, max(0, n + step))
+
+    restore = (lambda: None) if WINDOWS else raw_terminal()
+    out = sys.stdout
+    out.write("\x1b[?1049h\x1b[?25l"); out.flush()
+    threading.Thread(target=collect, daemon=True).start()
+    threading.Thread(target=read, daemon=True).start()
+    try:
+        while True:
+            rows = data["d"]["rows"]
+            sel = max(0, min(sel, len(rows) - 1))
+            size = shutil.get_terminal_size((120, 40))
+            out.write("\x1b[H\x1b[2J" + dashboard_text(data["d"], size.columns, sel if rows else None, True,
+                                                       msg, size.lines).replace("\n", "\r\n"))
+            out.flush()
+            dirty.wait(); dirty.clear()
+            while not keys.empty():
+                e = keys.get()
+                r = rows[sel] if rows else None
+                if e[0] == "quit" or e == ("text", "q"):
+                    return
+                if confirm and e == ("text", "y"):
+                    msg = act(lambda n: quiet(rm, n), confirm)  # the one asked about, whatever is selected now
+                    confirm = None
+                    continue
+                confirm = None
+                if e == ("key", "up"):
+                    sel -= 1
+                elif e == ("key", "down"):
+                    sel += 1
+                elif r and e == ("text", "s"):
+                    msg = act(lambda n: quiet(start, n), r["name"])
+                elif r and e == ("text", "t"):
+                    msg = act(lambda n: quiet(stop, n, 5), r["name"])
+                elif r and e == ("text", "r"):
+                    confirm, msg = r["name"], f"remove {r['name']} and its /data? y to confirm"
+                elif r and e in (("text", "+"), ("text", "-")) and r["stack"]:
+                    msg = act(scale_by, r, 1 if e[1] == "+" else -1)
+                elif r and e == ("text", "l"):
+                    try:
+                        text = logs(r["name"], max(10, size.lines - 3))
+                    except (SystemExit, Exception) as ex:
+                        msg = f"error: {ex}"
+                        continue
+                    drain()  # a key typed with l must not close the page at once
+                    out.write("\x1b[H\x1b[2J" + f"logs of {r['name']} (any key)\n{text}".replace("\n", "\r\n")); out.flush()
+                    while not stop_.is_set():
+                        try:
+                            keys.get(timeout=0.5)
+                            break
+                        except queue.Empty:
+                            pass
+                elif r and e == ("text", "v") and "D" in r["flags"]:
+                    # in a process of its own: its keyboard reader ends with it, nothing stays to eat dash's keys
+                    paused.set(); time.sleep(0.25)
+                    out.write("\x1b[?25h\x1b[?1049l"); out.flush(); restore()
+                    rc = subprocess.run([sys.executable, os.path.abspath(__file__), "--engine", node().engine,
+                                         "view", r["name"]]).returncode
+                    restore = (lambda: None) if WINDOWS else raw_terminal()
+                    out.write("\x1b[?1049h\x1b[?25l"); out.flush()
+                    drain(); paused.clear()
+                    msg = "" if rc == 0 else f"view ended with code {rc}"
+    finally:
+        stop_.set()
+        out.write("\x1b[?25h\x1b[?1049l"); out.flush()
+        restore()
 
 
 # ---------- snapshots, clones, files ----------
@@ -2416,6 +2689,11 @@ AGENT_TOOLS = [
     ("autostart", "Show (without on) or change whether containers that were running start again by themselves "
                   "after the PC restarts (a task at the user's logon). Changing it needs the user's approval.",
      _schema({"on": {"type": "boolean"}})),
+    ("dashboard", "The dashboard as text: every container (state, health, stack/replica, CPU and memory used next "
+                  "to its ceiling, age, restarts, flags D desktop S sandbox I internet A agent's), the daemon, the "
+                  "quota, the latest events. What the user sees with terminal-ct dash.", _schema({})),
+    ("ct_logs", "The last lines a container printed (stdout and stderr); n: how many (default 100).",
+     _schema({**_NAME, "n": {"type": "integer"}}, ["name"])),
     ("project_status", "Start here: the project's containers and networks as they are now (want: what each should "
                        "be doing), the notes left by earlier sessions, and the latest actions with their errors.",
      _schema({"project": {"type": "string", "description": "Only when this server has no project of its own"}})),
@@ -2551,6 +2829,11 @@ def agent_call(tool, a, approve, project=None):
                 use["cpus"] += cpus; use["memory_gb"] += mem; use["containers"] += 1
         return {k: {"limit": v["limit"], "free": v["free"], **({"used_by_project": round(use[k], 2)} if k in use else {})}
                 for k, v in q.items()}
+    if tool == "dashboard":
+        return dashboard_text(dashboard_data(project), width=160)
+    if tool == "ct_logs":
+        guard_("read the output of", f"terminal-ct logs {name}")
+        return logs(name, int(a.get("n", 100)))
     if tool == "autostart":
         if a.get("on") is not None:
             approve(("Start the containers that were running again by themselves after each restart of the PC "
@@ -2743,7 +3026,8 @@ def mcp(name=None, project=None):
             try:
                 if tool in AGENT_NAMES:
                     with contextlib.redirect_stdout(io.StringIO()):  # engine output must not reach the MCP channel
-                        content = [{"type": "text", "text": json.dumps(agent_call(tool, a, approve, project))}]
+                        r = agent_call(tool, a, approve, project)
+                        content = [{"type": "text", "text": r if isinstance(r, str) else json.dumps(r)}]
                 else:
                     if not target:
                         raise ValueError("name the container: this server was started without one (container)")
@@ -2818,6 +3102,8 @@ def main(argv=None):
     ev_.add_argument("--follow", action="store_true")
     sub.add_parser("daemon").add_argument("daemon_cmd", choices=["run", "start", "stop", "status"])
     sub.add_parser("prune")
+    da = sub.add_parser("dash"); da.add_argument("--project")
+    lg = sub.add_parser("logs"); lg.add_argument("name"); lg.add_argument("-n", type=int, default=100)
     sn = sub.add_parser("snapshot"); sn.add_argument("name"); sn.add_argument("snap_cmd", choices=["save", "load", "rm", "ls"])
     sn.add_argument("tag", nargs="?")
     cl = sub.add_parser("clone"); cl.add_argument("src"); cl.add_argument("new"); cl.add_argument("--project")
@@ -2890,6 +3176,8 @@ def main(argv=None):
         r = daemon(o.daemon_cmd)
         return None if o.daemon_cmd == "run" else show_json(r if isinstance(r, dict) else {"daemon": r})
     if o.cmd == "prune": return show_json(prune())
+    if o.cmd == "dash": return dash(o.project)
+    if o.cmd == "logs": return print(logs(o.name, o.n), end="")
     if o.cmd == "snapshot": return show_json(snapshot(o.name, o.snap_cmd, o.tag))
     if o.cmd == "clone": return show_json(clone(o.src, o.new, project=o.project))
     if o.cmd in ("push", "pull"): return show_json(transfer(o.name, o.cmd, o.src, o.dest))

@@ -4,10 +4,10 @@ Containers with a desktop and a shell, for people and computer-use agents. The c
 [terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm): same command and
 MCP shape, independent of it (each installs and works alone), and able to show its VMs when both are installed.
 
-Status: **phase 5** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
+Status: **phase 6** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
 screen tools, terminal viewer, quota and live resources, isolated networks, sandboxes, and an MCP server that
 manages containers under agent-authority rules; snapshots, clones and file copies; stacks kept in their desired state by a daemon (replicas, restarts, health
-probes, ttl, events). Dashboards (desired state, restarts, replicas) and
+probes, ttl, events); a terminal dashboard and its text for agents. The web dashboard (desired state, restarts, replicas) and
 dashboards (terminal and web) come next.
 
 ## Requirements
@@ -53,6 +53,8 @@ those labels are never listed or touched. An image whose default command is a ba
   no TCP port, nothing on the network, no password to keep. It runs as **your user** (Podman: `--userns=keep-id`;
   Docker: `--user`), so the socket is yours alone; `/data` is its home (`HOME=/data`, `LANG=C.UTF-8`).
 - `start` returns once the desktop shows a window, so the first click lands on it.
+- The terminal (xterm) opens maximized and stays so when the screen size changes (TigerVNC's window resizes the
+  desktop to fit, by default).
 - `type` sends X keysyms: any text, accents and other scripts included, whatever the keyboard layout.
 - Measured in WSL Debian (Podman 5.4 rootless, Docker 26.1): desktop ready 0.4-1.3 s after `start`, stop ~1 s
   (exit code 0); first `--desktop` build 23 s (Alpine) to 84 s (Ubuntu), then cached.
@@ -90,6 +92,18 @@ those labels are never listed or touched. An image whose default command is a ba
   system is committed to an image (`tct-keep-NAME`, removed with it), it is remade on the bridge with the same
   `/data`, ceiling and owner, and the old one is only renamed until then (put back if anything fails). Measured:
   5.4 s, files in `/etc` and `/data` kept, desktop working.
+
+## Dashboard
+
+`terminal-ct dash [--project P]`: a live table of the containers (state, health, stack/service/replica, CPU % and
+memory used next to the ceiling, age, restarts, flags: D desktop, S sandbox, I internet, A made by an agent), the
+daemon, the quota and the latest events, refreshed every 2 s (the quota every 10 s: it measures the disk). Keys on
+the selected container: up/down, `s` start, `t` stop, `r` remove (then `y`), `+`/`-` replicas of its service,
+`l` its logs, `v` its desktop in the terminal viewer, `q` or Ctrl+] quit. Works in WSL and Linux terminals and in
+Windows Terminal (keys through msvcrt there). `logs NAME [-n 100]` prints a container's output.
+
+Agents get the same view as text with the MCP tool `dashboard` (only their project with `--project`), and a
+container's output with `ct_logs` (one of the user's containers needs approval).
 
 ## Snapshots and clones
 
@@ -152,6 +166,7 @@ those labels are never listed or touched. An image whose default command is a ba
 - `ct_list`, `ct_create`, `ct_start`, `ct_stop`, `ct_remove`, `ct_resources`, `ct_internet`, `ct_snapshot`,
   `ct_clone`, `ct_apply`, `ct_scale`, `ct_stack`, `ct_events`, `net_list`,
   `net_create`, `net_remove`, `net_attach`, `net_detach`, `top`, `quota`;
+- `dashboard` (the `dash` view as text), `ct_logs`;
 - `autostart` (restart after a PC restart; changing it asks the user);
 - `project_status` (where things stand: containers and networks with what each should be doing, notes, latest
   actions and errors) and `notes_write`; the server tells the agent at connection to start with `project_status`
