@@ -16,16 +16,19 @@ labels; containers without them are never touched.
   resources NAME [--cpus N] [--memory GiB]            show, or change at once (even running), within the quota
   quota [--cpus N] [--memory GiB] [--disk GiB] [--containers N]   show, or set, the host quota
   net create|rm NET | net ls | net attach|detach NAME NET   isolated networks (containers reach each other by name)
-  internet NAME [on|off]  |  sandbox NAME on|off      stopped containers
+  internet NAME [on|off]  |  sandbox NAME on|off      stopped containers (one made by 0.2 is upgraded, kept as is)
   action NAME screenshot|click|move|drag|scroll|type|key|wait|status ...   desktop containers
-  mcp [NAME]          stdio MCP server: screen tools + exec (on NAME, or `container`), container and network
-                      management under the agent-authority rules (sandboxes and its own; the rest asks the user)
+  mcp [NAME] [--project P]   stdio MCP server: screen tools + exec (on NAME, or `container`), container and
+                      network management under the agent-authority rules (sandboxes and its own; the rest asks the
+                      user); with --project, only that project, and project_status / notes_write to resume
+  create ... --project P  |  project ls | project show [P] | project notes [P [TEXT]] | project move NAME P
+  resume [--stay]  |  autostart [on|off]     start again what was running before a restart; at each logon
   view NAME [--read-only]   terminal viewer: Kitty graphics or Sixel (Windows Terminal, foot); Ctrl+] exits
   show NAME                 native window (TigerVNC viewer, through the desktop's unix socket)
   image ls | image pull REF | image build NAME DIR | image rm NAME
 Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if installed, else docker).
 """
-import argparse, base64, collections, contextlib, io, json, os, queue, re, shutil, socket, struct, \
+import argparse, base64, collections, contextlib, io, json, os, queue, re, shlex, shutil, socket, struct, \
     subprocess, sys, threading, time, zlib
 
 VERSION = "0.3.0"
@@ -126,6 +129,7 @@ def normalize(c):
     return {"name": labels.get(f"{LABEL}.name") or c.get("Name", "").lstrip("/").removeprefix(PREFIX),
             "status": st.get("Status", "unknown"), "image": (c.get("Config") or {}).get("Image", ""),
             "created_by": labels.get(f"{LABEL}.created_by", "user"), "id": c.get("Id", "")[:12],
+            "project": labels.get(f"{LABEL}.project") or DEFAULT_PROJECT,
             "cpus": cpus or "unlimited", "memory_gb": round(mem, 2) if mem else "unlimited",
             "internet": online(c),
             "networks": sorted(n[len(NET_PREFIX):] for n in nets if n.startswith(NET_PREFIX)),
@@ -167,7 +171,8 @@ def allotted(c, unlimited="host"):
 
 def raw_containers(size=False):
     ids = node().run(["ps", "-a", "-q", "--filter", f"label={LABEL}.name"]).stdout.split()
-    return node().json(["inspect", "--type", "container", *(["--size"] if size else []), *ids]) if ids else []
+    infos = node().json(["inspect", "--type", "container", *(["--size"] if size else []), *ids]) if ids else []
+    return [c for c in infos if not c.get("Name", "").endswith("-OLD")]  # the old one during a remake
 
 
 def containers():
@@ -182,9 +187,21 @@ def running(c):
     return (c.get("State") or {}).get("Status") in ("running", "paused", "restarting", "stopping")
 
 
+def recover(name):
+    """Put back a container left renamed tct-NAME-OLD by a remake cut short (power off, killed process)."""
+    old = node().run(["inspect", "--type", "container", PREFIX + name + "-OLD"], check=False)
+    if old.returncode == 0 and node().run(["inspect", "--type", "container", PREFIX + name], check=False).returncode:
+        with contextlib.suppress(ValueError, IndexError):
+            if labels_of(json.loads(old.stdout)[0]).get(f"{LABEL}.name") == name:
+                node().run(["rename", PREFIX + name + "-OLD", PREFIX + name])
+
+
 def find(name):
     check_name(name)
     r = node().run(["inspect", "--type", "container", PREFIX + name], check=False)
+    if r.returncode:
+        recover(name)
+        r = node().run(["inspect", "--type", "container", PREFIX + name], check=False)
     try:
         info = json.loads(r.stdout or "[]")
     except ValueError:
@@ -224,14 +241,17 @@ def ct_dir(name):
     return d
 
 
+DEFAULT_PROJECT = "default"
 DEFAULT_CPUS, DEFAULT_MEMORY = 1, 1  # each container gets a ceiling, so the quota can count it
 SANDBOX_PIDS = 256
 
 
 def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_by="user",
-           desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=()):
+           desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=(), project=None):
     """Internet: on by default for the user's containers; sandboxes and agents' containers start offline."""
     check_name(name)
+    project = check_name(project or DEFAULT_PROJECT)
+    recover(name)  # an interrupted remake's container is still NAME's: never create over it
     if node().run(["inspect", "--type", "container", PREFIX + name], check=False).returncode == 0:
         raise SystemExit(f"{name!r} already exists (engine name {PREFIX}{name})")
     if desktop:
@@ -255,27 +275,28 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     quota_check({"disk_gb": 0})  # what a container will write is unknown: refuse once the disk quota is reached
     internet = not sandbox and created_by == "user" if internet is None else internet
     spec = {"image": image, "cmd": cmd, "desktop": desktop, "width": width, "height": height, "sandbox": sandbox}
-    out = _make(name, spec, created_by, cpus, memory, internet, nets, fresh=True)
+    out = _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=True)
+    want(name, "stopped")
     print(json.dumps(out))
 
 
 def ensure_image(spec):
     """Pull or build what the spec runs on (slow: outside the quota lock)."""
-    if spec.get("desktop"):
+    if spec.get("desktop") and not spec.get("prebuilt"):
         desktop_image(spec["image"])
     else:
         image_cmd(spec["image"])
 
 
-def _make(name, spec, created_by, cpus, memory, internet, nets, fresh=False):
+def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=False):
     """Create the engine container from its spec (kept in a label: a sandbox is recreated from it at each start)."""
     volume, extra = f"{PREFIX}{name}-data", []  # /data is kept when the container is recreated, removed by rm
     image, cmd, sandbox, podman = spec["image"], spec.get("cmd"), spec.get("sandbox"), node().engine == "podman"
     if spec.get("desktop"):
-        image = desktop_image(image)
+        image = image if spec.get("prebuilt") else desktop_image(image)  # prebuilt: a committed desktop
         # LANG: without UTF-8, xterm wrote é as Latin-1
         extra += ["-e", "LANG=C.UTF-8", "-e", f"TCT_WIDTH={spec['width']}", "-e", f"TCT_HEIGHT={spec['height']}",
-                  "-v", f"{os.path.join(ct_dir(name), 'run')}:/run/tct", "--label", f"{LABEL}.desktop=1"]
+                  "-v", f"{os.path.join(ct_dir(name), 'run')}:/run/tct"]
         cmd = [DESKTOP_ENTRY]
     else:
         entry, default = image_cmd(image)
@@ -292,8 +313,7 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, fresh=False):
     if sandbox:  # /data in memory, emptied at each stop; no host mount but the screen's socket
         data = ["--mount", "type=tmpfs,destination=/data,tmpfs-mode=0700,U=true"] if podman else \
             ["--tmpfs", f"/data:rw,uid={uid},gid={gid},mode=700"]
-        extra += ["--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(SANDBOX_PIDS),
-                  "--label", f"{LABEL}.sandbox=1"]
+        extra += ["--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(SANDBOX_PIDS)]
     elif as_user and podman:
         data = ["-v", f"{volume}:/data:U"]  # :U hands the volume to that user
     else:
@@ -304,7 +324,10 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, fresh=False):
                         "-v", f"{volume}:/data", image, f"{uid}:{gid}", "/data"])
         data = ["-v", f"{volume}:/data"]
     args = ["create", "--name", PREFIX + name, "--hostname", name, "--init", "--network", BRIDGE[node().engine],
+            # every label set, 0 included: a committed image carries the old container's labels into the new one
             "--label", f"{LABEL}.name={name}", "--label", f"{LABEL}.created_by={created_by}",
+            "--label", f"{LABEL}.project={project}", "--label", f"{LABEL}.sandbox={int(bool(sandbox))}",
+            "--label", f"{LABEL}.desktop={int(bool(spec.get('desktop')))}",
             "--label", f"{LABEL}.spec={json.dumps(spec, separators=(',', ':'))}", *data, *extra,
             "--cpus", f"{cpus:g}", "--memory", str(int(memory * 2 ** 30)), "--memory-swap", str(int(memory * 2 ** 30)),
             image, *(cmd or [])]  # memory-swap = memory: no swap, so the quota's memory is the real ceiling
@@ -323,24 +346,61 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, fresh=False):
         if fresh and made_volume:
             node().run(["volume", "rm", volume], check=False)  # else left behind with no container to rm it
         raise
-    return {"created": name, "image": image, "id": cid[:12], "cpus": cpus, "memory_gb": memory, "internet": internet,
+    return {"created": name, "image": image, "id": cid[:12], "project": project, "cpus": cpus, "memory_gb": memory,
+            "internet": internet,
             **({"networks": list(nets)} if nets else {}), **({"sandbox": True} if sandbox else {}),
             **({"desktop": f"{spec['width']}x{spec['height']}"} if spec.get("desktop") else {})}
 
 
-def recreate(name, info, **change):
-    """The container again from its spec, same resources and networks: a sandbox's fresh file system at each start,
-    or a changed spec (sandbox on/off). /data's volume, if any, is kept."""
-    raw = labels_of(info).get(f"{LABEL}.spec")
-    if not raw or not is_bridged(info):
-        raise SystemExit(f"{name} was made before terminal-ct 0.3: remove it and create it again")
-    spec = dict(json.loads(raw), **{k: v for k, v in change.items() if k != "internet"})
+KEEP = "tct-keep-"  # images holding a container's committed file system (remake keep=True), removed with it
+
+
+def legacy_spec(info):
+    """The spec of a container made before 0.3 (none in its labels), read from its configuration."""
+    env = dict(e.split("=", 1) for e in (info.get("Config") or {}).get("Env") or [] if "=" in e)
+    return {"image": (info.get("Config") or {}).get("Image", ""), "cmd": None,
+            "desktop": labels_of(info).get(f"{LABEL}.desktop") == "1", "sandbox": False,
+            "width": int(env.get("TCT_WIDTH", 1280)), "height": int(env.get("TCT_HEIGHT", 800))}
+
+
+def needs_upgrade(info):
+    """Made before 0.3: no spec to recreate it from, or (Podman) network mode pasta, which cannot change networks."""
+    return not labels_of(info).get(f"{LABEL}.spec") or not is_bridged(info)
+
+
+def remake(name, info, keep=False, **change):
+    """The container again, same resources, networks and owner, with `change` (sandbox, internet, project) applied.
+    keep=False: fresh from its spec's image (a sandbox at each start, sandbox on/off). keep=True: its file system
+    as it is, committed to an image first (moving it to another project; a container made before 0.3 brought up to
+    date, which Podman cannot do in place: its network mode is fixed at creation). /data's volume is kept. The old
+    container is only renamed until the new one exists, and put back if anything fails."""
+    if running(info):
+        raise SystemExit(f"stop {name} first (terminal-ct stop {name})")
+    lab = labels_of(info)
+    raw = lab.get(f"{LABEL}.spec")
+    keep = keep or needs_upgrade(info)
+    spec = json.loads(raw) if raw else legacy_spec(info)
+    project = change.pop("project", None) or lab.get(f"{LABEL}.project") or DEFAULT_PROJECT
+    internet = change.pop("internet", online(info))
+    spec.update(change)
+    if keep:
+        ref = f"{KEEP}{name}:latest"
+        node().run(["commit", PREFIX + name, ref])
+        spec.update(image=ref, prebuilt=bool(spec.get("desktop")))  # a desktop's layer is in the committed image
+    ensure_image(spec)  # before touching the container: a missing image must not leave the user with none
     cpus, mem = allotted(info, None)
     nets = [n[len(NET_PREFIX):] for n in networks_of(info) if n.startswith(NET_PREFIX)]
-    ensure_image(spec)  # before removing anything: a missing image must not leave the user with no container
-    node().run(["rm", "-f", PREFIX + name])
-    _make(name, spec, labels_of(info).get(f"{LABEL}.created_by", "user"), cpus or DEFAULT_CPUS, mem or DEFAULT_MEMORY,
-          change.get("internet", online(info)), nets)
+    old = PREFIX + name + "-OLD"  # uppercase: no terminal-ct name can be that
+    node().run(["rm", "-f", old], check=False)  # left by an interrupted remake
+    node().run(["rename", PREFIX + name, old])
+    try:
+        _make(name, spec, lab.get(f"{LABEL}.created_by", "user"), cpus or DEFAULT_CPUS, mem or DEFAULT_MEMORY,
+              internet, nets, project)
+    except BaseException:
+        node().run(["rm", "-f", PREFIX + name], check=False)
+        node().run(["rename", old, PREFIX + name], check=False)
+        raise
+    node().run(["rm", "-f", old])
     return find(name)
 
 
@@ -414,9 +474,10 @@ def start(name):
             cpus, mem = allotted(info)
             quota_check({"cpus": cpus, "memory_gb": mem, "containers": 1})
             if labels_of(info).get(f"{LABEL}.sandbox") == "1" and (info.get("State") or {}).get("Status") != "created":
-                info = recreate(name, info)  # a sandbox starts from its image every time
+                info = remake(name, info)  # a sandbox starts from its image every time
                 out["fresh"] = True
             node().run(["start", PREFIX + name])
+    want(name, "running")
     if labels_of(info).get(f"{LABEL}.desktop") == "1":
         # an empty screen looks "stable" too: return once the desktop shows a window (1% of the screen not
         # black; the pointer alone is drawn into the image), so input lands on it
@@ -435,6 +496,7 @@ def start(name):
 
 def stop(name, timeout=10):
     find(name)
+    want(name, "stopped")  # first: stopped by request, resume leaves it so
     node().run(["stop", "-t", str(timeout), PREFIX + name])
     print(json.dumps({"stopped": name}))
 
@@ -442,7 +504,9 @@ def stop(name, timeout=10):
 def rm(name):
     find(name)
     node().run(["rm", "-f", PREFIX + name])
+    node().run(["rm", "-f", PREFIX + name + "-OLD"], check=False)  # it would keep the volume in use
     node().run(["volume", "rm", f"{PREFIX}{name}-data"], check=False)  # absent if never created
+    node().run(["image", "rm", f"{KEEP}{name}:latest"], check=False)  # its committed file system, if any
     shutil.rmtree(os.path.join(STORE, name), ignore_errors=True)
     print(json.dumps({"removed": name}))
 
@@ -495,23 +559,35 @@ def disk_bytes(infos):
     """Space terminal-ct holds: its containers' writable layers, its volumes, its desktop images. Real use, not a
     limit: per-container disk limits exist only with some storage drivers."""
     total = sum(c.get("SizeRw") or 0 for c in infos)
-    paths = [m["Source"] for c in infos for m in c.get("Mounts") or []
-             if m.get("Type") == "volume" and (m.get("Name") or "").startswith(PREFIX) and os.path.isdir(m.get("Source") or "")]
-    if node().engine == "podman":
-        # rootless volumes are folders of ours: du takes 4 ms where `system df -v` took 0.7 s. shortcut: files of
-        # other uids inside the container may be unreadable and left out (`podman unshare du` if that matters);
-        # with a Podman machine (Windows, macOS) the folders are in its VM and volumes are not counted
-        if paths:
-            r = subprocess.run(["du", "-skc", *dict.fromkeys(paths)], capture_output=True, text=True)
+    if node().engine == "podman":  # every tct- volume, also one left without its container
+        rows = [r.split("\t") for r in node().run(["volume", "ls", "--format", "{{.Name}}\t{{.Mountpoint}}"]).stdout.splitlines()]
+        vols = {r[0]: r[-1] for r in rows if r[0].startswith(PREFIX)}
+        if vols and not WINDOWS and all(os.path.isdir(p) for p in vols.values()):
+            # rootless volumes are folders of ours: du takes 4 ms where `system df -v` took 0.7 s. shortcut: files
+            # of other uids inside the container may be unreadable and left out (`podman unshare du` if that matters)
+            r = subprocess.run(["du", "-skc", *vols.values()], capture_output=True, text=True)
             total += int((r.stdout.strip().splitlines() or ["0"])[-1].split()[0]) * 1024
+        elif vols:  # a Podman machine (Windows, macOS): the folders are in its VM, ask Podman
+            sizes = volume_sizes()
+            total += sum(sizes.get(n, 0) for n in vols)
     else:
-        vols = json.loads(node().run(["system", "df", "-v", "--format", "{{json .Volumes}}"]).stdout or "[]") or []
-        total += sum(parse_size(v.get("Size", "")) for v in vols if v.get("Name", "").startswith(PREFIX))
+        total += sum(v for n, v in volume_sizes().items() if n.startswith(PREFIX))
     for line in node().run(["image", "ls", "--format", "{{.Repository}} {{.Size}}"]).stdout.splitlines():
         repo, _, size = line.partition(" ")
-        if repo.split("/")[-1] == "tct-desktop":
+        if repo.split("/")[-1] == "tct-desktop" or repo.split("/")[-1].startswith(KEEP):
             total += parse_size(size)
     return total
+
+
+def volume_sizes():
+    """{volume: bytes} from the engine, for volumes whose folders are not on this machine (a Podman machine's VM on
+    Windows and macOS, Docker's root-owned store)."""
+    if node().engine == "docker":
+        vols = json.loads(node().run(["system", "df", "-v", "--format", "{{json .Volumes}}"]).stdout or "[]") or []
+        return {v.get("Name", ""): parse_size(v.get("Size", "")) for v in vols}
+    out = node().run(["system", "df", "-v"]).stdout  # podman refuses --format with -v: read its table
+    rows = out[out.find("VOLUME NAME"):].splitlines()[1:] if "VOLUME NAME" in out else []
+    return {p[0]: parse_size(" ".join(p[2:])) for p in (r.split() for r in rows) if len(p) >= 3}
 
 
 def quota_usage(disk=True):
@@ -651,7 +727,8 @@ def networks():
     for n in node().json(["network", "inspect", *ids]) if ids else []:
         lab = n.get("Labels") or n.get("labels") or {}  # docker, podman
         if lab.get(f"{LABEL}.net"):
-            out[lab[f"{LABEL}.net"]] = {"created_by": lab.get(f"{LABEL}.created_by", "user"), "members": []}
+            out[lab[f"{LABEL}.net"]] = {"created_by": lab.get(f"{LABEL}.created_by", "user"),
+                                        "project": lab.get(f"{LABEL}.project") or DEFAULT_PROJECT, "members": []}
     if out:
         for c in raw_containers():
             for k in networks_of(c):
@@ -660,13 +737,14 @@ def networks():
     return out
 
 
-def net_create(net, created_by="user"):
+def net_create(net, created_by="user", project=None):
     check_name(net)
+    project = check_name(project or DEFAULT_PROJECT)
     if net in networks():
         raise SystemExit(f"network {net!r} already exists")
     node().run(["network", "create", "--internal", "--label", f"{LABEL}.net={net}",
-                "--label", f"{LABEL}.created_by={created_by}", NET_PREFIX + net])
-    return {"created": net, "internal": True}
+                "--label", f"{LABEL}.created_by={created_by}", "--label", f"{LABEL}.project={project}", NET_PREFIX + net])
+    return {"created": net, "internal": True, "project": project}
 
 
 def net_rm(net):
@@ -680,12 +758,13 @@ def net_rm(net):
 
 
 def stopped(name, what):
+    """A stopped container whose networks can change: one made before 0.3 is brought up to date first, keeping
+    its file system and /data (remake keep=True)."""
     info = find(name)
     if running(info):
         raise SystemExit(f"stop {name} first: {what} changes apply to a stopped container (terminal-ct stop {name})")
     if not is_bridged(info):
-        raise SystemExit(f"{name} was made before terminal-ct 0.3 (network mode "
-                         f"{(info.get('HostConfig') or {}).get('NetworkMode')}): remove it and create it again")
+        info = remake(name, info, keep=True)
     return info
 
 
@@ -716,9 +795,172 @@ def sandbox(name, on):
     back). Both recreate the container from its image."""
     info = stopped(name, "sandbox")
     if (labels_of(info).get(f"{LABEL}.sandbox") == "1") != on:
-        info = recreate(name, info, sandbox=on, **({"internet": False} if on else {}))
+        info = remake(name, info, sandbox=on, **({"internet": False} if on else {}))
     c = normalize(info)
     return {"name": name, "sandbox": bool(c.get("sandbox")), "internet": c["internet"]}
+
+
+# ---------- resume after a restart ----------
+# What each container should be doing is kept on the host (STORE/NAME/want: running or stopped, written by start
+# and stop), so after the PC (or WSL) restarts, `resume` starts again what was running and leaves alone what the
+# user or an agent stopped. `autostart on` runs it at each logon.
+
+def want(name, state):
+    with open(os.path.join(ct_dir(name), "want"), "w") as f:
+        f.write(state)
+
+
+def wanted(name):
+    try:
+        with open(os.path.join(STORE, name, "want")) as f:
+            return f.read().strip()
+    except OSError:
+        return "stopped"
+
+
+def each_engine():
+    """The engine chosen (--engine, TERMINAL_CT_ENGINE), else each installed one in turn, as the current node."""
+    global NODE
+    if NODE is not None or os.environ.get("TERMINAL_CT_ENGINE"):
+        yield node()
+        return
+    for e in ("podman", "docker"):
+        if shutil.which(e):
+            NODE = Node(e)
+            yield NODE
+    NODE = None
+
+
+def resume(stay=False, wait=60):
+    """Start every container that was running when the machine stopped, on each engine. stay: then keep this
+    process alive while any terminal-ct container runs (WSL shuts its VM down once no Windows process uses it)."""
+    out = []
+    for n_ in each_engine():
+        for _ in range(wait):  # the engine may still be starting (dockerd at WSL boot)
+            if n_.run(["ps", "-q"], check=False).returncode == 0:
+                break
+            time.sleep(1)
+        for c in raw_containers():
+            n = labels_of(c).get(f"{LABEL}.name")
+            if wanted(n) == "running" and not running(c):
+                try:
+                    out.append(dict(quiet(start, n), name=n, engine=n_.engine))
+                except (SystemExit, Exception) as e:  # one refusal (quota) must not keep the others down
+                    out.append({"name": n, "engine": n_.engine, "error": str(e)})
+    print(json.dumps({"resumed": out}))
+    while stay and any(running(c) for _ in each_engine() for c in raw_containers()):
+        time.sleep(60)
+
+
+AUTOSTART = "terminal-ct-resume"
+
+
+def autostart(on=None):
+    """Run `resume` at each logon: a Windows scheduled task (for WSL: wsl.exe running it inside the distribution,
+    kept alive while containers run), else a systemd user service on Linux."""
+    me = [sys.executable, os.path.abspath(__file__)]
+    unit = os.path.expanduser(f"~/.config/systemd/user/{AUTOSTART}.service")
+    env = {k: os.environ[k] for k in ("TERMINAL_CT_HOME", "XDG_DATA_HOME") if os.environ.get(k)}  # where STORE is
+    if on:  # containers running now, from before `want` was kept (0.2): they are to come back too
+        for _ in each_engine():
+            for c in raw_containers():
+                n = labels_of(c).get(f"{LABEL}.name")
+                if running(c) and not os.path.isfile(os.path.join(STORE, n, "want")):
+                    want(n, "running")
+    if WINDOWS or in_wsl():
+        schtasks = "schtasks.exe" if in_wsl() else "schtasks"
+        if on is None:
+            return {"autostart": subprocess.run([schtasks, "/Query", "/TN", AUTOSTART], capture_output=True).returncode == 0}
+        if not on:
+            subprocess.run([schtasks, "/Delete", "/TN", AUTOSTART, "/F"], capture_output=True)
+            return {"autostart": False}
+        if in_wsl():  # conhost --headless: no console window at logon; wsl.exe reads a Windows command line
+            cmd = "conhost.exe --headless " + subprocess.list2cmdline(
+                ["wsl.exe", "-d", os.environ.get("WSL_DISTRO_NAME", "Debian"), "--exec", "env",
+                 *(f"{k}={v}" for k, v in env.items()), *me, "resume", "--stay"])
+        else:
+            if env:  # shortcut: a task's command line sets no variables; set them as user variables to use this
+                raise SystemExit(f"autostart on Windows uses the default store; unset {', '.join(env)} first")
+            cmd = subprocess.list2cmdline(me + ["resume"])
+        if len(cmd) > 261:  # schtasks /TR limit
+            raise SystemExit(f"the task's command line is {len(cmd)} characters, schtasks takes 261: {cmd}")
+        r = subprocess.run([schtasks, "/Create", "/TN", AUTOSTART, "/SC", "ONLOGON", "/TR", cmd, "/F"],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise SystemExit((r.stderr or r.stdout).strip())
+        return {"autostart": True, "task": AUTOSTART, "runs": cmd}
+    if on is None:
+        return {"autostart": os.path.isfile(unit)}
+    if not on:
+        subprocess.run(["systemctl", "--user", "disable", f"{AUTOSTART}.service"], capture_output=True)
+        with contextlib.suppress(OSError):
+            os.remove(unit)
+        return {"autostart": False}
+    os.makedirs(os.path.dirname(unit), exist_ok=True)
+    with open(unit, "w") as f:
+        # no After=default.target: WantedBy already orders it, and both made an ordering cycle
+        f.write(f"[Unit]\nDescription=terminal-ct: start again the containers that were running\n\n"
+                f"[Service]\nType=oneshot\n" + "".join(f"Environment={shlex.quote(f'{k}={v}')}\n" for k, v in env.items())
+                + f"ExecStart={shlex.join(me + ['resume'])}\n\n[Install]\nWantedBy=default.target\n")
+    r = subprocess.run(["systemctl", "--user", "enable", f"{AUTOSTART}.service"], capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit((r.stderr or r.stdout).strip())
+    return {"autostart": True, "unit": unit,
+            "note": "runs at your login; for boot without login: loginctl enable-linger"}
+
+
+# ---------- projects ----------
+# A project groups containers and networks (label terminal-ct.project; "default" when none was given) with what
+# an agent needs to pick up where it left off: its notes and the log of what was done. An MCP server started with
+# --project sees and manages only that project, so each agent works on its own and not on the others'.
+
+def project_dir(project):
+    d = os.path.join(STORE, "projects", check_name(project or DEFAULT_PROJECT))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def projects():
+    names = {DEFAULT_PROJECT} | {labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT for c in raw_containers()}
+    if os.path.isdir(os.path.join(STORE, "projects")):
+        names |= set(os.listdir(os.path.join(STORE, "projects")))
+    cs, ns = containers(), networks()
+    return [{"project": p, "containers": sum(c["project"] == p for c in cs),
+             "running": sum(c["project"] == p and c["status"] == "running" for c in cs),
+             "networks": sum(n["project"] == p for n in ns.values())} for p in sorted(names)]
+
+
+def project_status(project=None, log_lines=30):
+    """Everything an agent needs to resume: the project's containers and networks as they are now, its notes, and
+    the latest actions (with errors) from its log."""
+    project = project or DEFAULT_PROJECT
+    d = project_dir(project)
+    notes, log = "", []
+    with contextlib.suppress(OSError):
+        with open(os.path.join(d, "notes.md"), encoding="utf-8") as f:
+            notes = f.read()
+    with contextlib.suppress(OSError):
+        with open(os.path.join(d, AGENT_LOG), encoding="utf-8") as f:
+            log = [json.loads(l) for l in collections.deque(f, log_lines) if l.strip()]
+    return {"project": project,
+            "containers": [dict(c, want=wanted(c["name"])) for c in containers() if c["project"] == project],
+            "networks": {k: v for k, v in networks().items() if v["project"] == project},
+            "notes": notes, "recent_actions": log}
+
+
+def notes_write(project, text, mode="append"):
+    path = os.path.join(project_dir(project), "notes.md")
+    with open(path, "a" if mode == "append" else "w", encoding="utf-8") as f:
+        f.write((f"\n## {time.strftime('%Y-%m-%d %H:%M')}\n" if mode == "append" else "") + text.rstrip() + "\n")
+    return {"project": project or DEFAULT_PROJECT, "notes": mode, "bytes": os.path.getsize(path)}
+
+
+def project_move(name, project):
+    """Move a stopped container to another project, keeping its file system and /data."""
+    info = find(name)
+    # a sandbox starts from its image anyway: committing would make whatever is in it now its new image
+    remake(name, info, keep=labels_of(info).get(f"{LABEL}.sandbox") != "1", project=check_name(project))
+    return {"name": name, "project": project}
 
 
 def image(cmd, ref=None, path=None):
@@ -1379,8 +1621,19 @@ AGENT_TOOLS = [
      _schema({})),
     ("quota", "The host quota (CPUs, memory, disk, running containers) and its use; only the user changes it.",
      _schema({})),
+    ("project_status", "Start here: the project's containers and networks as they are now (want: what each should "
+                       "be doing), the notes left by earlier sessions, and the latest actions with their errors.",
+     _schema({"project": {"type": "string", "description": "Only when this server has no project of its own"}})),
+    ("notes_write", "Keep notes for the next session (what is set up, what is left to do): appended with the date, "
+                    "or mode=replace to rewrite them.",
+     _schema({"text": {"type": "string"}, "mode": {"type": "string", "enum": ["append", "replace"]},
+              "project": {"type": "string"}}, ["text"])),
 ]
+INSTRUCTIONS = ("terminal-ct: containers with a desktop and a shell. Call project_status first: it says what this "
+                "project already has and what earlier sessions did and noted. Before you stop, record with "
+                "notes_write what you set up and what is left, so the next session can pick up from there.")
 AGENT_NAMES = {n for n, _, _ in AGENT_TOOLS}
+PROJECT_ARG_TOOLS = {"ct_create", "net_create", "project_status", "notes_write"}  # take `project` without one of their own
 AGENT_LOG = "agent.log"
 
 
@@ -1413,8 +1666,16 @@ def managed(info):
     return agent_owned(info) or labels_of(info).get(f"{LABEL}.sandbox") == "1" and not online(info)
 
 
-def guard(name, approve, what, cli, destructive=False):
-    info = find(name)
+def in_scope(info, project, name=None):
+    """An MCP server with a project reaches nothing outside it, approval or not."""
+    p = labels_of(info).get(f"{LABEL}.project") or DEFAULT_PROJECT
+    if project and p != project:
+        raise SystemExit(f"{name or labels_of(info).get(LABEL + '.name')} is not in this agent's project {project!r}")
+    return info
+
+
+def guard(name, approve, what, cli, destructive=False, project=None):
+    info = in_scope(find(name), project, name)
     if not managed(info) or destructive and not agent_owned(info):
         approve(f"Let the agent {what} your container {name}?", cli)
     return info
@@ -1424,21 +1685,35 @@ def local_image(ref):
     return any(node().run(["image", "inspect", r], check=False).returncode == 0 for r in (ref, qualified(ref)))
 
 
-def agent_call(tool, a, approve):
+def agent_call(tool, a, approve, project=None):
+    """project: the server's own (--project); then nothing outside it is visible or reachable."""
     name, net = a.get("name"), a.get("net")
+    mine = lambda p: not project or p == project
+    nets = {k: v for k, v in networks().items() if mine(v["project"])} if tool.startswith("net_") or tool == "ct_create" else {}
+    guard_ = lambda what, cli, destructive=False: guard(name, approve, what, cli, destructive, project)
+    if name and project and tool != "ct_create":  # reads too: another project's containers are not this agent's business
+        in_scope(find(name), project, name)
     if tool == "ct_list":
-        infos = raw_containers()
-        return [dict(normalize(c), managed=managed(c)) for c in infos]
+        return [dict(normalize(c), managed=managed(c)) for c in raw_containers()
+                if mine(labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT)]
     if tool == "top":
-        return top()
+        t = top()
+        keep = {c["name"] for c in containers() if mine(c["project"])}
+        return dict(t, containers=[r for r in t["containers"] if r["name"] in keep])
     if tool == "quota":
         return quota()
+    if tool == "project_status":
+        return project_status(project or a.get("project"))
+    if tool == "notes_write":
+        return notes_write(project or a.get("project"), a["text"], a.get("mode", "append"))
     if tool == "net_list":
-        return networks()
+        return nets
     if tool == "net_create":
-        return net_create(net, "agent")
+        return net_create(net, "agent", project or a.get("project"))
+    if tool in ("net_remove", "net_attach") and check_name(net) not in nets and net in networks():
+        raise SystemExit(f"network {net!r} is not in this agent's project {project!r}")
     if tool == "net_remove":
-        if networks().get(check_name(net), {}).get("created_by") != "agent":
+        if nets.get(net, {}).get("created_by") != "agent":
             raise SystemExit(f"network {net!r} is not one this agent created")
         return net_rm(net)
     if tool == "ct_create":
@@ -1451,47 +1726,54 @@ def agent_call(tool, a, approve):
                         f"terminal-ct create {name} --desktop --image {img}")
         if a.get("internet"):
             approve(f"Give the new container {name} internet access?", f"terminal-ct internet {name} on")
-        own = networks()
         for n in a.get("networks") or []:
-            if own.get(n, {}).get("created_by") != "agent":
+            if project and n not in nets and n in networks():
+                raise SystemExit(f"network {n!r} is not in this agent's project {project!r}")
+            if nets.get(n, {}).get("created_by") != "agent":
                 approve(f"Plug {name} into your network {n!r} (it would reach your containers on it)?",
                         f"terminal-ct net attach {name} {n}")
         return quiet(create, name, img, a.get("cpus"), a.get("memory_gb"), created_by="agent", desktop=desk,
                      width=int(a.get("width", 1280)), height=int(a.get("height", 800)),
-                     sandbox=a.get("sandbox", True), internet=bool(a.get("internet")), nets=a.get("networks") or ())
+                     sandbox=a.get("sandbox", True), internet=bool(a.get("internet")), nets=a.get("networks") or (),
+                     project=project or a.get("project"))
     if tool == "ct_start":
-        guard(name, approve, "start", f"terminal-ct start {name}")
+        guard_("start", f"terminal-ct start {name}")
         return quiet(start, name)
     if tool == "ct_stop":
-        guard(name, approve, "stop", f"terminal-ct stop {name}")
+        guard_("stop", f"terminal-ct stop {name}")
         return quiet(stop, name, int(a.get("timeout", 10)))
     if tool == "ct_remove":
-        guard(name, approve, "delete (with its /data)", f"terminal-ct rm {name}", destructive=True)
+        guard_("delete (with its /data)", f"terminal-ct rm {name}", destructive=True)
         return quiet(rm, name)
     if tool == "ct_resources":
         if a.get("cpus") is not None or a.get("memory_gb") is not None:
-            guard(name, approve, "resize", f"terminal-ct resources {name} --cpus/--memory")
+            guard_("resize", f"terminal-ct resources {name} --cpus/--memory")
         return resources(name, a.get("cpus"), a.get("memory_gb"))
     if tool == "ct_internet":
         if a.get("on") is not None:
-            guard(name, approve, "change the network of", f"terminal-ct internet {name} {'on' if a['on'] else 'off'}")
+            guard_("change the network of", f"terminal-ct internet {name} {'on' if a['on'] else 'off'}")
             if a["on"]:
                 approve(f"Give {name} internet access?", f"terminal-ct internet {name} on")
         return internet(name, a.get("on"))
     if tool in ("net_attach", "net_detach"):
-        guard(name, approve, "change the networks of", f"terminal-ct net {tool[4:]} {name} {net}")
-        if tool == "net_attach" and networks().get(check_name(net), {}).get("created_by") != "agent":
+        guard_("change the networks of", f"terminal-ct net {tool[4:]} {name} {net}")
+        if tool == "net_attach" and nets.get(net, {}).get("created_by") != "agent":
             approve(f"Plug {name} into your network {net!r} (it would reach your containers on it)?",
                     f"terminal-ct net attach {name} {net}")
         return net_attach(name, net, tool == "net_attach")
     raise SystemExit(f"unknown tool {tool}")
 
 
-def mcp(name=None):
+def mcp(name=None, project=None):
     """Screen tools and exec on this server's container (NAME, given by the user) or, with `container`, on another;
-    plus managing containers and networks under the agent-authority rules."""
+    plus managing containers and networks under the agent-authority rules. project: the agent sees and reaches
+    only that project's containers and networks, and its notes and log are that project's."""
+    if project:
+        check_name(project)
     if name:
         check_name(name)
+        if project:
+            in_scope(find(name), project, name)
     allowed = {name}  # containers this session may drive: the server's own, and those the user approved
     can_ask, pending, asks = False, collections.deque(), iter(range(1, 1 << 30))
 
@@ -1502,16 +1784,22 @@ def mcp(name=None):
 
     def record(tool, a, target, error=None):  # every infrastructure action, and a sandbox's screen actions
         try:
-            sandboxed = target and labels_of(find(target)).get(f"{LABEL}.sandbox") == "1"
-        except SystemExit:
-            sandboxed = False
-        path = os.path.join(STORE, AGENT_LOG) if tool in AGENT_NAMES else \
-            os.path.join(ct_dir(target), "actions.log") if sandboxed else None
-        if path:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "tool": tool, "arguments": a,
-                                    **({"container": target} if target else {}), **({"error": error} if error else {})}) + "\n")
+            lab = {}
+            with contextlib.suppress(SystemExit):
+                lab = labels_of(find(target)) if target else {}
+            # the log of the project the action belongs to: this server's, else the one a creation names, else the
+            # container's own; never one an agent merely names (it would forge another project's history)
+            p = project or (a.get("project") if tool in PROJECT_ARG_TOOLS else None) or lab.get(f"{LABEL}.project")
+            p = p if isinstance(p, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,47}", p) else DEFAULT_PROJECT
+            mine = not project or (lab.get(f"{LABEL}.project") or DEFAULT_PROJECT) == project
+            path = os.path.join(project_dir(p), AGENT_LOG) if tool in AGENT_NAMES else \
+                os.path.join(ct_dir(target), "actions.log") if lab.get(f"{LABEL}.sandbox") == "1" and mine else None
+            if path:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "tool": tool, "arguments": a,
+                                        **({"container": target} if target else {}), **({"error": error} if error else {})}) + "\n")
+        except (OSError, TypeError, ValueError, SystemExit):  # a log that cannot be written must not end the server
+            pass
 
     def approve(message, cli):
         """Ask the user through the client (MCP elicitation); raise unless they accept."""
@@ -1552,7 +1840,8 @@ def mcp(name=None):
             can_ask = "elicitation" in (req.get("params", {}).get("capabilities") or {})
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": req.get("params", {}).get("protocolVersion", "2025-06-18"),
-                "capabilities": {"tools": {}}, "serverInfo": {"name": "terminal-ct", "version": VERSION}}})
+                "capabilities": {"tools": {}}, "serverInfo": {"name": "terminal-ct", "version": VERSION},
+                "instructions": INSTRUCTIONS + (f" This server's project: {project}." if project else "")}})
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
                 {"name": n, "description": d, "inputSchema": s} for n, d, s in SCREEN_TOOLS + AGENT_TOOLS]}})
@@ -1563,12 +1852,15 @@ def mcp(name=None):
             try:
                 if tool in AGENT_NAMES:
                     with contextlib.redirect_stdout(io.StringIO()):  # engine output must not reach the MCP channel
-                        content = [{"type": "text", "text": json.dumps(agent_call(tool, a, approve))}]
+                        content = [{"type": "text", "text": json.dumps(agent_call(tool, a, approve, project))}]
                 else:
                     if not target:
                         raise ValueError("name the container: this server was started without one (container)")
+                    if project:  # every call: a container moved to another project leaves this agent's reach
+                        in_scope(find(target), project, target)
                     if target not in allowed:
-                        guard(target, approve, "use the screen and shell of", f"terminal-ct mcp {target}")
+                        guard(target, approve, "use the screen and shell of", f"terminal-ct mcp {target}",
+                              project=project)
                         allowed.add(target)
                     if tool == "exec":
                         out = quiet(exec_, target, ["sh", "-c", a["command"]], float(a.get("timeout", 60)))
@@ -1625,12 +1917,17 @@ def main(argv=None):
     c.add_argument("--width", type=int, default=1280); c.add_argument("--height", type=int, default=800)
     c.add_argument("--sandbox", action="store_true"); c.add_argument("--offline", action="store_true")
     c.add_argument("--net", action="append", default=[], help="an isolated network (repeatable)")
+    c.add_argument("--project")
+    rs = sub.add_parser("resume"); rs.add_argument("--stay", action="store_true")
+    sub.add_parser("autostart").add_argument("state", nargs="?", choices=["on", "off"])
+    pj = sub.add_parser("project"); pj.add_argument("project_cmd", choices=["ls", "show", "notes", "move"])
+    pj.add_argument("args", nargs="*")
     r = sub.add_parser("resources"); r.add_argument("name")
     r.add_argument("--cpus", type=float); r.add_argument("--memory", type=float, help="GiB")
     q = sub.add_parser("quota"); q.add_argument("--cpus", type=int); q.add_argument("--memory", type=int, help="GiB")
     q.add_argument("--disk", type=int, help="GiB"); q.add_argument("--containers", type=int)
     nt = sub.add_parser("net"); nt.add_argument("net_cmd", choices=["create", "rm", "ls", "attach", "detach"])
-    nt.add_argument("args", nargs="*")
+    nt.add_argument("args", nargs="*"); nt.add_argument("--project")
     for n in ("internet", "sandbox"):
         t = sub.add_parser(n); t.add_argument("name"); t.add_argument("state", nargs="?" if n == "internet" else None,
                                                                        choices=["on", "off"])
@@ -1640,7 +1937,7 @@ def main(argv=None):
     a.add_argument("--double", action="store_true"); a.add_argument("--dy", type=int)
     a.add_argument("--x", type=float); a.add_argument("--y", type=float)
     a.add_argument("--timeout", type=float, default=30); a.add_argument("--stable", type=float, default=1)
-    sub.add_parser("mcp").add_argument("name", nargs="?")
+    m = sub.add_parser("mcp"); m.add_argument("name", nargs="?"); m.add_argument("--project")
     for n in ("view", "show"):
         v = sub.add_parser(n); v.add_argument("name"); v.add_argument("--read-only", action="store_true")
     for n in ("start", "rm", "status"):
@@ -1662,8 +1959,21 @@ def main(argv=None):
     if o.cmd == "ls": return ls()
     if o.cmd == "create":
         return create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width,
-                      height=o.height, sandbox=o.sandbox, internet=False if o.offline else None, nets=o.net)
+                      height=o.height, sandbox=o.sandbox, internet=False if o.offline else None, nets=o.net,
+                      project=o.project)
     show_json = lambda r: print(json.dumps(r, indent=1))
+    if o.cmd == "resume": return resume(o.stay)
+    if o.cmd == "autostart": return show_json(autostart(None if o.state is None else o.state == "on"))
+    if o.cmd == "project":
+        want_n = {"ls": (0, 0), "show": (0, 1), "notes": (0, 2), "move": (2, 2)}[o.project_cmd]
+        if not want_n[0] <= len(o.args) <= want_n[1]:
+            raise SystemExit({"ls": "project ls", "show": "project show [PROJECT]", "notes": "project notes [PROJECT [TEXT]]",
+                              "move": "project move NAME PROJECT"}[o.project_cmd])
+        if o.project_cmd == "ls": return show_json(projects())
+        if o.project_cmd == "show": return show_json(project_status(*o.args))
+        if o.project_cmd == "move": return show_json(project_move(*o.args))
+        if len(o.args) == 2: return show_json(notes_write(o.args[0], o.args[1]))
+        return print(project_status(*o.args)["notes"], end="")
     if o.cmd == "resources": return show_json(resources(o.name, o.cpus, o.memory))
     if o.cmd == "quota":
         return show_json(quota({"cpus": o.cpus, "memory_gb": o.memory, "disk_gb": o.disk, "containers": o.containers}))
@@ -1675,10 +1985,10 @@ def main(argv=None):
         if len(o.args) != want:
             raise SystemExit({0: "net ls", 1: f"net {o.net_cmd} NET", 2: f"net {o.net_cmd} NAME NET"}[want])
         if o.net_cmd == "ls": return show_json(networks())
-        if o.net_cmd == "create": return show_json(net_create(o.args[0]))
+        if o.net_cmd == "create": return show_json(net_create(o.args[0], project=o.project))
         if o.net_cmd == "rm": return show_json(net_rm(o.args[0]))
         return show_json(net_attach(o.args[0], o.args[1], o.net_cmd == "attach"))
-    if o.cmd == "mcp": return mcp(o.name)
+    if o.cmd == "mcp": return mcp(o.name, o.project)
     if o.cmd == "show": return show(o.name)
     if o.cmd == "view":
         if WINDOWS:

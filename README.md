@@ -59,7 +59,9 @@ those labels are never listed or touched. An image whose default command is a ba
 
 - Every container gets a ceiling (default 1 CPU, 1 GiB, set with `--cpus`/`--memory`, changed live with
   `resources`). The **quota** caps the sum over running containers: CPUs, memory, number of containers; and the
-  disk space terminal-ct holds (containers' writable layers, their volumes, the desktop images).
+  disk space terminal-ct holds (containers' writable layers, all its volumes, its desktop and kept images). Podman
+  volumes are measured with `du` when their folders are on this machine, else (a Podman machine on Windows or
+  macOS) from Podman's own table (`system df -v`).
 - Defaults come from the engine's host (on Windows: the WSL or Docker Desktop VM): cores - 1, 75% of memory, half of
   the space containers can have, 16 running containers. `quota --cpus ...` sets them (stored in `quota.json`).
 - Checked under a lock at `start`, `resources` (increase of a running container) and `create` (disk: refused once
@@ -78,23 +80,47 @@ those labels are never listed or touched. An image whose default command is a ba
   offline, and a fresh file system at each start (recreated from its image; `start` says `"fresh": true`).
 - Podman in WSL: netavark's nftables rules fail on WSL's kernel, so terminal-ct points its own Podman calls at the
   iptables driver (`CONTAINERS_CONF_OVERRIDE`, unless you set it). Podman: a container on an internal network and
-  online resolves only container names (IP access to the internet still works). Containers made by 0.2 on
-  Podman (network mode pasta) are online and cannot change networks: recreate them.
+  online resolves only container names (IP access to the internet still works).
+- Containers made by 0.2: Podman fixes a container's network mode (pasta) at creation and cannot change it. The
+  first network, internet, sandbox or project change brings such a container up to date by itself: its file
+  system is committed to an image (`tct-keep-NAME`, removed with it), it is remade on the bridge with the same
+  `/data`, ceiling and owner, and the old one is only renamed until then (put back if anything fails). Measured:
+  5.4 s, files in `/etc` and `/data` kept, desktop working.
 
 ## Agents
 
-`mcp [NAME]` serves, over stdio:
+`mcp [NAME] [--project P]` serves, over stdio:
 
 - screen tools and `exec` (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `status`, `exec`;
   input tools take `screenshot: true`) on NAME, or on another container with `container`;
 - `ct_list`, `ct_create`, `ct_start`, `ct_stop`, `ct_remove`, `ct_resources`, `ct_internet`, `net_list`,
-  `net_create`, `net_remove`, `net_attach`, `net_detach`, `top`, `quota`.
+  `net_create`, `net_remove`, `net_attach`, `net_detach`, `top`, `quota`;
+- `project_status` (where things stand: containers and networks with what each should be doing, notes, latest
+  actions and errors) and `notes_write`; the server tells the agent at connection to start with `project_status`
+  and to leave notes, so the next session picks up from there.
 
 Authority: an agent runs sandboxes and the containers it created (`terminal-ct.created_by=agent`; its creations are
 sandboxes by default). It must ask the user (MCP elicitation; without it, the call fails naming the CLI command to
 run) to: touch one of the user's other containers (screen, shell or lifecycle), delete a sandbox it did not
 create, download or build an image, give internet access, use a network the user created. It never changes the
-quota. Management actions are logged to `agent.log`, a sandbox's screen actions to its `actions.log`.
+quota. Management actions are logged to the project's `agent.log`, a sandbox's screen actions to its `actions.log`.
+
+## Projects
+
+- A project groups containers and networks (`create --project P`, `net create NET --project P`; `default`
+  otherwise) with their notes and agent log (`STORE/projects/P/`). `project ls`, `project show P` (the same view
+  as `project_status`), `project notes P [TEXT]`, `project move NAME P` (stopped container, kept as is).
+- `mcp --project P`: the agent sees and reaches only P's containers and networks, and creates in P. Outside P
+  nothing is listed and nothing can be approved: give each agent its own project to keep them apart.
+
+## Restarts
+
+- `start` and `stop` record what each container should be doing (`STORE/NAME/want`). After the PC (or WSL)
+  restarts, `resume` starts again what was running (within the quota; a sandbox fresh) and leaves alone what was
+  stopped on purpose.
+- `autostart on` runs it at each logon: on Windows (also from WSL) a scheduled task `terminal-ct-resume`
+  (from WSL: `conhost --headless wsl.exe ... resume --stay`, which keeps WSL up while containers run); on Linux a
+  systemd user service (at login; `loginctl enable-linger` for boot without login). `autostart off` removes it.
 
 ## Tests
 

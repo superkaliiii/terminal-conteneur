@@ -72,8 +72,17 @@ class FakeNode(ct.Node):
                 c.pop(net, None)
         elif args[:2] == ["volume", "inspect"]:
             code = 0 if args[2] in getattr(self, "volumes", ()) else 1
+        elif args[:2] == ["volume", "ls"]:
+            out = "\n".join(f"{n}\t{p}" for n, p in getattr(self, "podman_volumes", {}).items())
+        elif args[:2] == ["system", "df"] and self.engine == "podman":
+            out = ("Images space usage:\n\nREPOSITORY TAG\n\nLocal Volumes space usage:\n\nVOLUME NAME  LINKS  SIZE\n"
+                   "tct-web-data  1      2 GB\ntheirs  0  9GB\n")
         elif args[:2] == ["system", "df"]:
             out = json.dumps([{"Name": "tct-web-data", "Size": "2GB"}, {"Name": "theirs", "Size": "9GB"}])
+        elif args[0] == "commit":
+            self.images[args[2]] = {"Config": {"Cmd": ["tail", "-f", "/dev/null"]}}
+        elif args[0] == "rename":
+            obj = self.objects.pop(args[1]); obj["Name"] = "/" + args[2]; self.objects[args[2]] = obj
         elif args[:2] == ["image", "ls"] and "--format" in args:
             out = "tct-desktop 1GB\ndebian 80MB"
         elif args[0] == "run" and "cat" in args:  # os_family
@@ -277,11 +286,36 @@ class Phase3(unittest.TestCase):
             ct.create("x", internet=False, nets=["gone"])
         self.assertNotIn("tct-x", self.n.objects)                        # not left behind, online or not
 
-    def test_pre_03_container_cannot_change_networks(self):
+    def test_pre_03_podman_container_upgraded_in_place(self):
+        """A 0.2 container on Podman's pasta: changing its network commits it and remakes it on the bridge."""
+        self.n = ct.NODE = FakeNode("podman")
         quiet(ct.create, "old")
-        self.n.objects["tct-old"]["HostConfig"]["NetworkMode"] = "pasta"
-        with self.assertRaisesRegex(SystemExit, "before terminal-ct 0.3"):
-            ct.internet("old", False)
+        o = self.n.objects["tct-old"]
+        o["HostConfig"]["NetworkMode"] = "pasta"; o["NetworkSettings"]["Networks"] = {"pasta": {}}
+        del o["Config"]["Labels"]["terminal-ct.spec"]
+        self.assertEqual(ct.internet("old", False), {"name": "old", "internet": False})
+        self.assertIn(["commit", "tct-old", "tct-keep-old:latest"], self.n.calls)     # its file system kept
+        args = self.created("old")
+        self.assertEqual((args[args.index("--network") + 1], args[-1]), ("podman", "tct-keep-old:latest"))  # its own command
+        self.assertIn("tct-old-data:/data", args)                                     # and its /data
+        self.assertEqual(list(self.n.objects), ["tct-old"])                           # the old one gone
+        quiet(ct.rm, "old")
+        self.assertIn(["image", "rm", "tct-keep-old:latest"], self.n.calls)
+
+    def test_remake_failure_puts_the_old_container_back(self):
+        quiet(ct.create, "s", sandbox=True); quiet(ct.start, "s"); quiet(ct.stop, "s")
+        before = self.n.objects["tct-s"]
+        real = self.n.run
+        self.n.run = lambda args, **k: (_ for _ in ()).throw(SystemExit("engine down")) if args[0] == "create" \
+            else real(args, **k)
+        with self.assertRaisesRegex(SystemExit, "engine down"):
+            ct.start("s")
+        self.assertIs(self.n.objects["tct-s"], before)                                # back under its name
+
+    def test_podman_machine_volumes_counted(self):
+        self.n = ct.NODE = FakeNode("podman")
+        self.n.podman_volumes = {"tct-web-data": "/nonexistent/in/the/vm", "theirs": "/x"}
+        self.assertEqual(ct.disk_bytes([]), 2e9 + 1e9)                                # its volume + desktop image
 
 
 class AgentAuthority(unittest.TestCase):
@@ -345,8 +379,118 @@ class AgentAuthority(unittest.TestCase):
         self.assertEqual(replies[1]["method"], "elicitation/create")
         self.assertEqual(json.loads(replies[2]["result"]["content"][0]["text"]), {"started": "mine"})
         self.assertTrue(replies[3]["result"]["isError"])                  # no server container: name one
-        with open(os.path.join(ct.STORE, "agent.log")) as f:
+        with open(os.path.join(ct.STORE, "projects", "default", "agent.log")) as f:
             self.assertEqual(json.loads(f.readline())["tool"], "ct_start")
+
+
+class ProjectsAndResume(unittest.TestCase):
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
+        self.refuse = AgentAuthority.refuse.__get__(self)
+
+    def test_project_scope_is_closed(self):
+        quiet(ct.create, "mine", project="alpha")
+        ct.agent_call("ct_create", {"name": "job"}, self.refuse, project="beta")
+        self.assertEqual(ct.find("job")["Config"]["Labels"]["terminal-ct.project"], "beta")
+        listed = [c["name"] for c in ct.agent_call("ct_list", {}, self.refuse, project="beta")]
+        self.assertEqual(listed, ["job"])                                           # alpha is invisible
+        approve = lambda m, c: None                                                 # even approving would not help
+        for tool, a in (("ct_start", {"name": "mine"}), ("ct_resources", {"name": "mine"}),
+                        ("ct_internet", {"name": "mine"})):
+            with self.assertRaisesRegex(SystemExit, "not in this agent's project 'beta'"):
+                ct.agent_call(tool, a, approve, project="beta")
+        ct.net_create("alab", project="alpha")
+        with self.assertRaisesRegex(SystemExit, "not in this agent's project"):
+            ct.agent_call("net_attach", {"name": "job", "net": "alab"}, approve, project="beta")
+        self.assertEqual(ct.agent_call("net_list", {}, approve, project="beta"), {})
+        self.assertEqual({p["project"]: p["containers"] for p in ct.projects()}, {"alpha": 1, "beta": 1, "default": 0})
+
+    def test_status_notes_and_log_let_the_next_session_resume(self):
+        ct.agent_call("ct_create", {"name": "web"}, self.refuse, project="site")
+        ct.agent_call("notes_write", {"text": "web: nginx to install"}, self.refuse, project="site")
+        lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ct_start", "arguments": {"name": "web"}}},
+                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "project_status", "arguments": {}}}]
+        stdin, stdout = io.StringIO("".join(json.dumps(m) + "\n" for m in lines)), io.StringIO()
+        with unittest.mock.patch("sys.stdin", stdin), contextlib.redirect_stdout(stdout):
+            ct.mcp(project="site")
+        replies = [json.loads(l) for l in stdout.getvalue().splitlines()]
+        self.assertIn("project_status first", replies[0]["result"]["instructions"])
+        st = json.loads(replies[2]["result"]["content"][0]["text"])
+        self.assertEqual([(c["name"], c["status"], c["want"]) for c in st["containers"]], [("web", "running", "running")])
+        self.assertIn("nginx to install", st["notes"])
+        self.assertEqual([a["tool"] for a in st["recent_actions"]], ["ct_start"])
+
+    def test_resume_starts_what_was_running_only(self):
+        for n in ("up", "down", "fresh"):
+            quiet(ct.create, n)
+        quiet(ct.start, "up"); quiet(ct.start, "down"); quiet(ct.stop, "down")
+        self.n.objects["tct-up"]["State"]["Status"] = "exited"                     # the PC went off
+        out = quiet(ct.resume)
+        self.assertEqual([r["name"] for r in out["resumed"]], ["up"])
+        self.assertEqual({n: self.n.objects["tct-" + n]["State"]["Status"] for n in ("up", "down", "fresh")},
+                         {"up": "running", "down": "exited", "fresh": "created"})
+
+    def test_project_move_keeps_file_system(self):
+        quiet(ct.create, "w")
+        self.assertEqual(ct.project_move("w", "other"), {"name": "w", "project": "other"})
+        self.assertIn(["commit", "tct-w", "tct-keep-w:latest"], self.n.calls)
+        self.assertEqual(ct.normalize(ct.find("w"))["project"], "other")
+
+    def test_bad_project_argument_neither_kills_server_nor_forges_logs(self):
+        ct.project_dir("victim")
+        quiet(ct.create, "x", project="other")
+        lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "notes_write", "arguments": {"text": "t", "project": "../x"}}},
+                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "top", "arguments": {"project": 5}}},
+                 {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "ct_stop", "arguments": {"name": "x", "project": "victim"}}},
+                 {"jsonrpc": "2.0", "id": 5, "method": "ping"}]
+        stdin, stdout = io.StringIO("".join(json.dumps(m) + "\n" for m in lines)), io.StringIO()
+        with unittest.mock.patch("sys.stdin", stdin), contextlib.redirect_stdout(stdout):
+            ct.mcp()
+        replies = [json.loads(l) for l in stdout.getvalue().splitlines()]
+        self.assertEqual([r["id"] for r in replies], [1, 2, 3, 4, 5])                 # still serving
+        self.assertTrue(replies[1]["result"]["isError"])
+        self.assertFalse(os.path.exists(os.path.join(ct.STORE, "projects", "victim", "agent.log")))
+        with open(os.path.join(ct.STORE, "projects", "other", "agent.log")) as f:  # the container's own project
+            self.assertIn("ct_stop", f.read())
+
+    def test_interrupted_remake_is_recovered(self):
+        quiet(ct.create, "w")
+        self.n.run(["rename", "tct-w", "tct-w-OLD"])                                   # power cut mid-remake
+        self.assertEqual(ct.normalize(ct.find("w"))["name"], "w")
+        self.assertIn("tct-w", self.n.objects)
+
+    def test_sandbox_move_is_not_frozen(self):
+        quiet(ct.create, "s", sandbox=True)
+        ct.project_move("s", "p")
+        self.assertFalse(any(c[0] == "commit" for c in self.n.calls))
+
+    def test_systemd_unit(self):
+        calls = []
+        def run(args, **k):
+            calls.append(args); return subprocess.CompletedProcess(args, 0, "", "")
+        home = tempfile.mkdtemp()
+        with unittest.mock.patch.object(ct.subprocess, "run", run), unittest.mock.patch.object(ct, "in_wsl", lambda: False), \
+                unittest.mock.patch.object(ct, "WINDOWS", False), unittest.mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home, "TERMINAL_CT_HOME": "/s t"}):
+            out = ct.autostart(True)
+        with open(out["unit"]) as f:
+            unit = f.read()
+        self.assertNotIn("After=", unit)                                               # ordering cycle with WantedBy
+        self.assertIn("Environment='TERMINAL_CT_HOME=/s t'", unit)
+        self.assertEqual(calls[-1], ["systemctl", "--user", "enable", "terminal-ct-resume.service"])
+
+    def test_autostart_commands(self):
+        calls = []
+        def run(args, **k):
+            calls.append(args); return subprocess.CompletedProcess(args, 0, "", "")
+        with unittest.mock.patch.object(ct.subprocess, "run", run), unittest.mock.patch.object(ct, "in_wsl", lambda: True), \
+                unittest.mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "Debian"}):
+            out = ct.autostart(True)
+        self.assertEqual(calls[0][:5], ["schtasks.exe", "/Create", "/TN", "terminal-ct-resume", "/SC"])
+        self.assertTrue(out["runs"].startswith("conhost.exe --headless wsl.exe -d Debian --exec "))
+        self.assertTrue(out["runs"].endswith(" resume --stay"))
 
 
 @unittest.skipIf(ct.WINDOWS, "desktop containers need a Linux host or WSL")
