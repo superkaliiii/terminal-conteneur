@@ -1,4 +1,4 @@
-import contextlib, io, json, os, shutil, socket, struct, subprocess, sys, tempfile, threading, time, unittest, unittest.mock, zlib
+import base64, contextlib, hashlib, io, re, json, os, shutil, socket, struct, subprocess, sys, tempfile, threading, time, unittest, unittest.mock, zlib
 
 import terminal_ct as ct
 
@@ -787,7 +787,7 @@ class Phase8(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "a66afc10e8c277b0ac2b05f23ed7d5058dfb50aa3bc532170fb4f2993ffada72"
+    SHARED_SHA = "f1c7258c1765ba1682b5e2fb241d7c55b97c6768fb0e10079ae8bec43e333889"
 
     @staticmethod
     def block(path):
@@ -811,6 +811,8 @@ class Nodes(unittest.TestCase):
         self.local = ct.NODE = FakeNode("podman")
         ct.STORE = tempfile.mkdtemp()
         self.engines, self.vm_calls, self.vms = {}, [], {}
+        self.shell, self.files, self.deployed, self.acts = [], {}, {}, []
+        ct._DEPLOYED.clear()
 
         def vm_call(args, timeout=60, **k):
             self.vm_calls.append(args)
@@ -823,9 +825,38 @@ class Nodes(unittest.TestCase):
                 if argv[0] == "docker":
                     r = self.engines.setdefault(name, FakeNode("docker")).run(argv[1:], check=False)
                     return {"exit": r.returncode, "stdout": r.stdout, "stderr": "no such object" if r.returncode else ""}
+                if argv[0] == "sh":
+                    self.shell.append(argv[2])
+                    if "sha256sum" in argv[2]:
+                        return {"exit": 0, "stdout": self.deployed.get(name, ""), "stderr": ""}
+                    for out in re.findall(r"> (/tmp/tct-\w+/out)", argv[2]):
+                        self.files[out] = b"tar of /data"
+                    if argv[2].startswith("test -d"):
+                        return {"exit": 0, "stdout": "file\n", "stderr": ""}
+                    m = re.match(r"docker cp \S+ (/tmp/tct-\w+/out)$", argv[2])
+                    if m:
+                        self.files[m.group(1)] = b"from the container"
+                    return {"exit": 0, "stdout": "", "stderr": ""}
+                if argv[:2] == ["env", f"TERMINAL_CT_HOME={ct.STORE}"]:
+                    self.acts.append(argv[-3:])
+                    if argv[-2] == "screenshot":
+                        out = {"png": base64.b64encode(b"PNG!").decode(), "size": [1280, 800]}
+                    else:
+                        out = {"result": {"ok": argv[-2]}}
+                    return {"exit": 0, "stdout": json.dumps(out), "stderr": ""}
                 if argv[0] == "df":
                     return {"exit": 0, "stdout": "Filesystem 1K-blocks Used Available\n/dev/vda1 20000000 1 10485760 1% /\n"}
                 return {"exit": 0, "stdout": "", "stderr": ""}                   # test -f ready
+            if args[0] == "push":
+                with open(args[2], "rb") as f:
+                    self.files[args[3]] = f.read()
+                if args[3] == ct.NODE_CT + ".new":                             # then checked and moved
+                    self.deployed[args[1]] = hashlib.sha256(self.files[args[3]]).hexdigest()
+                return {}
+            if args[0] == "pull":
+                with open(args[3], "wb") as f:
+                    f.write(self.files[args[2]])
+                return {}
             if args[0] == "create":
                 self.vms[args[1]] = "stopped"
             elif args[0] == "start":
@@ -888,8 +919,6 @@ class Nodes(unittest.TestCase):
         self.cli("node", "add", "n1")
         with self.assertRaisesRegex(SystemExit, "not both"):
             self.cli("--engine", "docker", "--node", "n1", "ls")
-        with self.assertRaisesRegex(SystemExit, "desktop containers on a node"):
-            self.cli("--node", "n1", "create", "d", "--desktop")
         with self.assertRaisesRegex(SystemExit, "already exists"):
             self.cli("node", "add", "n1")
 
@@ -993,10 +1022,73 @@ class Nodes(unittest.TestCase):
             out = ct.reconcile("db")
             self.assertEqual([e["event"] for e in out], ["pending"])                                # never moved
             self.assertEqual(self.local.objects, {})
-        for bad in ({"node": "n1", "spread": "nodes"}, {"node": "n1", "desktop": True},
+        for bad in ({"node": "n1", "spread": "nodes"},
                     {"spread": "nodes", "networks": ["back"]}, {"spread": "all"}):
             with self.assertRaises(SystemExit, msg=bad):
                 ct.check_stack({"stack": "x", "services": {"a": bad}})
+
+    def test_screen_copies_and_builds_in_a_node(self):
+        """9.5: the node's terminal-ct does the screen (copied there once); files cross by push/pull."""
+        self.cli("node", "add", "n1")
+        n = ct.NodeVM("n1")
+        with ct.on_node("n1"):
+            self.assertEqual(ct.act("web", "screenshot", {}), (b"PNG!", (1280, 800)))
+            self.assertEqual(ct.act("web", "click", {"x": 1, "y": 2}), {"ok": "click"})
+        self.assertEqual(sum(1 for c in self.vm_calls if c[:1] == ["push"] and c[3] == ct.NODE_CT + ".new"), 1)  # once
+        self.assertEqual(self.acts[0], ["web", "screenshot", "{}"])
+        ct._DEPLOYED.clear()
+        with ct.on_node("n1"):
+            ct.act("web", "status", {})                                          # same file there: not copied again
+        self.assertEqual(sum(1 for c in self.vm_calls if c[:1] == ["push"] and c[3] == ct.NODE_CT + ".new"), 1)
+        src, out = os.path.join(ct.STORE, "in.tar"), os.path.join(ct.STORE, "out.tar")
+        with open(src, "wb") as f:
+            f.write(b"\x00binary\xff")
+        n.pipe(["cp", "-", "tct-web:/data"], stdin=src)
+        n.pipe(["cp", "tct-web:/data", "-"], stdout=out)
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"tar of /data")
+        self.assertTrue(any(re.match(r"docker cp - tct-web:/data < /tmp/tct-\w+/in >/dev/null$", c) for c in self.shell))
+        self.assertTrue(any(re.match(r"mkdir -m 700 /tmp/tct-\w+$", c) for c in self.shell))  # private to root
+        self.assertTrue(self.shell[-1].startswith("rm -rf /tmp/tct-"))          # nothing left in the node
+        ctx = os.path.join(ct.STORE, "ctx"); os.makedirs(ctx)
+        with open(os.path.join(ctx, "Dockerfile"), "w") as f:
+            f.write("FROM alpine\n")
+        n.run(["build", "-t", "mine", ctx])                                     # the context folder sent as a tar
+        self.assertRegex(self.shell[-2], r"tar -xf /tmp/tct-\w+\.tar -C /tmp/tct-\w+ && docker build -t mine /tmp/tct-")
+        import tarfile
+        pushed = [c for c in self.vm_calls if c[0] == "push"][-1][3]          # the context, pushed last
+        with tarfile.open(fileobj=io.BytesIO(self.files[pushed])) as tar:
+            self.assertTrue(tar.extractfile("./Dockerfile").read().startswith(b"FROM alpine"))
+
+    def test_push_pull_with_a_node_container(self):
+        self.cli("node", "add", "n1")
+        self.cli("--node", "n1", "create", "web")
+        src, back = os.path.join(ct.STORE, "notes.txt"), os.path.join(ct.STORE, "back.txt")
+        with open(src, "wb") as f:
+            f.write(b"hello")
+        self.cli("push", "web", src, "/data/")                                   # routed to n1 by its placement
+        pushed = [c for c in self.vm_calls if c[0] == "push"][-1]
+        self.assertRegex(pushed[3], r"^/tmp/tct-\w+/notes\.txt$")
+        self.assertTrue(any(re.match(r"docker cp -a /tmp/tct-\w+/notes\.txt tct-web:/data/$", c) for c in self.shell))
+        self.cli("pull", "web", "/data/notes.txt", back)
+        with open(back, "rb") as f:
+            self.assertEqual(f.read(), b"from the container")
+        self.assertTrue(self.shell[-1].startswith("rm -rf /tmp/tct-"))           # nothing left in the node
+
+    def test_untrusted_tar_refused_without_the_data_filter(self):
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for name, kind in (("out/ok.txt", tarfile.REGTYPE), ("out/../../evil", tarfile.REGTYPE)):
+                ti = tarfile.TarInfo(name); ti.type = kind; tar.addfile(ti, io.BytesIO(b""))
+        for has_filter in (True, False):
+            buf.seek(0)
+            with tarfile.open(fileobj=buf) as tar, tempfile.TemporaryDirectory() as d:
+                with unittest.mock.patch.object(tarfile, "data_filter", tarfile.data_filter, create=True) if has_filter \
+                        else unittest.mock.patch.object(ct, "tarfile", type("T", (), {"open": tarfile.open})):
+                    with self.assertRaises((SystemExit, tarfile.TarError)):
+                        ct._extract(tar, d)
+                self.assertFalse(os.path.exists(os.path.join(d, "..", "evil")))
 
     def test_engine_errors_and_free_space(self):
         n = ct.NodeVM("n1")
@@ -1010,8 +1102,7 @@ class Nodes(unittest.TestCase):
         with ct.on_node("n1"):
             limits, set_ = ct.quota_limits({})
         self.assertEqual((limits["cpus"], limits["memory_gb"], set_["cpus"]), (8, 16, False))  # the node's own size
-        with self.assertRaisesRegex(SystemExit, "come later"):
-            n.pipe(["cp"])
+
 
 
 class SnapshotsAndClones(unittest.TestCase):

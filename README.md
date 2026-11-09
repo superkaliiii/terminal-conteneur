@@ -92,8 +92,13 @@ of a VM, the lightness of containers inside it.
   `"spread": "nodes"` spreads them over the running nodes, the least loaded first, and moves a node's replicas to
   another when it is down (`failover` events; their `/data` does not follow). When the node is back, the copies left
   there are removed. Real run (WSL, two Alpine nodes, 3 replicas): node killed, its 2 replicas made again and running
-  on the other in 23 s; old copies gone at its return. Not yet with desktops or isolated networks.
-- Not yet in a node: desktops, file copies, snapshots and clones (later steps of phase 9).
+  on the other in 23 s; old copies gone at its return. Not yet with isolated networks (phase 10).
+- Desktops in a node (`--node N create NAME --desktop`, or a stack service): the desktop image is built in the node
+  (its context sent there), and the screen tools (`action`, MCP screenshot/click/type/key/wait, dashboard
+  thumbnails) are run by a copy of terminal-ct the host puts in the node, next to the desktop's socket (copied again
+  when it changes). About 1.5 s per action from the CLI. `view` and `show` stay for this host's desktops.
+- `push`/`pull`, image builds, snapshots: files and folders cross by the guest agent through a temporary folder of
+  the node (folders as tar archives), removed after.
 
 ## Desktops
 

@@ -39,7 +39,7 @@ labels; containers without them are never touched.
 Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if installed, else docker).
 """
 import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, \
-    shlex, shutil, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, webbrowser, zlib
+    shlex, shutil, socket, socketserver, struct, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, webbrowser, zlib
 
 VERSION = "0.9.0"
 WINDOWS = os.name == "nt"
@@ -166,6 +166,20 @@ class NodeVM(Node):
         self.name, self.engine, self.timeout = name, "docker", timeout  # timeout: each call's, when looking around
 
     def run(self, args, check=True, timeout=None, capture=True):
+        if args[0] == "build" and os.path.isdir(args[-1]):  # a context folder of this host: unpacked in the node
+            remote = f"/tmp/tct-{secrets.token_hex(6)}"
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    _tar(args[-1], ".", os.path.join(tmp, "context.tar"))
+                    self.copy("push", os.path.join(tmp, "context.tar"), remote + ".tar")
+                out = self.sh(f"mkdir -m 700 {remote} && tar -xf {remote}.tar -C {remote} && docker "
+                              + " ".join(shlex.quote(a) for a in args[:-1]) + f" {remote}", timeout=3600)
+            finally:
+                with contextlib.suppress(SystemExit):
+                    self.sh(f"rm -rf {remote} {remote}.tar", timeout=60)
+            if not capture:
+                sys.stderr.write(out)
+            return subprocess.CompletedProcess(["docker", *args], 0, out, "")
         t = timeout or self.timeout or (600 if capture else 3600)  # uncaptured: a pull or a build, minutes
         try:
             r = vm_call(["exec", self.name, "--timeout", str(t), "--", "docker", *args], timeout=t + 30)
@@ -191,9 +205,126 @@ class NodeVM(Node):
         except (RuntimeError, subprocess.TimeoutExpired, KeyError, IndexError, ValueError) as e:
             raise SystemExit(f"node {self.name}: cannot read its free disk space ({e})") from None
 
+    def sh(self, command, timeout=600):
+        """A shell command in the node, as root; its output, or SystemExit with its error."""
+        try:
+            r = vm_call(["exec", self.name, "--timeout", str(timeout), "--", "sh", "-c", command], timeout=timeout + 30)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            raise SystemExit(f"node {self.name}: {e}") from None
+        if r.get("exit"):
+            raise SystemExit((r.get("stderr") or r.get("stdout") or f"node {self.name}: command failed").strip())
+        return r.get("stdout", "")
+
+    def copy(self, direction, src, dest):
+        """A file into (push) or out of (pull) the node, by its guest agent (any size, binary)."""
+        try:
+            vm_call([direction, self.name, src, dest], timeout=3600)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            raise SystemExit(f"node {self.name}: copy failed ({e})") from None
+
     def pipe(self, args, stdin=None, stdout=None):
-        # shortcut: no binary streams through the guest agent yet; file copies and snapshots on a node come in 9.5
-        raise SystemExit(f"file copies and snapshots of a container on a node come later (node {self.name})")
+        """An engine call with binary files as stdin/stdout (tar streams): the files cross by the guest agent."""
+        tmp = f"/tmp/tct-{secrets.token_hex(6)}"
+        self.sh(f"mkdir -m 700 {tmp}", timeout=30)  # the node's other users never read the stream
+        try:
+            if stdin:
+                self.copy("push", stdin, f"{tmp}/in")
+            self.sh("docker " + " ".join(shlex.quote(a) for a in args) + (f" < {tmp}/in" if stdin else " </dev/null")
+                    + (f" > {tmp}/out" if stdout else " >/dev/null"), timeout=3600)
+            if stdout:
+                self.copy("pull", f"{tmp}/out", stdout)
+        finally:
+            with contextlib.suppress(SystemExit):
+                self.sh(f"rm -rf {tmp}", timeout=30)
+
+    def deploy(self):
+        """This terminal_ct.py in the node (its screen tools run there, next to the desktop's socket); copied again
+        when it changed."""
+        if self.name in _DEPLOYED:
+            return
+        with open(os.path.abspath(__file__), "rb") as f:
+            mine = hashlib.sha256(f.read()).hexdigest()
+        if mine not in self.sh(f"sha256sum {NODE_CT} 2>/dev/null || true", timeout=30):
+            self.sh(f"mkdir -p {os.path.dirname(NODE_CT)}", timeout=30)
+            self.copy("push", os.path.abspath(__file__), NODE_CT + ".new")  # run as root there: never half written
+            self.sh(f"echo '{mine}  {NODE_CT}.new' | sha256sum -c - >/dev/null && mv {NODE_CT}.new {NODE_CT}", timeout=30)
+        _DEPLOYED.add(self.name)
+
+    def act(self, name, tool, a):
+        """act() run by terminal-ct in the node: same replies (a screenshot comes back as PNG bytes)."""
+        self.deploy()
+        t = int(float(a.get("timeout", 30))) + 60 if tool in ("wait", "ready") else 60
+        try:
+            r = vm_call(["exec", self.name, "--timeout", str(t), "--", "env", f"TERMINAL_CT_HOME={STORE}",
+                         "TERMINAL_CT_ENGINE=docker", "python3", NODE_CT, "_act", name, tool, json.dumps(a)],
+                        timeout=t + 30)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            raise RuntimeError(f"node {self.name}: {e}") from None
+        if r.get("exit"):
+            raise RuntimeError((r.get("stderr") or "").strip().splitlines()[-1:][0] if (r.get("stderr") or "").strip()
+                               else f"node {self.name}: {tool} failed")
+        try:
+            out = json.loads(r["stdout"])
+            return (base64.b64decode(out["png"]), tuple(out["size"])) if tool == "screenshot" else out["result"]
+        except (ValueError, KeyError, TypeError) as e:  # cut short (the agent keeps 16 MB of output) or not ours
+            raise RuntimeError(f"node {self.name}: unreadable reply to {tool} ({e})") from None
+
+    def transfer(self, direction, src, container, dest):
+        """push/pull with a container of the node: through a folder of the node, as `docker cp` would do here
+        (a folder crosses as a tar)."""
+        q, tmp = shlex.quote, f"/tmp/tct-{secrets.token_hex(6)}"
+        self.sh(f"mkdir -m 700 {tmp}", timeout=30)
+        try:
+            if direction == "push":
+                base = os.path.basename(os.path.normpath(src))
+                if os.path.isdir(src):
+                    with tempfile.TemporaryDirectory() as t:
+                        _tar(src, base, os.path.join(t, "x.tar"))
+                        self.copy("push", os.path.join(t, "x.tar"), f"{tmp}.tar")  # beside: any folder name is free
+                    self.sh(f"tar -xf {tmp}.tar -C {tmp}", timeout=600)
+                else:
+                    self.copy("push", src, f"{tmp}/{base}")
+                self.sh(f"docker cp -a {q(f'{tmp}/{base}')} {q(f'{container}:{dest}')}", timeout=600)
+                return
+            self.sh(f"docker cp {q(f'{container}:{src}')} {tmp}/out", timeout=600)
+            if os.path.isdir(dest):  # as docker cp: into an existing folder, under the source's name
+                dest = os.path.join(dest, os.path.basename(src.rstrip("/")) or "out")
+            if self.sh(f"test -d {tmp}/out && echo dir || echo file", timeout=30).strip() == "file":
+                return self.copy("pull", f"{tmp}/out", dest)
+            self.sh(f"tar -cf {tmp}.tar -C {tmp} out", timeout=600)
+            with tempfile.TemporaryDirectory() as t:
+                self.copy("pull", f"{tmp}.tar", os.path.join(t, "x.tar"))
+                with tarfile.open(os.path.join(t, "x.tar")) as tar:
+                    _extract(tar, t)
+                shutil.move(os.path.join(t, "out"), dest)
+        finally:
+            with contextlib.suppress(SystemExit):
+                self.sh(f"rm -rf {tmp} {tmp}.tar", timeout=60)
+
+
+def _tar(src, arcname, path):
+    """A tar of src that busybox's tar reads too (GNU long names), or SystemExit."""
+    try:
+        with tarfile.open(path, "w", format=tarfile.GNU_FORMAT) as tar:
+            tar.add(src, arcname=arcname)
+    except (ValueError, OSError) as e:
+        raise SystemExit(f"cannot pack {src}: {e}") from None
+
+
+def _extract(tar, dest):
+    """Extract a tar that came out of a container (not trusted): nothing outside dest, no devices, no setuid."""
+    if hasattr(tarfile, "data_filter"):
+        return tar.extractall(dest, filter="data")
+    for m in tar.getmembers():  # what the "data" filter does, for Pythons without it
+        parts = m.name.split("/") + (m.linkname.split("/") if m.issym() or m.islnk() else [])
+        if m.isdev() or os.path.isabs(m.name) or ".." in parts or (m.issym() or m.islnk()) and os.path.isabs(m.linkname):
+            raise SystemExit(f"refused in the copy: {m.name}")
+        m.mode &= 0o777
+    tar.extractall(dest)
+
+
+NODE_CT = "/var/lib/terminal-ct/terminal_ct.py"  # terminal-ct's copy in each node
+_DEPLOYED = set()  # nodes this process already checked
 
 
 def _nodes():
@@ -303,6 +434,7 @@ def node_rm(name, force=False):
         d["nodes"].pop(name, None)
         d["placement"] = {c: n for c, n in d["placement"].items() if n != name}
         _save_nodes(d)
+    _DEPLOYED.discard(name)  # a new node of that name has no terminal-ct yet
     event("node_removed", None, detail=name)
     return {"removed": name, "containers": on}
 
@@ -470,10 +602,10 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     recover(name)  # an interrupted remake's container is still NAME's: never create over it
     if node().run(["inspect", "--type", "container", PREFIX + name], check=False).returncode == 0:
         raise SystemExit(f"{name!r} already exists (engine name {PREFIX}{name})")
-    if desktop and isinstance(node(), NodeVM):
-        raise SystemExit("desktop containers on a node come later (phase 9.5): create it on this host")
     if desktop:
-        if WINDOWS:  # shortcut: the VNC unix socket does not cross into Windows; run terminal-ct inside WSL there
+        # shortcut: the VNC unix socket does not cross into Windows, and a node's paths would be Windows ones;
+        # run terminal-ct inside WSL there
+        if WINDOWS:
             raise SystemExit("desktop containers need a Linux host or WSL (the screen is reached through a unix socket)")
         if not (640 <= width <= 7680 and 480 <= height <= 4320):
             raise SystemExit("invalid --width/--height")
@@ -516,6 +648,10 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
         # LANG: without UTF-8, xterm wrote é as Latin-1
         extra += ["-e", "LANG=C.UTF-8", "-e", f"TCT_WIDTH={spec['width']}", "-e", f"TCT_HEIGHT={spec['height']}",
                   "-v", f"{os.path.join(ct_dir(name), 'run')}:/run/tct"]
+        if isinstance(node(), NodeVM):  # there, the engine would make it as root: the desktop's user could not write
+            uid, gid = (1000, 1000) if WINDOWS else (os.getuid(), os.getgid())
+            run = shlex.quote(os.path.join(ct_dir(name), "run"))
+            node().sh(f"mkdir -p {run} && chown {uid}:{gid} {run} && chmod 700 {run}", timeout=30)
         cmd = ["sh", "-c", DESKTOP_RUN]
     else:
         entry, default = image_cmd(image)
@@ -708,19 +844,26 @@ def start(name):
             node().run(["start", PREFIX + name])
     want(name, "running")
     if labels_of(info).get(f"{LABEL}.desktop") == "1":
-        # an empty screen looks "stable" too: return once the desktop shows a window (1% of the screen not
-        # black; the pointer alone is drawn into the image), so input lands on it
-        t0, end = time.time(), time.time() + 10
-        while time.time() < end:
-            try:
-                fb = _pixels(name)
-                if len(fb) - fb.count(0) > len(fb) // 100:
-                    out["desktop_ready"] = round(time.time() - t0, 1)
-                    break
-            except RuntimeError:  # socket not there yet
-                pass
-            time.sleep(0.25)
+        with contextlib.suppress(RuntimeError):
+            ready = act(name, "ready", {})
+            if ready is not None:
+                out["desktop_ready"] = ready
     print(json.dumps(out))
+
+
+def desktop_ready(name, timeout=10):
+    """Seconds until the desktop shows a window (1% of the screen not black; the pointer alone is drawn into the
+    image), so input lands on it: an empty screen looks "stable" too. None if not within timeout."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            fb = _pixels(name)
+            if len(fb) - fb.count(0) > len(fb) // 100:
+                return round(time.time() - t0, 1)
+        except RuntimeError:  # socket not there yet
+            pass
+        time.sleep(0.25)
+    return None
 
 
 def stop(name, timeout=10):
@@ -1335,8 +1478,8 @@ def check_stack(s):
             raise SystemExit(f'service {svc}: spread is "nodes" (its replicas across the nodes)')
         if c.get("node") and c.get("spread"):
             raise SystemExit(f"service {svc}: node (all replicas there) or spread, not both")
-        if (c.get("node") or c.get("spread")) and (c.get("desktop") or c.get("networks")):
-            raise SystemExit(f"service {svc}: desktops and isolated networks on nodes come later; leave node/spread out")
+        if (c.get("node") or c.get("spread")) and c.get("networks"):
+            raise SystemExit(f"service {svc}: isolated networks on nodes come later; leave node/spread out")
         h = c.get("health")
         if h is not None:
             if not isinstance(h, dict) or not isinstance(h.get("exec"), str):
@@ -2483,12 +2626,13 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         try:
             body = None
             if method == "POST":
-                if self.headers.get_content_type() != "application/json":  # no cross-site "simple" request
-                    raise ValueError("Content-Type must be application/json")
                 n = int(self.headers.get("Content-Length") or 0)
                 if not 0 <= n <= 2 ** 20:
                     raise ValueError("body too large")
-                body = json.loads(self.rfile.read(n) or b"null")
+                raw = self.rfile.read(n)  # read even when refused: unread data makes Windows reset the connection
+                if self.headers.get_content_type() != "application/json":  # no cross-site "simple" request
+                    raise ValueError("Content-Type must be application/json")
+                body = json.loads(raw or b"null")
             ctype, out = web_api(method, u.path, dict(urllib.parse.parse_qsl(u.query)), body)
             self._send(200, ctype, out)
         except NoRoute:
@@ -2656,7 +2800,8 @@ function renderCts(d) {
         button("restart", {op: "restart", name: r.name}), logsButton(r.name),
         r.flags.includes("D") && run ? shotButton("ct", r.name) : null,
         button("rm", {op: "rm", name: r.name}, "Remove " + r.name + " and its /data?" + (r.stack ? " (a stack replica: the daemon makes it again, with an empty /data)" : ""), "danger")]);
-    tb.append(keyed(r.name, {acts}, h("td", null, h("b", {textContent: r.name})), h("td", {className: r.status, textContent: r.status}),
+    tb.append(keyed(r.name, {acts}, h("td", null, h("b", {textContent: r.name}),
+      r.node ? h("span", {className: "mute", textContent: " @" + r.node, title: "in node " + r.node}) : null), h("td", {className: r.status, textContent: r.status}),
       h("td", {className: r.health.split(" ")[0], textContent: r.health}), h("td", {textContent: r.project}), h("td", {textContent: r.stack || "-"}),
       h("td", null, spark(hh.cpu, Math.max(100, cpuMax), css("--cpu")), r.cpu_percent == null ? "-" : r.cpu_percent + "%"),
       h("td", null, spark(hh.mem, memMax, css("--mem")), (r.used_memory_gb == null ? "-" : r.used_memory_gb) + " / " + (r.memory_gb || "-") + " GiB"),
@@ -2980,6 +3125,9 @@ def transfer(name, direction, src, dest):
     """push NAME LOCAL PATH | pull NAME PATH LOCAL: files in or out, running or stopped. A sandbox's /data is in
     memory: reachable only while it runs, and gone at its stop."""
     find(name)
+    if isinstance(node(), NodeVM):  # the engine is in the node: this host's paths cross by its guest agent
+        node().transfer(direction, src, PREFIX + name, dest)
+        return {direction: name, "from": src, "to": dest}
     args = [src, f"{PREFIX}{name}:{dest}"] if direction == "push" else [f"{PREFIX}{name}:{src}", dest]
     # -a: the host file's owner kept (Docker made it root's, which a desktop's user could not change; Podman's
     # default already)
@@ -3135,6 +3283,9 @@ def desktop(name):
         raise RuntimeError(f"{name} has no desktop (create it with --desktop)")
     if (info.get("State") or {}).get("Status") != "running":
         raise RuntimeError(f"{name} is not running; start it: terminal-ct start {name}")
+    if isinstance(node(), NodeVM):
+        raise RuntimeError(f"{name} lives in node {node().name}: its screen is reached through screenshot and the "
+                           "other actions (view and show work for this host's desktops)")
     path = os.path.join(STORE, name, "run", "vnc.sock")
     for _ in range(50):  # the desktop may still be starting
         if os.path.exists(path):
@@ -3145,6 +3296,10 @@ def desktop(name):
 
 def act(name, tool, a):
     """Shared by the CLI and MCP. Coordinates are pixels of the latest screenshot."""
+    if isinstance(node(), NodeVM):  # the desktop's socket is in the node: terminal-ct there does it
+        return node().act(name, tool, a)
+    if tool == "ready":
+        return desktop_ready(name, float(a.get("timeout", 10)))
     r = desktop(name)
     try:
         if tool == "screenshot":
@@ -3213,6 +3368,9 @@ def settled_screenshot(name, before=None, timeout=1.5):
 
 
 def _pixels(name):
+    """The screen's content, to see it change: the raw frame here; in a node, its screenshot (same use)."""
+    if isinstance(node(), NodeVM):
+        return node().act(name, "screenshot", {})[0]
     r = desktop(name)
     try:
         return bytes(r.refresh().fb)
@@ -4138,8 +4296,21 @@ def doctor():
         sys.exit(1)
 
 
+def _act_cli(name, tool, a):
+    """Internal (a node's copy, called by the host's terminal-ct): act() as one JSON line."""
+    try:
+        r = act(name, tool, json.loads(a))
+    except (RuntimeError, ValueError, KeyError, OSError) as e:
+        print(str(e) or type(e).__name__, file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({"png": base64.b64encode(r[0]).decode(), "size": list(r[1])} if tool == "screenshot"
+                     else {"result": r}))
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["_act"] and len(argv) == 4:
+        return _act_cli(*argv[1:])
     cmd_args = []
     if "--" in argv:  # create NAME ... -- CMD: everything after -- is the container's command
         i = argv.index("--")
