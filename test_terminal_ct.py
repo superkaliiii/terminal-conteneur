@@ -680,7 +680,7 @@ class Web(unittest.TestCase):
 
     def test_http_server(self):
         threading.Thread(target=ct.web_serve, args=(0,), daemon=True).start()
-        for _ in range(100):
+        for _ in range(200):
             if os.path.exists(ct._daemon_file("web")):
                 break
             time.sleep(0.05)

@@ -39,7 +39,7 @@ labels; containers without them are never touched.
 Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if installed, else docker).
 """
 import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, \
-    shlex, shutil, socket, struct, subprocess, sys, threading, time, urllib.parse, webbrowser, zlib
+    shlex, shutil, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, webbrowser, zlib
 
 VERSION = "0.8.0"
 WINDOWS = os.name == "nt"
@@ -2036,6 +2036,10 @@ class _WebServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = not WINDOWS  # on Windows it lets a second process bind the same port
     allow_reuse_port = False  # never share the port with another store's daemon
+
+    def server_bind(self):  # HTTPServer's also looks up this host's FQDN: seconds on some Macs, and unused here
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 class _WebHandler(http.server.BaseHTTPRequestHandler):
