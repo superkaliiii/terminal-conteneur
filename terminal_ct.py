@@ -40,7 +40,7 @@ Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if inst
 """
 import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, \
     shlex, shutil, socket, socketserver, struct, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, webbrowser, zlib
-import importlib.util
+import importlib.util, ipaddress
 
 VERSION = "0.9.0"
 WINDOWS = os.name == "nt"
@@ -4347,6 +4347,131 @@ def doctor():
         sys.exit(1)
 
 
+# ---------- the nodes' DNS (phase 10): service names of one isolated network, nothing else ----------
+# Run by terminal-ct in a node, one per network, on that Docker network's gateway address only. Authoritative only:
+# it never forwards, caches or looks anything up (no open resolver, no amplification); any other name is REFUSED, so
+# the container's resolver asks its next server. Its table is a file terminal-ct writes (root's, replaced whole);
+# nothing changes it over the network. Strict parsing; malformed packets get no answer; a rate limit per source.
+
+DNS_MAX = 512  # bytes of a query (and of an answer): plain UDP DNS, no EDNS
+DNS_TTL = 5  # seconds: a failover shows within moments
+DNS_MAX_ADDRS = 8
+DNS_RATE = (50, 100)  # queries per second per source, burst
+_DNS_LABEL = re.compile(rb"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def dns_table(text):
+    """{name: [IPv4, ...]} from the table file's JSON; anything not clean is left out."""
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        return {}
+    out = {}
+    for name, addrs in (raw.items() if isinstance(raw, dict) else ()):
+        if not (isinstance(name, str) and isinstance(addrs, list) and len(name) <= 253 and
+                all(_DNS_LABEL.fullmatch(l.encode()) for l in name.lower().split("."))):
+            continue
+        ips = []
+        for a in addrs[:DNS_MAX_ADDRS]:
+            if isinstance(a, str):  # IPv4Address(7) would be 0.0.0.7
+                with contextlib.suppress(ValueError):
+                    ips.append(ipaddress.IPv4Address(a).packed)
+        out[name.lower()] = ips
+    return out
+
+
+def dns_answer(packet, table):
+    """The reply to one query (bytes), or None to stay silent (malformed, not a query). Pure: tested alone."""
+    if not 12 + 5 <= len(packet) <= DNS_MAX:
+        return None
+    qid, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", packet[:12])
+    if flags & 0x8000 or (flags >> 11) & 0xF or qd != 1 or an or ns or ar > 1:  # a response, not QUERY, not 1 question
+        return None
+    labels, i = [], 12
+    while True:
+        if i >= len(packet):
+            return None
+        n = packet[i]
+        if n == 0:
+            i += 1
+            break
+        if n & 0xC0 or n > 63 or i + 1 + n > len(packet):  # no compression in a question; label bounds
+            return None
+        # any bytes: a well-formed name we do not hold (_tcp...) gets REFUSED, not silence (the client would wait)
+        label = packet[i + 1:i + 1 + n].decode("latin-1").lower()
+        labels.append(label if "." not in label else "\0")  # a dot inside a label never matches a two-label name
+        i += 1 + n
+    if i + 4 > len(packet) or len(".".join(labels)) > 253 or not labels:
+        return None
+    qtype, qclass = struct.unpack("!HH", packet[i:i + 4])
+    question = packet[12:i + 4]
+    name = ".".join(labels)
+    rd = flags & 0x0100
+    if qclass != 1 or name not in table:  # not ours: REFUSED, never looked up elsewhere
+        return struct.pack("!HHHHHH", qid, 0x8000 | rd | 5, 1, 0, 0, 0) + question
+    addrs = table[name][:DNS_MAX_ADDRS] if qtype == 1 else []  # AAAA and the rest: no data
+    answers = b"".join(struct.pack("!HHHIH", 0xC00C, 1, 1, DNS_TTL, 4) + a for a in addrs)
+    return struct.pack("!HHHHHH", qid, 0x8000 | 0x0400 | rd, 1, len(addrs), 0, 0) + question + answers
+
+
+def _dns_read(table_path, seen):
+    """(table, key) when the file changed since `seen` (key: inode, time, size: a rename always shows), else None."""
+    st = os.stat(table_path)
+    key = (st.st_ino, st.st_mtime_ns, st.st_size)
+    if key == seen:
+        return None
+    with open(table_path, encoding="utf-8") as f:
+        return dns_table(f.read()), key
+
+
+def dns_serve(listen, table_path, port=53, user="nobody", device=None):
+    """The server for one network. listen: its gateway with the network's prefix (10.88.0.1/24); only sources of
+    that subnet are answered (Linux would deliver another network's packets to this address too, and a spoofed
+    source would make it reflect at someone else). device: the network's bridge, the socket bound to it alone.
+    Root is dropped once port 53 is bound and the table read."""
+    iface = ipaddress.IPv4Interface(listen)
+    ip = iface.ip
+    if ip.is_unspecified or ip.is_multicast or ip == ipaddress.IPv4Address("255.255.255.255") or \
+            iface.network.prefixlen < 8:
+        raise SystemExit("the DNS listens on one network's gateway address, never on all of them")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if device:  # Linux: SO_BINDTODEVICE (root only, so before the drop)
+        sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), device.encode())
+    sock.bind((str(ip), port))
+    table, seen = _dns_read(table_path, None)  # unreadable: fail now, not answer REFUSED forever
+    if hasattr(os, "geteuid") and os.geteuid() == 0:  # drop root for good
+        import pwd
+        pw = pwd.getpwnam(user)
+        os.setgroups([])
+        os.setgid(pw.pw_gid)
+        os.setuid(pw.pw_uid)
+        if os.getuid() == 0 or os.geteuid() == 0 or not os.access(table_path, os.R_OK):
+            raise SystemExit(f"the DNS could not drop root, or {user} cannot read {table_path}")
+    buckets = {}
+    while True:
+        try:
+            data, (src, sport) = sock.recvfrom(DNS_MAX + 1)
+            if ipaddress.IPv4Address(src) not in iface.network:
+                continue  # not from this network: no answer, and no reflection elsewhere
+            with contextlib.suppress(OSError, ValueError):
+                got = _dns_read(table_path, seen)
+                if got:
+                    table, seen = got
+            now = time.monotonic()
+            if len(buckets) > 4096:  # bounded by the subnet already; never rebuilt per packet
+                buckets.clear()
+            tokens, last = buckets.get(src, (DNS_RATE[1], now))
+            tokens = min(DNS_RATE[1], tokens + (now - last) * DNS_RATE[0])
+            buckets[src] = (tokens - 1 if tokens >= 1 else tokens, now)
+            if tokens < 1:
+                continue  # over its rate: dropped
+            reply = dns_answer(data, table)
+            if reply:
+                sock.sendto(reply, (src, sport))
+        except Exception:  # one bad packet or a send failing must not end the service
+            continue
+
+
 def _act_cli(name, tool, a):
     """Internal (a node's copy, called by the host's terminal-ct): act() as one JSON line."""
     try:
@@ -4362,6 +4487,8 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["_act"] and len(argv) == 4:
         return _act_cli(*argv[1:])
+    if argv[:1] == ["_dns"] and len(argv) == 4:  # internal, in a node: GATEWAY/PREFIX BRIDGE TABLE_FILE
+        return dns_serve(argv[1], argv[3], device=argv[2])
     cmd_args = []
     if "--" in argv:  # create NAME ... -- CMD: everything after -- is the container's command
         i = argv.index("--")

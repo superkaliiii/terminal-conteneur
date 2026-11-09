@@ -1153,6 +1153,90 @@ class Nodes(unittest.TestCase):
 
 
 
+def dns_query(name, qtype=1, qid=0x1234, flags=0x0100, qd=1, raw_name=None):
+    q = raw_name if raw_name is not None else b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0"
+    return struct.pack("!HHHHHH", qid, flags, qd, 0, 0, 0) + q + struct.pack("!HH", qtype, 1)
+
+
+class NodeDns(unittest.TestCase):
+    """Phase 10.3: the nodes' DNS is authoritative only, strict, and silent on anything malformed."""
+    TABLE = ct.dns_table(json.dumps({"web": ["10.77.1.2", "10.77.1.3"], "web.lab": ["10.77.1.2"], "db": []}))
+
+    def reply(self, packet):
+        r = ct.dns_answer(packet, self.TABLE)
+        if r is None:
+            return None
+        qid, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", r[:12])
+        ips = [socket.inet_ntoa(r[-16 * an:][i * 16 + 12:i * 16 + 16]) for i in range(an)] if an else []
+        return {"id": qid, "rcode": flags & 0xF, "aa": bool(flags & 0x400), "rd": bool(flags & 0x100), "ips": ips,
+                "ttl": struct.unpack("!I", r[-16 * an + 6:-16 * an + 10])[0] if an else None}
+
+    def test_answers_its_names_only(self):
+        r = self.reply(dns_query("WEB"))                                            # names are case-insensitive
+        self.assertEqual((r["id"], r["rcode"], r["aa"], r["rd"], r["ips"], r["ttl"]),
+                         (0x1234, 0, True, True, ["10.77.1.2", "10.77.1.3"], 5))
+        self.assertEqual(self.reply(dns_query("web.lab"))["ips"], ["10.77.1.2"])
+        self.assertEqual((self.reply(dns_query("example.com"))["rcode"], self.reply(dns_query("example.com"))["ips"]),
+                         (5, []))                                                    # REFUSED: never looked up
+        self.assertEqual(self.reply(dns_query("web", qtype=28))["ips"], [])         # AAAA: no data, no error
+        self.assertEqual(self.reply(dns_query("web", qtype=28))["rcode"], 0)
+        self.assertEqual(self.reply(dns_query("db"))["ips"], [])                    # known, nowhere running now
+        for odd in (b"\x04_tcp\x03web\0", b"\x03w_b\0", b"\x07web.lab\0", b"\x03w\xffb\0"):
+            r = self.reply(dns_query("", raw_name=odd))                              # well formed, not ours
+            self.assertEqual((r["rcode"], r["ips"]), (5, []), odd)                  # REFUSED, not silence
+        many = ct.dns_table(json.dumps({"big": [f"10.77.1.{i}" for i in range(1, 40)]}))
+        self.assertEqual(len(ct.dns_answer(dns_query("big"), many)) - len(dns_query("big")) - 0, 8 * 16)  # 8 at most
+
+    def test_malformed_gets_no_answer(self):
+        bad = [b"", b"\0" * 11, dns_query("web", flags=0x8100),                     # a response, not a query
+               dns_query("web", flags=0x2900),                                       # not opcode QUERY (UPDATE)
+               dns_query("web", qd=2), dns_query("web") + b"x" * 600,               # two questions; too long
+               dns_query("", raw_name=b"\xc0\x0c"),                                # a compression pointer
+               dns_query("", raw_name=b"\x40" + b"a" * 64 + b"\0"),               # a label over 63
+               dns_query("", raw_name=b"\x03web"),                                  # cut short
+               dns_query("", raw_name=b"\0")]                                        # the root name
+        for packet in bad:
+            self.assertIsNone(ct.dns_answer(packet, self.TABLE), packet[:40])
+
+    def test_table_keeps_only_clean_entries(self):
+        t = ct.dns_table(json.dumps({"ok": ["10.0.0.1", "nope", 7, "::1"], "Bad Name": ["10.0.0.2"], "x": "10.0.0.3",
+                                     "a-": ["10.0.0.4"]}))
+        self.assertEqual(t, {"ok": [socket.inet_aton("10.0.0.1")]})
+        self.assertEqual(ct.dns_table("not json"), {})
+
+    def test_server_one_address_rate_limited(self):
+        for wild in ("0.0.0.0/24", "224.0.0.1/24", "255.255.255.255/32", "10.0.0.1/0"):
+            with self.assertRaisesRegex(SystemExit, "never on all", msg=wild):
+                ct.dns_serve(wild, "x")
+        with self.assertRaises(ValueError):
+            ct.dns_serve("example.com", "x")
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]; probe.close()
+        d = tempfile.mkdtemp(); self.addCleanup(shutil.rmtree, d, True)
+        table = os.path.join(d, "table.json")
+        with open(table, "w") as f:
+            json.dump({"web": ["10.77.1.2"]}, f)
+        threading.Thread(target=ct.dns_serve, args=("127.0.0.1/8", table, port), daemon=True).start()
+        time.sleep(0.3)
+        c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); c.settimeout(1)
+        self.addCleanup(c.close)
+        c.sendto(dns_query("web"), ("127.0.0.1", port))
+        self.assertEqual(ct.dns_answer(dns_query("web"), ct.dns_table('{"web": ["10.77.1.2"]}')), c.recv(600))
+        with open(table, "w") as f:
+            json.dump({"web": ["10.77.1.9"]}, f)                                    # rewritten: seen at once
+        os.utime(table, (time.time() + 5, time.time() + 5))
+        c.sendto(dns_query("web"), ("127.0.0.1", port))
+        self.assertTrue(c.recv(600).endswith(socket.inet_aton("10.77.1.9")))
+        for _ in range(300):                                                          # a flood from one source
+            c.sendto(dns_query("web"), ("127.0.0.1", port))
+        got = 0
+        c.settimeout(0.5)
+        with contextlib.suppress(socket.timeout):
+            while True:
+                c.recv(600); got += 1
+        self.assertLess(got, 250)                                                     # the burst, not all of it
+
+
 class SnapshotsAndClones(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
