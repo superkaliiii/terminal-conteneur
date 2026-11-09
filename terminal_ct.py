@@ -345,26 +345,7 @@ def _agent_path(f):
 def agent_credentials(rotate=False):
     """(certificate SHA-256, token) of this PC's agent: the certificate made once (openssl), a new token on rotate."""
     cert, tok = _agent_path("cert.pem"), _agent_path("token")  # cert.pem holds the certificate and its key
-    if not os.path.isfile(cert):
-        exe = shutil.which("openssl")
-        if not exe:
-            raise SystemExit("agent needs openssl once, to make its certificate (Linux, macOS, WSL and Git for Windows "
-                             "have it); or reach this PC over SSH instead (host add NAME ssh://user@pc)")
-        new, key = f"{cert}.{os.getpid()}.new", f"{cert}.{os.getpid()}.key"  # two first starts: each its own files
-        r = subprocess.run([exe, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-subj",
-                            "/CN=terminal-ct agent", "-keyout", key, "-out", new],
-                           capture_output=True, text=True, **NO_WINDOW)
-        try:
-            if r.returncode:
-                raise SystemExit(f"openssl: {r.stderr.strip()}")
-            os.chmod(new, 0o600)
-            with open(new, "a") as f, open(key) as k:  # one file, one replace: never a key of another start
-                f.write(k.read())
-            os.replace(new, cert)
-        finally:
-            for x in (new, key):
-                with contextlib.suppress(OSError):
-                    os.remove(x)
+    fp = tls_cert(cert)  # the same maker as the shared dashboard's
     if rotate or not os.path.isfile(tok):
         _web_write(tok, secrets.token_urlsafe(32), 0o600)
     with open(tok) as f:  # what the file says: another start may have written it first
@@ -373,9 +354,7 @@ def agent_credentials(rotate=False):
         _web_write(tok, secrets.token_urlsafe(32), 0o600)
         with open(tok) as f:
             token = f.read().strip()
-    with open(cert) as f:
-        pem = f.read()
-    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem[:pem.index("-----END CERTIFICATE-----") + 25])).hexdigest(), token
+    return fp, token
 
 
 AGENT_LOG_MAX = 5 * 2 ** 20
@@ -3353,13 +3332,13 @@ def vm_screenshot(name):
     path = os.path.join(STORE, "web", f"vm-{vm}.{threading.get_ident()}.png")  # one per request: two tabs at once
     try:
         if not host:
-            vm_call(["action", vm, "screenshot", "--output", path], timeout=20)
+            vm_call(["action", vm, "screenshot", "--no-wake", "--output", path], timeout=20)  # looking is no use
         else:  # written in a private folder there, then brought here
             n, tmp = node_obj(host, 30), f"/tmp/tct-{secrets.token_hex(6)}"
             try:
                 try:
                     r = n._exec(["sh", "-lc", f"mkdir -m 700 {tmp} && " + VM_FIND + 'exec $c "$@"', "terminal-vm",
-                                 "action", vm, "screenshot", "--output", f"{tmp}/s.png"], 30)
+                                 "action", vm, "screenshot", "--no-wake", "--output", f"{tmp}/s.png"], 30)
                 except (RuntimeError, subprocess.TimeoutExpired) as e:
                     raise RuntimeError(f"{host}: {e}") from None
                 if r.get("exit"):
@@ -3573,12 +3552,199 @@ def web_token():
 
 
 WEB_LAST = [0.0]  # time of the latest API call: a daemon with an open dashboard does not end for being idle
+WEB_ROLES = ("read", "full")  # read: look (every GET); full: act too (POST)
+WEB_SEEN = {}  # user: (time of its latest call, role): who is on the dashboard now
+
+
+def _web_dir():
+    d = os.path.join(STORE, "web")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+def tls_cert(path, ip=None):
+    """SHA-256 of the self-signed certificate kept at path (with its key, owner only), made once by openssl.
+    ip: named in it too (subjectAltName), so a browser can trust it once, imported, instead of each time."""
+    if not os.path.isfile(path):
+        exe = shutil.which("openssl")
+        if not exe:
+            raise SystemExit("HTTPS needs openssl once, to make a certificate (Linux, macOS, WSL and Git for Windows "
+                             "have it)")
+        new, key = f"{path}.{os.getpid()}.new", f"{path}.{os.getpid()}.key"  # two first starts: each its own files
+        argv = [exe, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-subj", f"/CN={TOOL}",
+                "-keyout", key, "-out", new]
+        r = subprocess.run(argv + (["-addext", f"subjectAltName=IP:{ip}"] if ip else []), capture_output=True,
+                           text=True, **NO_WINDOW)
+        if r.returncode and ip:  # an openssl without -addext (old LibreSSL): a certificate without the address
+            r = subprocess.run(argv, capture_output=True, text=True, **NO_WINDOW)
+        try:
+            if r.returncode:
+                raise SystemExit(f"openssl: {r.stderr.strip()}")
+            os.chmod(new, 0o600)
+            with open(new, "a") as f, open(key) as k:  # one file, one replace: never a key of another start
+                f.write(k.read())
+            os.replace(new, path)
+        finally:
+            for x in (new, key):
+                with contextlib.suppress(OSError):
+                    os.remove(x)
+    with open(path) as f:
+        pem = f.read()
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem[:pem.index("-----END CERTIFICATE-----") + 25])).hexdigest()
+
+
+def _web_users():
+    try:
+        with open(os.path.join(STORE, "web.users.json")) as f:
+            u = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return u if isinstance(u, dict) else {}
+
+
+def web_user(cmd, name=None, role="full"):
+    """Dashboard users, each with its own token (shown once: only its SHA-256 is kept) and role: read or full."""
+    users, path = _web_users(), os.path.join(STORE, "web.users.json")
+    if cmd == "ls":
+        return [{"user": n, "role": u.get("role"), "added": u.get("added")} for n, u in sorted(users.items())]
+    if cmd not in ("add", "rm"):
+        raise SystemExit("web user add NAME [--role read|full] | web user ls | web user rm NAME")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,31}", name or "") or name == "owner":
+        raise SystemExit(f"invalid user name {name!r} (lowercase letters, digits, _ . -; not owner)")
+    if cmd == "rm":
+        if name not in users:
+            raise SystemExit(f"no dashboard user {name!r}")
+        users.pop(name)
+        _web_write(path, json.dumps(users, indent=1), 0o600)
+        return {"removed": name}  # its open tabs are refused from their next call
+    if role not in WEB_ROLES:
+        raise SystemExit("--role read (look) or full (act too)")
+    if name in users:
+        raise SystemExit(f"user {name!r} exists: web user rm {name} first (a new token)")
+    token = secrets.token_urlsafe(24)
+    users[name] = {"sha256": hashlib.sha256(token.encode()).hexdigest(), "role": role,
+                   "added": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    os.makedirs(STORE, exist_ok=True)
+    _web_write(path, json.dumps(users, indent=1), 0o600)
+    out = {"user": name, "role": role, "token": token, "note": "shown once: give it to that person or agent"}
+    net = _web_net()
+    if net:
+        out.update(url=f"{net['url']}/#t={token}", fingerprint=net["fingerprint"])
+    return out
+
+
+def _web_who(given):
+    """(user, role) of a token, or None. The owner's token (web.token) is full."""
+    if not given:
+        return None
+    if secrets.compare_digest(given, web_token().encode()):
+        return "owner", "full"
+    h = hashlib.sha256(given).hexdigest()
+    for n, u in _web_users().items():
+        if isinstance(u, dict) and u.get("role") in WEB_ROLES and secrets.compare_digest(h, str(u.get("sha256", ""))):
+            return n, u["role"]
+    return None
+
+
+def _web_act_log(user, addr, path, body, error=None):
+    """Who did what, from where (STORE/web/actions.log, one JSON line each, one older file kept)."""
+    b = body if isinstance(body, dict) else {}
+    clean = lambda v, n=64: re.sub(r"[\x00-\x1f\x7f]", "?", str(v))[:n]  # one line each, short: no forged lines
+    rec = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "user": user, "from": addr, "path": clean(path),
+           **{k: clean(b[k]) for k in ("op", "kind", "name", "service", "replicas") if isinstance(b.get(k), (str, int))}}
+    st = b.get("stack")
+    if isinstance(st, dict):
+        st = st.get("stack")
+    if isinstance(st, str):
+        rec["stack"] = clean(st)
+    if error:
+        rec["error"] = clean(error, 200)
+    log = os.path.join(_web_dir(), "actions.log")
+    with contextlib.suppress(OSError):
+        if os.path.exists(log) and os.path.getsize(log) > 2 ** 20:
+            os.replace(log, log + ".1")
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+
+
+def web_actions(n=20):
+    """The latest actions done through the dashboard, newest first."""
+    try:
+        with open(os.path.join(STORE, "web", "actions.log"), encoding="utf-8") as f:
+            lines = f.readlines()[-n:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        with contextlib.suppress(ValueError):
+            out.append(json.loads(line))
+    return out
+
+
+def web_session(who):
+    """This caller, who else is on the dashboard (a call in the last 30 s), and who did what."""
+    now = time.time()
+    return {"user": who[0], "role": who[1], "actions": web_actions(20),
+            "online": [{"user": n, "role": r, "seen_s": int(now - t)}
+                       for n, (t, r) in sorted(WEB_SEEN.items()) if now - t < 30]}
+
+
+def _web_listen():
+    """The network address the dashboard is shared on ({ip, port}; web --listen), or None."""
+    try:
+        with open(os.path.join(STORE, "web.listen.json")) as f:
+            n = json.load(f)
+        return {"ip": str(ipaddress.ip_address(n["ip"])), "port": int(n["port"])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _web_net():
+    """{url, fingerprint} of the network dashboard the running daemon serves, or None."""
+    try:
+        with open(_daemon_file("webnet")) as f:
+            n = json.load(f)
+        return n if _web_listen() and n.get("url") and n.get("fingerprint") else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 class _WebServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = not WINDOWS  # on Windows it lets a second process bind the same port
     allow_reuse_port = False  # never share the port with another store's daemon
+    slots = None  # at most 64 clients at once: idle connections never use up threads or memory
+
+    def handle_error(self, *a):  # a failed handshake, a client gone: just that client
+        pass
+
+    per_address = None  # the network side: at most this many at once from one address (one host cannot take all)
+
+    def process_request(self, request, client_address):
+        if self.slots is None:  # (the agent's server sets its own)
+            self.slots = threading.BoundedSemaphore(64)
+        if getattr(self, "lock", None) is None:
+            self.by_address, self.lock, self.origin = {}, threading.Lock(), {}  # origin: request id -> address
+        with self.lock:
+            busy = self.per_address and self.by_address.get(client_address[0], 0) >= self.per_address
+            if not busy and self.slots.acquire(blocking=False):
+                self.by_address[client_address[0]] = self.by_address.get(client_address[0], 0) + 1
+                self.origin[id(request)] = client_address[0]  # (a plain socket takes no attribute)
+            else:
+                return socketserver.TCPServer.shutdown_request(self, request)  # full: closed, no slot to give back
+        super().process_request(request, client_address)  # its thread failing to start: shutdown_request below
+
+    def shutdown_request(self, request):  # end of a request that had a slot
+        try:
+            super().shutdown_request(request)
+        finally:
+            with self.lock:
+                a = self.origin.pop(id(request), None)
+                if self.by_address.get(a, 0) > 1:
+                    self.by_address[a] -= 1
+                else:
+                    self.by_address.pop(a, None)
+            self.slots.release()
 
     def server_bind(self):  # HTTPServer's also looks up this host's FQDN: seconds on some Macs, and unused here
         socketserver.TCPServer.server_bind(self)
@@ -3591,6 +3757,15 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *a):  # quiet: the daemon's log is for its own work
         pass
+
+    def version_string(self):  # no Python version told to whoever asks
+        return self.server_version
+
+    def setup(self):
+        if isinstance(self.request, ssl.SSLSocket):  # the network's HTTPS: its handshake here, in this request's thread
+            self.request.settimeout(self.timeout)
+            self.request.do_handshake()
+        super().setup()
 
     def _send(self, code, ctype, body):
         if not isinstance(body, bytes):
@@ -3611,11 +3786,14 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         if method == "GET" and u.path == "/":
             return self._send(200, "text/html; charset=utf-8", WEB_PAGE.encode())
         given = self.headers.get("X-Token", "").encode("utf-8", "replace")
-        if not given or not secrets.compare_digest(given, web_token().encode()):
-            return self._send(401, "application/json", {"error": f"token: open the dashboard with {TOOL} web"})
+        who = _web_who(given)
+        if not who:
+            return self._send(401, "application/json", {"error": f"token: open the dashboard with {TOOL} web, or ask "
+                                                                 f"for one ({TOOL} web user add NAME)"})
         WEB_LAST[0] = time.time()
+        WEB_SEEN[who[0]] = (WEB_LAST[0], who[1])
+        addr, body = self.client_address[0], None
         try:
-            body = None
             if method == "POST":
                 n = int(self.headers.get("Content-Length") or 0)
                 if not 0 <= n <= 2 ** 20:
@@ -3624,13 +3802,26 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                 if self.headers.get_content_type() != "application/json":  # no cross-site "simple" request
                     raise ValueError("Content-Type must be application/json")
                 body = json.loads(raw or b"null")
+                if who[1] != "full":
+                    _web_act_log(who[0], addr, u.path, body, "refused: read only")
+                    return self._send(403, "application/json", {"error": "read only: this token may look, not act"})
+            if method == "GET" and u.path == "/api/session":
+                return self._send(200, "application/json", web_session(who))
             ctype, out = web_api(method, u.path, dict(urllib.parse.parse_qsl(u.query)), body)
+            if who[1] == "read" and isinstance(out, dict) and isinstance(out.get("desired"), dict):
+                out = dict(out, desired=dict(out["desired"], services={  # a stack's env holds secrets: full only
+                    k: {**v, "env": "(hidden: read only)"} if isinstance(v, dict) and v.get("env") else v
+                    for k, v in (out["desired"].get("services") or {}).items()}))
+            if method == "POST":
+                _web_act_log(who[0], addr, u.path, body)
             self._send(200, ctype, out)
         except NoRoute:
             self._send(404, "application/json", {"error": "not found"})
         except ConnectionError:  # the browser left: no error reply on a closed socket
             raise
         except (SystemExit, Exception) as e:  # a bad request or a failed action: the server goes on
+            if method == "POST":
+                _web_act_log(who[0], addr, u.path, body, str(e) or type(e).__name__)
             self._send(400, "application/json", {"error": str(e) or type(e).__name__})
 
     def handle(self):
@@ -3655,15 +3846,83 @@ def web_serve(port=None):
         p = srv.server_address[1]
         srv.hosts = {f"127.0.0.1:{p}", f"localhost:{p}"}
         _web_write(_daemon_file("web"), json.dumps({"port": p, "pid": os.getpid()}))
+        with contextlib.suppress(OSError):
+            os.remove(_daemon_file("webnet"))  # an earlier daemon's: said again below if this one shares it
+        if _web_listen():
+            threading.Thread(target=_web_serve_net, args=(_web_listen(),), daemon=True).start()
         srv.serve_forever()
     except Exception as e:  # the dashboard down must not take the daemon's own work with it
         print(f"{time.strftime('%H:%M:%S')} web: {e}", file=sys.stderr, flush=True)
 
 
-def web(open_browser=True, project=None):
-    """Start the daemon if needed, then open its dashboard in the browser; returns the URL (token included)."""
+class _WebServer6(_WebServer):
+    address_family = socket.AF_INET6
+
+
+def _web_serve_net(net):
+    """The dashboard on the network too (web --listen): HTTPS only, the same tokens, at most 64 clients at once."""
+    try:
+        cert = os.path.join(_web_dir(), f"cert-{net['ip'].replace(':', '_')}.pem")  # one per address: named in it
+        fp = tls_cert(cert, net["ip"])
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cert)
+        ip = ipaddress.ip_address(net["ip"])
+        srv = (_WebServer6 if ip.version == 6 else _WebServer)((str(ip), net["port"]), _WebHandler)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
+        name = f"[{ip}]" if ip.version == 6 else str(ip)
+        host = f"{name}:{srv.server_address[1]}"
+        srv.hosts = {host} | ({name} if srv.server_address[1] == 443 else set())  # a browser names this address
+        srv.per_address = 8
+        _web_write(_daemon_file("webnet"), json.dumps({"url": f"https://{host}", "fingerprint": fp, "pid": os.getpid()}))
+        srv.serve_forever()
+    except Exception as e:  # the local dashboard and the daemon's work go on
+        print(f"{time.strftime('%H:%M:%S')} web (network): {e}", file=sys.stderr, flush=True)
+
+
+def web_cli(args, role="full", open_browser=True, project=None, listen=None, port=None):
+    """The web command of both tools: web [--listen IP|off] [--port N], or web user add|ls|rm."""
+    if not args:
+        return web(open_browser, project, listen, port)
+    if args[0] != "user" or len(args) > 3:
+        raise SystemExit("web [--listen IP|off] [--port N] | web user add NAME [--role read|full] | web user ls | "
+                         "web user rm NAME")
+    return web_user(*args[1:3], role=role)
+
+
+def web(open_browser=True, project=None, listen=None, port=None):
+    """Start the daemon if needed, then open its dashboard in the browser; returns the URL (token included).
+    listen: share it on the network too, at that address of this PC (HTTPS), or "off"."""
     if project:
         check_project(project)
+    if listen is not None:
+        path = os.path.join(STORE, "web.listen.json")
+        if listen == "off":
+            with contextlib.suppress(OSError):
+                os.remove(path)
+        else:
+            try:
+                ip = ipaddress.ip_address(listen)
+            except ValueError:
+                raise SystemExit("--listen: an address of this PC on the network (an IP), or off") from None
+            if ip.is_unspecified or ip.version == 6 and (ip.ipv4_mapped and ip.ipv4_mapped.is_unspecified
+                                                         or "%" in str(ip)):
+                raise SystemExit("--listen: one address of this PC (not 0.0.0.0 or ::, which would share it on every "
+                                 "network; no %zone)")
+            p = WEB_PORT + 10 if port is None else port
+            if not 1 <= p <= 65535:
+                raise SystemExit("--port: 1-65535")
+            tls_cert(os.path.join(_web_dir(), f"cert-{str(ip).replace(':', '_')}.pem"), str(ip))  # no openssl: said now
+            os.makedirs(STORE, exist_ok=True)
+            _web_write(path, json.dumps({"ip": str(ip), "port": p}))
+        if daemon_alive():  # it serves what it read when it started
+            daemon("stop")
+            end = time.time() + 60
+            while daemon_alive() and time.time() < end:
+                time.sleep(0.3)
+            if daemon_alive():  # it would go on serving what it read before
+                raise SystemExit(f"the daemon did not stop: the dashboard may still be shared as before; "
+                                 f"{TOOL} daemon stop, then {TOOL} web again")
     if not daemon_alive():
         daemon("start")
     end = time.time() + 20
@@ -3682,6 +3941,13 @@ def web(open_browser=True, project=None):
                                  f"{TOOL} daemon stop, then {TOOL} web") from None
             time.sleep(0.3)
     url = f"http://127.0.0.1:{w['port']}/#t={web_token()}" + (f"&p={urllib.parse.quote(project)}" if project else "")
+    net = None
+    if _web_listen():  # its network side comes up a moment after
+        for _ in range(30):
+            net = _web_net()
+            if net:
+                break
+            time.sleep(0.3)
     if open_browser:
         with contextlib.suppress(OSError):
             if in_wsl():  # the Windows browser: WSL forwards its 127.0.0.1 ports to Windows
@@ -3689,7 +3955,13 @@ def web(open_browser=True, project=None):
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 webbrowser.open(url)
-    return {"url": url, "port": w["port"]}
+    out = {"url": url, "port": w["port"]}
+    if net:
+        out["network"] = {"url": net["url"], "fingerprint": net["fingerprint"],
+                          "users": f"{TOOL} web user add NAME --role read|full: a token for each person or agent"}
+    elif _web_listen():
+        out["network"] = {"error": f"not served: see {_daemon_file('log')}"}
+    return out
 
 
 WEB_PAGE = r"""<!doctype html>
@@ -3716,7 +3988,7 @@ dialog{width:min(1100px,96vw);max-height:92vh;border:1px solid var(--line);borde
 dialog img{max-width:100%;max-height:78vh;display:block;margin:auto}dialog pre{max-height:76vh;overflow:auto;font:12px ui-monospace,monospace;white-space:pre-wrap}
 select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:5px}.mute{color:var(--mute)}
 </style></head><body>
-<header><h1 id="tool">terminal</h1><span id="engine" class="chip">…</span><span id="daemon" class="chip">daemon …</span>
+<header><h1 id="tool">terminal</h1><span id="engine" class="chip">…</span><span id="daemon" class="chip">daemon …</span><span id="who" class="chip"></span><span id="online" class="mute"></span>
 <label class="mute">project <select id="project"><option value="">all</option></select></label><span id="quota" class="mute"></span>
 <span id="msg"></span></header>
 <main>
@@ -3726,6 +3998,7 @@ select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--
 <section><h2>Stacks</h2><table><thead><tr><th>stack</th><th>project</th><th>services (running / wanted)</th><th></th></tr></thead><tbody id="stacks"></tbody></table>
 <p><button id="new">new stack</button></p><div id="editor" hidden><textarea id="spec" spellcheck="false"></textarea><p><button id="apply">apply</button><button id="close">close</button></p></div></section>
 <section><h2>Events</h2><pre id="events" class="ev"></pre></section>
+<section><h2>Actions (who did what)</h2><pre id="actions" class="ev"></pre></section>
 </main>
 <dialog id="dlg"><p><b id="dlgtitle"></b> <button id="dlgclose" style="float:right">close</button></p><div id="dlgbody"></div></dialog>
 <script>
@@ -3830,7 +4103,7 @@ function bigShot(kind, name) {
 const shotEls = {};
 async function renderShots(d, vms) {
   const want = d.rows.filter(r => r.flags.includes("D") && r.status === "running").map(r => ["ct", r.name])
-    .concat(vms.filter(v => v.status && v.status !== "stopped").map(v => ["vm", v.name]));
+    .concat(vms.filter(v => v.status === "running").map(v => ["vm", v.name]));  // looking wakes nothing
   const box = $("shots"), keys = want.map(w => w.join(":"));
   for (const k of Object.keys(shotEls)) if (!keys.includes(k)) { const s = shotEls[k].img.src;
     if (s.startsWith("blob:")) URL.revokeObjectURL(s); shotEls[k].remove(); delete shotEls[k]; }
@@ -3900,6 +4173,15 @@ function renderTop(d, v) {
     sel.value = cur; }
 }
 let busy = false, again = false;
+function renderSession(s) {
+  if (!s) return;
+  $("who").textContent = s.user + (s.role === "read" ? " (read only)" : "");
+  const others = s.online.filter(o => o.user !== s.user).map(o => o.user + (o.role === "read" ? " (read)" : ""));
+  $("online").textContent = others.length ? "with " + others.join(", ") : "";
+  $("actions").textContent = s.actions.map(a => [a.time, a.user, a.from, a.op || a.path, a.kind, a.stack, a.service,
+    a.name, a.replicas, a.error && "failed: " + a.error].filter(x => x !== undefined && x !== "").join("  ")).join("\n")
+    || "no action yet";
+}
 async function refresh() {
   if (busy) { again = true; return; }  // asked meanwhile (an action, another project): once this pass ends
   if (document.hidden) return; busy = true;  // a forgotten tab costs the engine nothing
@@ -3909,6 +4191,7 @@ async function refresh() {
       api("/api/vms?" + q({project: p})).then(r => r.json()).catch(e => ({vms: [], note: e.message}))]);
     if (p !== project()) return;  // the project changed meanwhile: the next pass shows it
     renderTop(d, v); renderCts(d); renderVms(v); renderStacks(d); renderShots(d, v.vms);
+    renderSession(await api("/api/session").then(r => r.json()).catch(() => null));
     if ($("msg").className === "err" && $("msg").textContent.startsWith("dashboard:")) msg("");
   } catch (e) { msg("dashboard: " + e.message, true); }
   finally { busy = false; if (again) { again = false; refresh(); } }
@@ -3933,20 +4216,8 @@ AGENT_CONNECTIONS = 64
 
 
 class _AgentServer(_WebServer):
-    """At most AGENT_CONNECTIONS clients at once: idle connections (15 s each) never use up threads or memory."""
-    def handle_error(self, *a):  # a failed handshake, a client gone: just that client
-        pass
-
-    def process_request(self, request, client_address):
-        if not self.slots.acquire(blocking=False):
-            return socketserver.TCPServer.shutdown_request(self, request)  # full: closed, no slot to give back
-        super().process_request(request, client_address)  # its thread failing to start: shutdown_request below
-
-    def shutdown_request(self, request):  # end of a request that had a slot
-        try:
-            super().shutdown_request(request)
-        finally:
-            self.slots.release()
+    """At most AGENT_CONNECTIONS clients at once (the dashboard server's cap): idle connections (15 s each) never
+    use up threads or memory."""
 
 
 class _AgentServer6(_AgentServer):
@@ -5515,6 +5786,9 @@ def main(argv=None):
     bn = sub.add_parser("bench"); bn.add_argument("--runs", type=int, default=10); bn.add_argument("--desktop", action="store_true")
     sk_ = sub.add_parser("skills"); sk_.add_argument("skill_cmd", choices=["get", "path", "install"]); sk_.add_argument("--dir")
     wb = sub.add_parser("web"); wb.add_argument("--project"); wb.add_argument("--no-open", action="store_true")
+    wb.add_argument("web_args", nargs="*", help="user add NAME | user ls | user rm NAME")
+    wb.add_argument("--role", choices=["read", "full"], default="full"); wb.add_argument("--listen", help="IP or off")
+    wb.add_argument("--port", type=int)
     ag = sub.add_parser("agent", help="serve this PC to a central PC (HTTPS, pinned certificate + token)")
     ag.add_argument("--listen", default="127.0.0.1"); ag.add_argument("--port", type=int); ag.add_argument("--rotate", action="store_true")
     lg = sub.add_parser("logs"); lg.add_argument("name"); lg.add_argument("-n", type=int, default=100)
@@ -5647,7 +5921,7 @@ def main(argv=None):
         if o.json:  # what the web dashboard shows (terminal-vm's dashboard reads it)
             return print(json.dumps(web_api("GET", "/api/state", {"project": o.project or ""})[1]))
         return dash(o.project)
-    if o.cmd == "web": return show_json(web(not o.no_open, o.project))
+    if o.cmd == "web": return show_json(web_cli(o.web_args, o.role, not o.no_open, o.project, o.listen, o.port))
     if o.cmd == "agent": return agent(o.listen, o.port, o.rotate)
     if o.cmd == "bench": return show_json(bench(max(1, o.runs), o.desktop))
     if o.cmd == "skills": return skills(o.skill_cmd, o.dir)

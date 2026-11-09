@@ -787,7 +787,7 @@ class Phase8(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "107763a31819e193f9c19d1199f58350ea2a9bad0c80669135a846d232fbbcb2"
+    SHARED_SHA = "7e5a6d078fad6b5a27d96b0dcc889ea461941444dc39d7d642a5ff2ce69268eb"
 
     @staticmethod
     def block(path):
@@ -2012,6 +2012,142 @@ class Hosts(unittest.TestCase):
         with ct.on_node("vm1"), self.assertRaisesRegex(SystemExit, "its size"):
             ct.quota({"cpus": 2})
         self.assertFalse(os.path.exists(os.path.join(ct.STORE, "quota.json")))
+
+
+class WebSession(unittest.TestCase):
+    """Phase 11.5: the shared dashboard: a token per user with a role, who is on it, who did what, the network."""
+
+    def setUp(self):
+        ct.STORE = tempfile.mkdtemp()
+        ct.WEB_SEEN.clear()
+        self.calls = []
+
+        def api(method, path, q, body=None):
+            self.calls.append((method, path, body))
+            if body and body.get("op") == "boom":
+                raise SystemExit("it failed")
+            if path == "/api/stack":
+                return "application/json", {"desired": {"stack": "s", "services": {"db": {"env": {"PW": "secret"}},
+                                                                                 "web": {"image": "nginx"}}}}
+            return "application/json", {"ok": path}
+        self.p = unittest.mock.patch.object(ct, "web_api", api)
+        self.p.start()
+        self.srv = ct._WebServer(("127.0.0.1", 0), ct._WebHandler)
+        port = self.srv.server_address[1]
+        self.srv.hosts = {f"127.0.0.1:{port}"}
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.port = port
+
+    def tearDown(self):
+        self.srv.shutdown(); self.srv.server_close(); self.p.stop()
+
+    def call(self, token, method="GET", path="/api/state", body=None, host=None):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        data = json.dumps(body).encode() if body is not None else None
+        c.request(method, path, body=data, headers={"X-Token": token, "Content-Type": "application/json",
+                                                   **({"Host": host} if host else {})})
+        r = c.getresponse()
+        out = r.status, json.loads(r.read() or b"null")
+        c.close()
+        return out
+
+    def test_roles_presence_and_actions(self):
+        bob = ct.web_user("add", "bob", role="read")
+        ann = ct.web_user("add", "ann", role="full")
+        with open(os.path.join(ct.STORE, "web.users.json")) as f:
+            self.assertNotIn(bob["token"], f.read())                            # its hash only
+        if not ct.WINDOWS:
+            self.assertEqual(os.stat(os.path.join(ct.STORE, "web.users.json")).st_mode & 0o777, 0o600)
+        self.assertEqual(self.call(bob["token"])[0], 200)                       # read: may look
+        s, r = self.call(bob["token"], "POST", "/api/do", {"op": "stop", "name": "web"})
+        self.assertEqual((s, r["error"]), (403, "read only: this token may look, not act"))
+        self.assertNotIn(("POST", "/api/do", {"op": "stop", "name": "web"}), self.calls)  # never reached the tool
+        self.assertEqual(self.call(ann["token"], "POST", "/api/do", {"op": "stop", "name": "web"})[0], 200)
+        self.assertEqual(self.call(ann["token"], "POST", "/api/do", {"op": "boom", "name": "x"})[0], 400)
+        s, me = self.call(bob["token"], path="/api/session")
+        self.assertEqual((me["user"], me["role"]), ("bob", "read"))
+        self.assertEqual({o["user"] for o in me["online"]}, {"bob", "ann"})
+        self.assertEqual([(a["user"], a.get("op"), a.get("error")) for a in me["actions"]],
+                         [("ann", "boom", "it failed"), ("ann", "stop", None), ("bob", "stop", "refused: read only")])
+        self.assertEqual(self.call(ct.web_token(), path="/api/session")[1]["user"], "owner")
+        self.assertEqual(self.call("x" * 32)[0], 401)
+        self.assertEqual([u["user"] for u in ct.web_user("ls")], ["ann", "bob"])
+        ct.web_user("rm", "bob")
+        self.assertEqual(self.call(bob["token"])[0], 401)                       # revoked at once
+        for bad in (("add", "owner"), ("add", "Bob"), ("add", "ann"), ("rm", "nobody"), ("add", "x", "admin")):
+            with self.assertRaises(SystemExit, msg=bad):
+                ct.web_user(*bad[:2], role=bad[2] if len(bad) > 2 else "full")
+        with self.assertRaisesRegex(SystemExit, "web user add NAME"):
+            ct.web_cli(["users"])
+
+    def test_read_role_sees_no_secret_and_forges_no_log_line(self):
+        bob, ann = ct.web_user("add", "bob", role="read"), ct.web_user("add", "ann", role="full")
+        s, r = self.call(bob["token"], path="/api/stack?name=s")
+        self.assertEqual(r["desired"]["services"], {"db": {"env": "(hidden: read only)"}, "web": {"image": "nginx"}})
+        self.assertEqual(self.call(ann["token"], path="/api/stack?name=s")[1]["desired"]["services"]["db"]["env"],
+                         {"PW": "secret"})                                     # full: as it is
+        forged = "x\n2026-11-10T10:00:00  owner  127.0.0.1  rm  db" + "y" * 5000
+        self.call(bob["token"], "POST", "/api/do", {"op": "stop", "name": forged})
+        a = ct.web_actions(1)[0]
+        self.assertEqual(len(a["name"]), 64)
+        self.assertNotIn("\n", a["name"])
+
+    def test_one_address_cannot_take_every_slot(self):
+        srv = ct._WebServer(("127.0.0.1", 0), ct._WebHandler)
+        srv.hosts, srv.per_address = {f"127.0.0.1:{srv.server_address[1]}"}, 2
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        idle = [socket.create_connection(("127.0.0.1", srv.server_address[1])) for _ in range(2)]
+        try:
+            time.sleep(0.3)
+            third = socket.create_connection(("127.0.0.1", srv.server_address[1])); third.settimeout(5)
+            self.assertEqual(third.recv(1), b"")                               # closed at once
+            third.close()
+            for s in idle:
+                s.close()
+            time.sleep(0.5)
+            self.assertEqual(srv.by_address, {})                               # their places given back
+        finally:
+            srv.shutdown(); srv.server_close()
+
+    def test_listen_checks(self):
+        for bad in ("0.0.0.0", "::", "::ffff:0.0.0.0", "fe80::1%eth0", "pc.local", "300.1.1.1"):
+            with self.assertRaises(SystemExit, msg=bad):
+                ct.web(False, listen=bad)
+        self.assertFalse(os.path.exists(os.path.join(ct.STORE, "web.listen.json")))
+
+    @unittest.skipUnless(shutil.which("openssl"), "HTTPS needs openssl")
+    def test_network_side_is_https_only(self):
+        import http.client
+        with open(os.path.join(ct.STORE, "web.listen.json"), "w") as f:
+            json.dump({"ip": "127.0.0.1", "port": 0}, f)
+        threading.Thread(target=ct._web_serve_net, args=(ct._web_listen(),), daemon=True).start()
+        for _ in range(100):
+            net = ct._web_net()
+            if net:
+                break
+            time.sleep(0.1)
+        self.assertTrue(net, "the network side did not come up")
+        port = int(net["url"].rsplit(":", 1)[1])
+        seen = ssl.get_server_certificate(("127.0.0.1", port))
+        if hashlib.sha256(ssl.PEM_cert_to_DER_cert(seen)).hexdigest() != net["fingerprint"]:
+            self.skipTest("TLS intercepted on this machine (antivirus HTTPS scanning)")
+        ann = ct.web_user("add", "ann", role="full")
+        self.assertTrue(ann["url"].startswith(net["url"] + "/#t="))             # a link to give with the token
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+
+        def get(host=None):
+            c = http.client.HTTPSConnection("127.0.0.1", port, timeout=10, context=ctx)
+            c.request("GET", "/api/session", headers={"X-Token": ann["token"], **({"Host": host} if host else {})})
+            r = c.getresponse()
+            out = r.status, json.loads(r.read())
+            c.close()
+            return out
+        self.assertEqual(get()[1]["user"], "ann")
+        self.assertEqual(get("evil.example:80")[0], 403)                       # DNS rebinding: refused
+        plain = http.client.HTTPConnection("127.0.0.1", port, timeout=5)      # never plain HTTP on the network
+        with self.assertRaises((OSError, http.client.HTTPException)):
+            plain.request("GET", "/"); plain.getresponse().read()
 
 
 @unittest.skipUnless(shutil.which("openssl"), "the agent makes its certificate with openssl")
