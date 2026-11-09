@@ -5,14 +5,21 @@ The container counterpart of terminal-vm: same command and MCP shape, Docker or 
 (whichever is installed), standard library only. Every container it makes carries `terminal-ct.*`
 labels; containers without them are never touched.
 
-  create NAME [--image IMAGE] [--desktop [--width 1280 --height 800]] [--cpus N] [--memory GiB] [-- CMD...]
+  create NAME [--image IMAGE] [--desktop [--width 1280 --height 800]] [--cpus 1] [--memory 1 (GiB)]
+              [--sandbox] [--offline] [--net NET ...] [-- CMD...]
               default image debian:stable-slim; --desktop adds Xvnc + Openbox to any Debian/Ubuntu, Fedora,
-              Alpine or Arch image (built once, cached as tct-desktop:<base>)
-  ls | status NAME | doctor | help | version
+              Alpine or Arch image (built once, cached as tct-desktop:<base>); --sandbox: not root, no
+              capabilities, process limit, /data in memory, fresh file system at each start, offline
+  ls | status NAME | top | doctor | help | version
   start NAME | stop NAME [--timeout 10] | rm NAME     rm also deletes the container's /data volume
   exec NAME [--timeout 60] CMD...                     run a command, JSON reply (exit code, stdout, stderr)
+  resources NAME [--cpus N] [--memory GiB]            show, or change at once (even running), within the quota
+  quota [--cpus N] [--memory GiB] [--disk GiB] [--containers N]   show, or set, the host quota
+  net create|rm NET | net ls | net attach|detach NAME NET   isolated networks (containers reach each other by name)
+  internet NAME [on|off]  |  sandbox NAME on|off      stopped containers
   action NAME screenshot|click|move|drag|scroll|type|key|wait|status ...   desktop containers
-  mcp NAME                                            stdio MCP server (screen tools + exec)
+  mcp [NAME]          stdio MCP server: screen tools + exec (on NAME, or `container`), container and network
+                      management under the agent-authority rules (sandboxes and its own; the rest asks the user)
   view NAME [--read-only]   terminal viewer: Kitty graphics or Sixel (Windows Terminal, foot); Ctrl+] exits
   show NAME                 native window (TigerVNC viewer, through the desktop's unix socket)
   image ls | image pull REF | image build NAME DIR | image rm NAME
@@ -21,7 +28,7 @@ Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if inst
 import argparse, base64, collections, contextlib, io, json, os, queue, re, shutil, socket, struct, \
     subprocess, sys, threading, time, zlib
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 WINDOWS = os.name == "nt"
 if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
@@ -51,15 +58,46 @@ def pick_engine(wanted=None):
     raise SystemExit(f"{wanted or 'docker or podman'} not found: install one (Debian: sudo apt install podman)")
 
 
+def in_wsl():
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
 class Node:
     """Where containers run. v1: the local host; later a VM node (through its guest agent) or a remote machine,
     so every engine call goes through a node."""
     def __init__(self, engine=None):
         self.engine = engine or pick_engine()
+        if self.engine == "podman" and in_wsl() and "CONTAINERS_CONF_OVERRIDE" not in os.environ:
+            # WSL's kernel lacks nftables pieces netavark needs: a bridge container failed to start ("nft did not
+            # return successfully"). Its iptables driver works; set for terminal-ct's own calls only.
+            os.makedirs(STORE, exist_ok=True)
+            conf = os.path.join(STORE, "podman-wsl.conf")
+            with open(conf, "w") as f:
+                f.write('[network]\nfirewall_driver = "iptables"\n')
+            os.environ["CONTAINERS_CONF_OVERRIDE"] = conf
+
+    def host(self):
+        """(CPUs, memory GiB, storage folder) of the machine the engine runs on: on Windows and macOS, the WSL,
+        Docker Desktop or Podman machine VM. On Linux that is this machine: read here (an engine call costs ~0.5 s)."""
+        if not hasattr(self, "_host"):
+            if sys.platform.startswith("linux"):  # shortcut: assumes the engine's storage shares STORE's file system
+                mem = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                self._host = os.cpu_count(), mem / 2 ** 30, STORE if os.path.isdir(STORE) else os.path.dirname(STORE)
+            else:
+                fmt = "{{.Host.CPUs}} {{.Host.MemTotal}} {{.Store.GraphRoot}}" if self.engine == "podman" else \
+                    "{{.NCPU}} {{.MemTotal}} {{.DockerRootDir}}"
+                c, m, root = self.run(["info", "--format", fmt]).stdout.split(None, 2)
+                self._host = int(c), int(m) / 2 ** 30, root.strip()
+        return self._host
 
     def run(self, args, check=True, timeout=None, capture=True):
-        r = subprocess.run([self.engine, *args], capture_output=capture, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace")
+        # uncaptured output (pull, build progress) goes to stderr: stdout is the JSON reply, or the MCP channel
+        r = subprocess.run([self.engine, *args], text=True, timeout=timeout, encoding="utf-8", errors="replace",
+                           **({"capture_output": True} if capture else {"stdout": sys.stderr}))
         if check and r.returncode:
             raise SystemExit((r.stderr or r.stdout or f"{self.engine} {args[0]} failed").strip())
         return r
@@ -83,15 +121,65 @@ def normalize(c):
     """One container from `inspect`, the same shape for Docker and Podman."""
     labels = (c.get("Config") or {}).get("Labels") or {}
     st = c.get("State") or {}
+    cpus, mem = allotted(c, None)
+    nets = networks_of(c)
     return {"name": labels.get(f"{LABEL}.name") or c.get("Name", "").lstrip("/").removeprefix(PREFIX),
             "status": st.get("Status", "unknown"), "image": (c.get("Config") or {}).get("Image", ""),
             "created_by": labels.get(f"{LABEL}.created_by", "user"), "id": c.get("Id", "")[:12],
+            "cpus": cpus or "unlimited", "memory_gb": round(mem, 2) if mem else "unlimited",
+            "internet": online(c),
+            "networks": sorted(n[len(NET_PREFIX):] for n in nets if n.startswith(NET_PREFIX)),
+            **({"sandbox": True} if labels.get(f"{LABEL}.sandbox") == "1" else {}),
+            **({"desktop": True} if labels.get(f"{LABEL}.desktop") == "1" else {}),
             **({"exit_code": st.get("ExitCode")} if st.get("Status") == "exited" else {})}
 
 
-def containers():
+BRIDGE = {"docker": "bridge", "podman": "podman"}  # each engine's default network, the way to the internet
+NET_PREFIX = PREFIX + "net-"
+
+
+def networks_of(c):
+    return list(((c.get("NetworkSettings") or {}).get("Networks") or {}))
+
+
+def is_bridged(c):
+    """False for containers made before 0.3 on Podman's default (pasta): online, and their networks cannot change."""
+    mode = (c.get("HostConfig") or {}).get("NetworkMode") or "bridge"
+    return mode in ("bridge", "default") or mode.startswith(PREFIX) or mode in BRIDGE.values()
+
+
+def online(c):
+    if is_bridged(c):
+        return BRIDGE[node().engine] in networks_of(c)
+    return (c.get("HostConfig") or {}).get("NetworkMode") != "none"
+
+
+def allotted(c, unlimited="host"):
+    """(CPUs, GiB) a container may use. 0 means no limit: counted as the whole host (containers made before 0.3),
+    or returned as 0 when unlimited is None."""
+    hc = c.get("HostConfig") or {}
+    cpus, mem = (hc.get("NanoCpus") or 0) / 1e9, (hc.get("Memory") or 0) / 2 ** 30
+    if unlimited is None:
+        return cpus, mem
+    host = node().host()
+    return cpus or host[0], mem or host[1]
+
+
+def raw_containers(size=False):
     ids = node().run(["ps", "-a", "-q", "--filter", f"label={LABEL}.name"]).stdout.split()
-    return [normalize(c) for c in node().json(["inspect", "--type", "container", *ids])] if ids else []
+    return node().json(["inspect", "--type", "container", *(["--size"] if size else []), *ids]) if ids else []
+
+
+def containers():
+    return [normalize(c) for c in raw_containers()]
+
+
+def labels_of(c):
+    return (c.get("Config") or {}).get("Labels") or {}
+
+
+def running(c):
+    return (c.get("State") or {}).get("Status") in ("running", "paused", "restarting", "stopping")
 
 
 def find(name):
@@ -136,12 +224,16 @@ def ct_dir(name):
     return d
 
 
+DEFAULT_CPUS, DEFAULT_MEMORY = 1, 1  # each container gets a ceiling, so the quota can count it
+SANDBOX_PIDS = 256
+
+
 def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_by="user",
-           desktop=False, width=1280, height=800):
+           desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=()):
+    """Internet: on by default for the user's containers; sandboxes and agents' containers start offline."""
     check_name(name)
     if node().run(["inspect", "--type", "container", PREFIX + name], check=False).returncode == 0:
         raise SystemExit(f"{name!r} already exists (engine name {PREFIX}{name})")
-    volume, extra = f"{PREFIX}{name}-data", []  # /data is kept when the container is recreated, removed by rm
     if desktop:
         if WINDOWS:  # shortcut: the VNC unix socket does not cross into Windows; run terminal-ct inside WSL there
             raise SystemExit("desktop containers need a Linux host or WSL (the screen is reached through a unix socket)")
@@ -149,20 +241,40 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
             raise SystemExit("invalid --width/--height")
         if cmd:
             raise SystemExit("a desktop container runs its desktop: start programs from it, or with exec")
+    cpus, memory = cpus or DEFAULT_CPUS, memory or DEFAULT_MEMORY
+    if cpus <= 0 or memory < 0.0625:
+        raise SystemExit("--cpus must be > 0 and --memory at least 0.0625 GiB (64 MiB)")
+    known = networks()
+    for n in nets:
+        if n not in known:
+            raise SystemExit(f"no network {n!r}; create it with: terminal-ct net create {n}")
+    if not sandbox and node().run(["volume", "inspect", f"{PREFIX}{name}-data"], check=False).returncode == 0:
+        # never hand an earlier container's data to a new owner (an agent could then delete it unasked)
+        raise SystemExit(f"a volume {PREFIX}{name}-data is left from an earlier {name}: keep it under another name, "
+                         f"or remove it: {node().engine} volume rm {PREFIX}{name}-data")
+    quota_check({"disk_gb": 0})  # what a container will write is unknown: refuse once the disk quota is reached
+    internet = not sandbox and created_by == "user" if internet is None else internet
+    spec = {"image": image, "cmd": cmd, "desktop": desktop, "width": width, "height": height, "sandbox": sandbox}
+    out = _make(name, spec, created_by, cpus, memory, internet, nets, fresh=True)
+    print(json.dumps(out))
+
+
+def ensure_image(spec):
+    """Pull or build what the spec runs on (slow: outside the quota lock)."""
+    if spec.get("desktop"):
+        desktop_image(spec["image"])
+    else:
+        image_cmd(spec["image"])
+
+
+def _make(name, spec, created_by, cpus, memory, internet, nets, fresh=False):
+    """Create the engine container from its spec (kept in a label: a sandbox is recreated from it at each start)."""
+    volume, extra = f"{PREFIX}{name}-data", []  # /data is kept when the container is recreated, removed by rm
+    image, cmd, sandbox, podman = spec["image"], spec.get("cmd"), spec.get("sandbox"), node().engine == "podman"
+    if spec.get("desktop"):
         image = desktop_image(image)
-        # the desktop runs as the host user (podman: same uid inside), so the socket is the user's alone; /data is
-        # its home
-        uid, gid = os.getuid(), os.getgid()
-        if node().engine == "podman":
-            extra = ["--userns=keep-id", "--user", f"{uid}:{gid}"]
-            vol = f"{volume}:/data:U"  # :U hands the volume to that user
-        else:
-            node().run(["volume", "create", volume])
-            node().run(["run", "--rm", "--user", "0", "--entrypoint", "chown", "-v", f"{volume}:/data", image,
-                        f"{uid}:{gid}", "/data"])
-            extra, vol = ["--user", f"{uid}:{gid}"], f"{volume}:/data"
         # LANG: without UTF-8, xterm wrote é as Latin-1
-        extra += ["-e", "HOME=/data", "-e", "LANG=C.UTF-8", "-e", f"TCT_WIDTH={width}", "-e", f"TCT_HEIGHT={height}",
+        extra += ["-e", "LANG=C.UTF-8", "-e", f"TCT_WIDTH={spec['width']}", "-e", f"TCT_HEIGHT={spec['height']}",
                   "-v", f"{os.path.join(ct_dir(name), 'run')}:/run/tct", "--label", f"{LABEL}.desktop=1"]
         cmd = [DESKTOP_ENTRY]
     else:
@@ -170,13 +282,66 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
         # a bare shell as the main process exits at once without a terminal: keep such containers alive instead
         if not cmd and not entry and (not default or default[0] in SHELLS):
             cmd = KEEP_ALIVE
-        vol = f"{volume}:/data"
-    args = ["create", "--name", PREFIX + name, "--hostname", name, "--init",
-            "--label", f"{LABEL}.name={name}", "--label", f"{LABEL}.created_by={created_by}", "-v", vol, *extra,
-            *(["--cpus", str(cpus)] if cpus else []), *(["--memory", f"{memory}g"] if memory else []),
-            image, *(cmd or [])]
-    cid = node().run(args).stdout.strip()
-    print(json.dumps({"created": name, "image": image, "id": cid[:12], **({"desktop": f"{width}x{height}"} if desktop else {})}))
+    # desktops and sandboxes run as the host user (podman: same uid inside): the VNC socket is the user's alone, and
+    # a sandbox is not root even inside; /data is their home
+    as_user = spec.get("desktop") or sandbox
+    uid, gid = (1000, 1000) if WINDOWS else (os.getuid(), os.getgid())  # shortcut: no uid on Windows, typical one
+    if as_user:
+        extra += [*(["--userns=keep-id"] if podman else []), "--user", f"{uid}:{gid}", "-e", "HOME=/data"]
+    made_volume = False
+    if sandbox:  # /data in memory, emptied at each stop; no host mount but the screen's socket
+        data = ["--mount", "type=tmpfs,destination=/data,tmpfs-mode=0700,U=true"] if podman else \
+            ["--tmpfs", f"/data:rw,uid={uid},gid={gid},mode=700"]
+        extra += ["--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(SANDBOX_PIDS),
+                  "--label", f"{LABEL}.sandbox=1"]
+    elif as_user and podman:
+        data = ["-v", f"{volume}:/data:U"]  # :U hands the volume to that user
+    else:
+        if as_user:  # docker: hand the volume to the user before the container runs as them
+            made_volume = node().run(["volume", "inspect", volume], check=False).returncode != 0
+            node().run(["volume", "create", volume])
+            node().run(["run", "--rm", "--network", "none", "--user", "0", "--entrypoint", "chown",
+                        "-v", f"{volume}:/data", image, f"{uid}:{gid}", "/data"])
+        data = ["-v", f"{volume}:/data"]
+    args = ["create", "--name", PREFIX + name, "--hostname", name, "--init", "--network", BRIDGE[node().engine],
+            "--label", f"{LABEL}.name={name}", "--label", f"{LABEL}.created_by={created_by}",
+            "--label", f"{LABEL}.spec={json.dumps(spec, separators=(',', ':'))}", *data, *extra,
+            "--cpus", f"{cpus:g}", "--memory", str(int(memory * 2 ** 30)), "--memory-swap", str(int(memory * 2 ** 30)),
+            image, *(cmd or [])]  # memory-swap = memory: no swap, so the quota's memory is the real ceiling
+    try:
+        cid = node().run(args).stdout.strip()
+        # every container sits on the default bridge, so networks can change later; offline = unplugged from it
+        try:
+            if not internet:
+                node().run(["network", "disconnect", BRIDGE[node().engine], PREFIX + name])
+            for n in nets:
+                node().run(["network", "connect", "--alias", name, NET_PREFIX + n, PREFIX + name])
+        except SystemExit:
+            node().run(["rm", "-f", PREFIX + name], check=False)  # fail closed: never left online by mistake
+            raise
+    except SystemExit:
+        if fresh and made_volume:
+            node().run(["volume", "rm", volume], check=False)  # else left behind with no container to rm it
+        raise
+    return {"created": name, "image": image, "id": cid[:12], "cpus": cpus, "memory_gb": memory, "internet": internet,
+            **({"networks": list(nets)} if nets else {}), **({"sandbox": True} if sandbox else {}),
+            **({"desktop": f"{spec['width']}x{spec['height']}"} if spec.get("desktop") else {})}
+
+
+def recreate(name, info, **change):
+    """The container again from its spec, same resources and networks: a sandbox's fresh file system at each start,
+    or a changed spec (sandbox on/off). /data's volume, if any, is kept."""
+    raw = labels_of(info).get(f"{LABEL}.spec")
+    if not raw or not is_bridged(info):
+        raise SystemExit(f"{name} was made before terminal-ct 0.3: remove it and create it again")
+    spec = dict(json.loads(raw), **{k: v for k, v in change.items() if k != "internet"})
+    cpus, mem = allotted(info, None)
+    nets = [n[len(NET_PREFIX):] for n in networks_of(info) if n.startswith(NET_PREFIX)]
+    ensure_image(spec)  # before removing anything: a missing image must not leave the user with no container
+    node().run(["rm", "-f", PREFIX + name])
+    _make(name, spec, labels_of(info).get(f"{LABEL}.created_by", "user"), cpus or DEFAULT_CPUS, mem or DEFAULT_MEMORY,
+          change.get("internet", online(info)), nets)
+    return find(name)
 
 
 # ---------- desktop image ----------
@@ -212,9 +377,13 @@ def os_family(image):
     raise SystemExit(f"--desktop supports Debian/Ubuntu, Fedora, Alpine and Arch images; {image} is {' '.join(ids) or 'unknown'}")
 
 
+def desktop_tag(base):
+    return "tct-desktop:" + re.sub(r"[^a-z0-9_.-]", "-", base.lower())[-120:]
+
+
 def desktop_image(base):
     """The desktop layer on top of BASE, built once and cached as tct-desktop:<base>."""
-    tag = "tct-desktop:" + re.sub(r"[^a-z0-9_.-]", "-", base.lower())[-120:]
+    tag = desktop_tag(base)
     if node().run(["image", "inspect", tag], check=False).returncode == 0:
         return tag
     image_cmd(base)  # pulls it if needed
@@ -233,9 +402,22 @@ def desktop_image(base):
 
 def start(name):
     info = find(name)
-    node().run(["start", PREFIX + name])
     out = {"started": name}
-    if ((info.get("Config") or {}).get("Labels") or {}).get(f"{LABEL}.desktop") == "1":
+    if not running(info):
+        if labels_of(info).get(f"{LABEL}.sandbox") == "1" and labels_of(info).get(f"{LABEL}.spec"):
+            ensure_image(json.loads(labels_of(info)[f"{LABEL}.spec"]))  # a rebuild takes minutes: not under the lock
+        with quota_lock():  # check and start together: two commands cannot both pass and then both start
+            c0, m0 = allotted(info, None)
+            if not (c0 and m0):  # made before 0.3 without limits: give it the defaults, else it counts as the host
+                resources(name, None if c0 else DEFAULT_CPUS, None if m0 else DEFAULT_MEMORY, lock=False)
+                info, out["limits_set"] = find(name), True
+            cpus, mem = allotted(info)
+            quota_check({"cpus": cpus, "memory_gb": mem, "containers": 1})
+            if labels_of(info).get(f"{LABEL}.sandbox") == "1" and (info.get("State") or {}).get("Status") != "created":
+                info = recreate(name, info)  # a sandbox starts from its image every time
+                out["fresh"] = True
+            node().run(["start", PREFIX + name])
+    if labels_of(info).get(f"{LABEL}.desktop") == "1":
         # an empty screen looks "stable" too: return once the desktop shows a window (1% of the screen not
         # black; the pointer alone is drawn into the image), so input lands on it
         t0, end = time.time(), time.time() + 10
@@ -285,6 +467,258 @@ def exec_(name, cmd, timeout=60):
     out = {"exit": r.returncode, "stdout": r.stdout, "stderr": r.stderr}
     print(json.dumps(out))
     return out
+
+
+# ---------- quota and resources ----------
+# One ceiling for all of terminal-ct's containers, set by the user (`quota`), by default from the engine's host.
+# Checked under a lock at create (disk), start and resources, so no sequence of commands, human or agent, gets past
+# it. CPUs and memory count each running container's ceiling (--cpus, --memory), not its momentary use.
+QUOTA_KEYS = ("cpus", "memory_gb", "disk_gb", "containers")
+_UNITS = {"": 1, "b": 1, "k": 1e3, "m": 1e6, "g": 1e9, "t": 1e12, "ki": 2 ** 10, "mi": 2 ** 20, "gi": 2 ** 30, "ti": 2 ** 40}
+
+
+def parse_size(s):
+    """Bytes from an engine's human size: 3MB, 498 MB, 352KiB, 0B."""
+    m = re.match(r"\s*([\d.]+)\s*([kKmMgGtT]?i?)[bB]?", s or "")
+    return float(m.group(1)) * _UNITS[m.group(2).lower()] if m else 0
+
+
+def _quota_file():
+    try:
+        with open(os.path.join(STORE, "quota.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def disk_bytes(infos):
+    """Space terminal-ct holds: its containers' writable layers, its volumes, its desktop images. Real use, not a
+    limit: per-container disk limits exist only with some storage drivers."""
+    total = sum(c.get("SizeRw") or 0 for c in infos)
+    paths = [m["Source"] for c in infos for m in c.get("Mounts") or []
+             if m.get("Type") == "volume" and (m.get("Name") or "").startswith(PREFIX) and os.path.isdir(m.get("Source") or "")]
+    if node().engine == "podman":
+        # rootless volumes are folders of ours: du takes 4 ms where `system df -v` took 0.7 s. shortcut: files of
+        # other uids inside the container may be unreadable and left out (`podman unshare du` if that matters);
+        # with a Podman machine (Windows, macOS) the folders are in its VM and volumes are not counted
+        if paths:
+            r = subprocess.run(["du", "-skc", *dict.fromkeys(paths)], capture_output=True, text=True)
+            total += int((r.stdout.strip().splitlines() or ["0"])[-1].split()[0]) * 1024
+    else:
+        vols = json.loads(node().run(["system", "df", "-v", "--format", "{{json .Volumes}}"]).stdout or "[]") or []
+        total += sum(parse_size(v.get("Size", "")) for v in vols if v.get("Name", "").startswith(PREFIX))
+    for line in node().run(["image", "ls", "--format", "{{.Repository}} {{.Size}}"]).stdout.splitlines():
+        repo, _, size = line.partition(" ")
+        if repo.split("/")[-1] == "tct-desktop":
+            total += parse_size(size)
+    return total
+
+
+def quota_usage(disk=True):
+    infos = raw_containers(size=disk)
+    use = dict.fromkeys(QUOTA_KEYS, 0)
+    for c in infos:
+        if running(c):
+            cpus, mem = allotted(c)
+            use["cpus"] += cpus; use["memory_gb"] += mem; use["containers"] += 1
+    if disk:
+        use["disk_gb"] = disk_bytes(infos) / 2 ** 30
+    return use
+
+
+def host_free_bytes(path):
+    """Free space containers can grow into. Under WSL the engine's store sits in a virtual disk that df reports at
+    its maximum size while it really grows inside a Windows drive: count that drive too."""
+    free = shutil.disk_usage(path).free
+    if in_wsl() and os.path.isdir("/mnt/c"):  # shortcut: assumes the distribution's disk is on C:, the default
+        free = min(free, shutil.disk_usage("/mnt/c").free)
+    return free
+
+
+def quota_limits(use):
+    """The user's quota; defaults from the engine's host for what was never set: cores - 1, 75% of its memory, half
+    of the space containers can have (free now plus what they hold), 16 running containers."""
+    set_ = _quota_file()
+    cpus, mem, root = node().host()
+    try:
+        free = host_free_bytes(root)
+    except OSError:  # the engine's store is in another machine (Docker Desktop's VM): use ours
+        free = host_free_bytes(STORE if os.path.isdir(STORE) else os.path.dirname(STORE))
+    default = {"cpus": max(1, cpus - 1), "memory_gb": max(1, int(mem * 3 // 4)),
+               "disk_gb": int((free / 2 ** 30 + use.get("disk_gb", 0)) // 2), "containers": 16}
+    return {k: set_.get(k, default[k]) for k in QUOTA_KEYS}, {k: k in set_ for k in QUOTA_KEYS}
+
+
+class quota_lock:
+    """Cross-process lock (an atomic mkdir), so two commands cannot both pass the check and then both start."""
+    def __enter__(self):
+        os.makedirs(STORE, exist_ok=True)
+        self.path = os.path.join(STORE, ".quota.lock")
+        for _ in range(300):
+            try:
+                os.mkdir(self.path); return self
+            except FileExistsError:
+                with contextlib.suppress(OSError):
+                    if time.time() - os.path.getmtime(self.path) > 120:  # left by a crashed command
+                        # rename first: of two waiters seeing it stale, only one claims it (rmdir alone let the
+                        # second remove the first's fresh lock)
+                        stale = f"{self.path}.{os.getpid()}"
+                        os.rename(self.path, stale)
+                        os.rmdir(stale)
+                time.sleep(0.1)
+        raise SystemExit("another terminal-ct command holds the quota lock; try again")
+
+    def __exit__(self, *exc):
+        with contextlib.suppress(OSError):
+            os.rmdir(self.path)
+
+
+def quota_check(add):
+    """Refuse when adding `add` to current use would pass the quota (disk: when it is already reached)."""
+    use = quota_usage(disk="disk_gb" in add)
+    lim = quota_limits(use)[0]
+    over = [f"{k}: {use[k]:.4g} used + {add[k]:g} > {lim[k]}" for k in add
+            if use[k] + add[k] > lim[k] or k == "disk_gb" and use[k] >= lim[k]]
+    if over:
+        raise SystemExit("quota exceeded (" + "; ".join(over) + "). Free resources (stop or shrink containers: "
+                         "a container without limits counts as the whole host, set them with terminal-ct resources), "
+                         "or the user raises the quota: terminal-ct quota --cpus/--memory/--disk/--containers")
+
+
+def quota(set_=None):
+    """Show the quota and its use, or (user only) change it."""
+    if set_ and any(v is not None for v in set_.values()):
+        if any(v is not None and v < 1 for v in set_.values()):
+            raise SystemExit("quota values must be at least 1")
+        with quota_lock():
+            stored = _quota_file()
+            stored.update({k: v for k, v in set_.items() if v is not None})
+            with open(os.path.join(STORE, "quota.json"), "w") as f:
+                json.dump(stored, f)
+    use = quota_usage()
+    lim, chosen = quota_limits(use)
+    return {k: {"limit": lim[k], "used": round(use[k], 2), "free": round(lim[k] - use[k], 2),
+                "source": "user" if chosen[k] else "host default"} for k in QUOTA_KEYS}
+
+
+def resources(name, cpus=None, memory=None, lock=True):
+    """Show or change a container's CPUs and memory (GiB), at once even while it runs, within the quota."""
+    info = find(name)
+    if cpus is not None or memory is not None:
+        if cpus is not None and cpus <= 0 or memory is not None and memory < 0.0625:
+            raise SystemExit("cpus must be > 0 and memory at least 0.0625 GiB (64 MiB)")
+        with quota_lock() if lock else contextlib.nullcontext():
+            if running(info):
+                cur = allotted(info)
+                quota_check({"cpus": max(0, (cpus or cur[0]) - cur[0]), "memory_gb": max(0, (memory or cur[1]) - cur[1])})
+            mem = [] if memory is None else ["--memory", str(int(memory * 2 ** 30)), "--memory-swap", str(int(memory * 2 ** 30))]
+            node().run(["update", *(["--cpus", f"{cpus:g}"] if cpus else []), *mem, PREFIX + name])
+        info = find(name)
+    c = normalize(info)
+    return {"name": name, "status": c["status"], "cpus": c["cpus"], "memory_gb": c["memory_gb"]}
+
+
+def top():
+    """Real use of each running container (CPU % of one core, memory, processes) next to its ceiling, and the quota."""
+    infos = [c for c in raw_containers() if running(c)]
+    stats = {}
+    if infos:
+        out = node().run(["stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}",
+                          *(c.get("Name", "").lstrip("/") for c in infos)]).stdout
+        for line in out.splitlines():
+            p = line.split("|")
+            if len(p) == 4:
+                stats[p[0].strip()] = {"cpu_percent": float(p[1].strip().rstrip("%") or 0),
+                                       "used_memory_gb": round(parse_size(p[2].split("/")[0]) / 2 ** 30, 3),
+                                       "pids": int(p[3]) if p[3].strip().isdigit() else None}
+    rows = []
+    for c in infos:
+        n = normalize(c)
+        rows.append({"name": n["name"], "cpus": n["cpus"], "memory_gb": n["memory_gb"],
+                     **stats.get(c.get("Name", "").lstrip("/"), {}), **({"sandbox": True} if n.get("sandbox") else {})})
+    return {"containers": rows, "quota": quota()}
+
+
+# ---------- networks, internet, sandbox ----------
+# Networks are the engine's internal networks (no LAN, no internet; containers on one reach each other by name).
+# Internet is the engine's default bridge: a container is plugged into it or not. Changes apply to stopped
+# containers (Podman's DNS inside a running one kept the old setup).
+
+def networks():
+    """terminal-ct's networks: {name: {"created_by", "members"}}."""
+    ids = node().run(["network", "ls", "-q", "--filter", f"label={LABEL}.net"]).stdout.split()
+    out = {}
+    for n in node().json(["network", "inspect", *ids]) if ids else []:
+        lab = n.get("Labels") or n.get("labels") or {}  # docker, podman
+        if lab.get(f"{LABEL}.net"):
+            out[lab[f"{LABEL}.net"]] = {"created_by": lab.get(f"{LABEL}.created_by", "user"), "members": []}
+    if out:
+        for c in raw_containers():
+            for k in networks_of(c):
+                if k.startswith(NET_PREFIX) and k[len(NET_PREFIX):] in out:
+                    out[k[len(NET_PREFIX):]]["members"].append(labels_of(c).get(f"{LABEL}.name"))
+    return out
+
+
+def net_create(net, created_by="user"):
+    check_name(net)
+    if net in networks():
+        raise SystemExit(f"network {net!r} already exists")
+    node().run(["network", "create", "--internal", "--label", f"{LABEL}.net={net}",
+                "--label", f"{LABEL}.created_by={created_by}", NET_PREFIX + net])
+    return {"created": net, "internal": True}
+
+
+def net_rm(net):
+    n = networks().get(check_name(net))
+    if n is None:
+        raise SystemExit(f"no network {net!r}")
+    if n["members"]:
+        raise SystemExit(f"network {net!r} still has containers: {', '.join(n['members'])} (net detach them first)")
+    node().run(["network", "rm", NET_PREFIX + net])
+    return {"removed": net}
+
+
+def stopped(name, what):
+    info = find(name)
+    if running(info):
+        raise SystemExit(f"stop {name} first: {what} changes apply to a stopped container (terminal-ct stop {name})")
+    if not is_bridged(info):
+        raise SystemExit(f"{name} was made before terminal-ct 0.3 (network mode "
+                         f"{(info.get('HostConfig') or {}).get('NetworkMode')}): remove it and create it again")
+    return info
+
+
+def net_attach(name, net, attach=True):
+    info = stopped(name, "network")
+    n = networks().get(check_name(net))
+    if n is None:
+        raise SystemExit(f"no network {net!r}; create it with: terminal-ct net create {net}")
+    on = NET_PREFIX + net in networks_of(info)
+    if attach and not on:
+        node().run(["network", "connect", "--alias", name, NET_PREFIX + net, PREFIX + name])
+    elif not attach and on:
+        node().run(["network", "disconnect", NET_PREFIX + net, PREFIX + name])
+    return {"name": name, "networks": normalize(find(name))["networks"]}
+
+
+def internet(name, on=None):
+    info = find(name) if on is None else stopped(name, "internet")
+    if on is not None and on != online(info):
+        node().run(["network", "connect" if on else "disconnect", BRIDGE[node().engine], PREFIX + name])
+        info = find(name)
+    return {"name": name, "internet": online(info)}
+
+
+def sandbox(name, on):
+    """Sandbox on: no capabilities, no new privileges, a process limit, not root, /data in memory, a fresh file
+    system at each start, offline. Off: the same container back as a normal one (still offline, /data's volume
+    back). Both recreate the container from its image."""
+    info = stopped(name, "sandbox")
+    if (labels_of(info).get(f"{LABEL}.sandbox") == "1") != on:
+        info = recreate(name, info, sandbox=on, **({"internet": False} if on else {}))
+    c = normalize(info)
+    return {"name": name, "sandbox": bool(c.get("sandbox")), "internet": c["internet"]}
 
 
 def image(cmd, ref=None, path=None):
@@ -910,51 +1344,248 @@ TOOLS = [
      _schema({"command": {"type": "string"}, "timeout": _N}, ["command"])),
 ]
 INPUT_TOOLS = {"click", "move", "drag", "scroll", "type", "key"}
+_CT = {"container": {"type": "string", "description": "Another container (default: this server's own)"}}
+SCREEN_TOOLS = [(n, d, dict(s, properties={**s["properties"], **_CT})) for n, d, s in TOOLS]
+_NAME, _NET = {"name": {"type": "string"}}, {"net": {"type": "string"}}
+_MANAGED = (" The agent runs sandboxes and the containers it created; any other container of the user's needs "
+            "their approval.")
+AGENT_TOOLS = [
+    ("ct_list", "terminal-ct's containers; managed=true marks the ones this agent runs without asking." + _MANAGED,
+     _schema({})),
+    ("ct_create", "Create a container, sandboxed by default (not root, no capabilities, process limit, /data in "
+                  "memory, a fresh file system at each start, offline). image: default debian:stable-slim; desktop: "
+                  "add a screen (Debian/Ubuntu, Fedora, Alpine, Arch bases). Needs the user's approval: an image not "
+                  "on this host yet (download or build), internet, a network of the user's.",
+     _schema({**_NAME, "image": {"type": "string"}, "desktop": {"type": "boolean"}, "width": {"type": "integer"},
+              "height": {"type": "integer"}, "cpus": _N, "memory_gb": _N, "sandbox": {"type": "boolean"},
+              "internet": {"type": "boolean"}, "networks": {"type": "array", "items": {"type": "string"}}}, ["name"])),
+    ("ct_start", "Start a container, within the host quota (a sandbox starts fresh from its image)." + _MANAGED,
+     _schema(_NAME, ["name"])),
+    ("ct_stop", "Stop a container.", _schema({**_NAME, "timeout": {"type": "integer"}}, ["name"])),
+    ("ct_remove", "Delete a container and its /data volume (one the agent did not create needs approval).",
+     _schema(_NAME, ["name"])),
+    ("ct_resources", "Show, or change at once (even running), a container's CPUs and memory within the quota.",
+     _schema({**_NAME, "cpus": _N, "memory_gb": _N}, ["name"])),
+    ("ct_internet", "Show (without on) or change a stopped container's internet access; on needs the user's approval.",
+     _schema({**_NAME, "on": {"type": "boolean"}}, ["name"])),
+    ("net_list", "terminal-ct's isolated networks (no LAN, no internet) and their containers, which reach each "
+                 "other by name.", _schema({})),
+    ("net_create", "Create an isolated container-to-container network.", _schema(_NET, ["net"])),
+    ("net_remove", "Remove an empty network this agent created.", _schema(_NET, ["net"])),
+    ("net_attach", "Plug a stopped container into a network (a network the user created needs their approval).",
+     _schema({**_NAME, **_NET}, ["name", "net"])),
+    ("net_detach", "Unplug a stopped container from a network.", _schema({**_NAME, **_NET}, ["name", "net"])),
+    ("top", "Real CPU, memory and process use of each running container, next to its ceiling, and the quota.",
+     _schema({})),
+    ("quota", "The host quota (CPUs, memory, disk, running containers) and its use; only the user changes it.",
+     _schema({})),
+]
+AGENT_NAMES = {n for n, _, _ in AGENT_TOOLS}
+AGENT_LOG = "agent.log"
 
 
 def _image(data):
     return {"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"}
 
 
-def mcp(name):
-    """One container per server (phase 3 adds managing others under the agent-authority rules)."""
-    check_name(name)
-    send = lambda msg: (sys.stdout.write(json.dumps(msg) + "\n"), sys.stdout.flush())
-    for line in sys.stdin:
+def quiet(f, *a, **k):
+    """Call a CLI function that prints its JSON result (stdout is the MCP channel) and return that result."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        r = f(*a, **k)
+    if r is not None:
+        return r
+    out = buf.getvalue().strip()
+    return json.loads(out.splitlines()[-1]) if out else {}
+
+
+# ---------- agent authority ----------
+# Through MCP, agents run sandboxes and the containers they created (labelled created_by=agent at creation; only
+# recreating changes a label). Anything else, and risky steps, needs the user's approval: approve(message, cli) asks
+# through MCP elicitation, or raises naming the CLI command the user can run instead.
+
+def agent_owned(info):
+    return labels_of(info).get(f"{LABEL}.created_by") == "agent"
+
+
+def managed(info):
+    """The agent's own, or a user's sandbox the user left offline (one they put online would be a way out)."""
+    return agent_owned(info) or labels_of(info).get(f"{LABEL}.sandbox") == "1" and not online(info)
+
+
+def guard(name, approve, what, cli, destructive=False):
+    info = find(name)
+    if not managed(info) or destructive and not agent_owned(info):
+        approve(f"Let the agent {what} your container {name}?", cli)
+    return info
+
+
+def local_image(ref):
+    return any(node().run(["image", "inspect", r], check=False).returncode == 0 for r in (ref, qualified(ref)))
+
+
+def agent_call(tool, a, approve):
+    name, net = a.get("name"), a.get("net")
+    if tool == "ct_list":
+        infos = raw_containers()
+        return [dict(normalize(c), managed=managed(c)) for c in infos]
+    if tool == "top":
+        return top()
+    if tool == "quota":
+        return quota()
+    if tool == "net_list":
+        return networks()
+    if tool == "net_create":
+        return net_create(net, "agent")
+    if tool == "net_remove":
+        if networks().get(check_name(net), {}).get("created_by") != "agent":
+            raise SystemExit(f"network {net!r} is not one this agent created")
+        return net_rm(net)
+    if tool == "ct_create":
+        img, desk = a.get("image") or DEFAULT_IMAGE, bool(a.get("desktop"))
+        if not (desk and local_image(desktop_tag(img))):
+            if not local_image(img):
+                approve(f"Download the image {img} for {name}?", f"terminal-ct image pull {img}")
+            if desk:
+                approve(f"Build the desktop image for {img} (packages from the internet, a few minutes)?",
+                        f"terminal-ct create {name} --desktop --image {img}")
+        if a.get("internet"):
+            approve(f"Give the new container {name} internet access?", f"terminal-ct internet {name} on")
+        own = networks()
+        for n in a.get("networks") or []:
+            if own.get(n, {}).get("created_by") != "agent":
+                approve(f"Plug {name} into your network {n!r} (it would reach your containers on it)?",
+                        f"terminal-ct net attach {name} {n}")
+        return quiet(create, name, img, a.get("cpus"), a.get("memory_gb"), created_by="agent", desktop=desk,
+                     width=int(a.get("width", 1280)), height=int(a.get("height", 800)),
+                     sandbox=a.get("sandbox", True), internet=bool(a.get("internet")), nets=a.get("networks") or ())
+    if tool == "ct_start":
+        guard(name, approve, "start", f"terminal-ct start {name}")
+        return quiet(start, name)
+    if tool == "ct_stop":
+        guard(name, approve, "stop", f"terminal-ct stop {name}")
+        return quiet(stop, name, int(a.get("timeout", 10)))
+    if tool == "ct_remove":
+        guard(name, approve, "delete (with its /data)", f"terminal-ct rm {name}", destructive=True)
+        return quiet(rm, name)
+    if tool == "ct_resources":
+        if a.get("cpus") is not None or a.get("memory_gb") is not None:
+            guard(name, approve, "resize", f"terminal-ct resources {name} --cpus/--memory")
+        return resources(name, a.get("cpus"), a.get("memory_gb"))
+    if tool == "ct_internet":
+        if a.get("on") is not None:
+            guard(name, approve, "change the network of", f"terminal-ct internet {name} {'on' if a['on'] else 'off'}")
+            if a["on"]:
+                approve(f"Give {name} internet access?", f"terminal-ct internet {name} on")
+        return internet(name, a.get("on"))
+    if tool in ("net_attach", "net_detach"):
+        guard(name, approve, "change the networks of", f"terminal-ct net {tool[4:]} {name} {net}")
+        if tool == "net_attach" and networks().get(check_name(net), {}).get("created_by") != "agent":
+            approve(f"Plug {name} into your network {net!r} (it would reach your containers on it)?",
+                    f"terminal-ct net attach {name} {net}")
+        return net_attach(name, net, tool == "net_attach")
+    raise SystemExit(f"unknown tool {tool}")
+
+
+def mcp(name=None):
+    """Screen tools and exec on this server's container (NAME, given by the user) or, with `container`, on another;
+    plus managing containers and networks under the agent-authority rules."""
+    if name:
+        check_name(name)
+    allowed = {name}  # containers this session may drive: the server's own, and those the user approved
+    can_ask, pending, asks = False, collections.deque(), iter(range(1, 1 << 30))
+
+    channel = sys.stdout  # replies only: tool code runs with stdout redirected
+
+    def send(msg):
+        channel.write(json.dumps(msg) + "\n"); channel.flush()
+
+    def record(tool, a, target, error=None):  # every infrastructure action, and a sandbox's screen actions
+        try:
+            sandboxed = target and labels_of(find(target)).get(f"{LABEL}.sandbox") == "1"
+        except SystemExit:
+            sandboxed = False
+        path = os.path.join(STORE, AGENT_LOG) if tool in AGENT_NAMES else \
+            os.path.join(ct_dir(target), "actions.log") if sandboxed else None
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "tool": tool, "arguments": a,
+                                    **({"container": target} if target else {}), **({"error": error} if error else {})}) + "\n")
+
+    def approve(message, cli):
+        """Ask the user through the client (MCP elicitation); raise unless they accept."""
+        if not can_ask:
+            raise RuntimeError(f"This needs the user's approval and this client cannot ask them. Ask the user to run: {cli}")
+        aid = f"ask-{next(asks)}"
+        send({"jsonrpc": "2.0", "id": aid, "method": "elicitation/create", "params": {
+            "message": message, "requestedSchema": {"type": "object", "properties": {
+                "approve": {"type": "boolean", "title": "Approve", "description": message}}, "required": ["approve"]}}})
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                raise RuntimeError("the client closed the connection before the user answered")
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("id") != aid or "method" in msg:
+                pending.append(line)  # other messages wait until the user has answered
+                continue
+            r = msg.get("result") or {}
+            if r.get("action") == "accept" and (r.get("content") or {}).get("approve"):
+                return
+            raise RuntimeError(f"The user did not approve. They can still run: {cli}")
+
+    while True:
+        line = pending.popleft() if pending else sys.stdin.readline()
+        if not line:
+            break
         try:
             req = json.loads(line)
         except ValueError:
             continue
         method, rid = req.get("method"), req.get("id")
-        if rid is None:  # notifications
+        if rid is None or method is None:  # notifications, stray responses
             continue
         if method == "initialize":
+            can_ask = "elicitation" in (req.get("params", {}).get("capabilities") or {})
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": req.get("params", {}).get("protocolVersion", "2025-06-18"),
                 "capabilities": {"tools": {}}, "serverInfo": {"name": "terminal-ct", "version": VERSION}}})
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
-                {"name": n, "description": d, "inputSchema": s} for n, d, s in TOOLS]}})
+                {"name": n, "description": d, "inputSchema": s} for n, d, s in SCREEN_TOOLS + AGENT_TOOLS]}})
         elif method == "tools/call":
             p = req.get("params", {})
             tool, a = p.get("name"), dict(p.get("arguments") or {})
+            target = a.get("name") if tool in AGENT_NAMES else a.pop("container", None) or name
             try:
-                if tool == "exec":
-                    buf = io.StringIO()
-                    with contextlib.redirect_stdout(buf):
-                        out = exec_(name, ["sh", "-c", a["command"]], float(a.get("timeout", 60)))
-                    content = [{"type": "text", "text": json.dumps(out)}]
+                if tool in AGENT_NAMES:
+                    with contextlib.redirect_stdout(io.StringIO()):  # engine output must not reach the MCP channel
+                        content = [{"type": "text", "text": json.dumps(agent_call(tool, a, approve))}]
                 else:
-                    before = _pixels(name) if a.get("screenshot") and tool in INPUT_TOOLS else None
-                    out = act(name, tool, a)
-                    if tool == "screenshot":
-                        content = [_image(out[0])]
-                    else:
+                    if not target:
+                        raise ValueError("name the container: this server was started without one (container)")
+                    if target not in allowed:
+                        guard(target, approve, "use the screen and shell of", f"terminal-ct mcp {target}")
+                        allowed.add(target)
+                    if tool == "exec":
+                        out = quiet(exec_, target, ["sh", "-c", a["command"]], float(a.get("timeout", 60)))
                         content = [{"type": "text", "text": json.dumps(out)}]
-                        if a.get("screenshot") or tool == "wait":
-                            content.append(_image(settled_screenshot(name, before)))
+                    else:
+                        before = _pixels(target) if a.get("screenshot") and tool in INPUT_TOOLS else None
+                        out = act(target, tool, a)
+                        if tool == "screenshot":
+                            content = [_image(out[0])]
+                        else:
+                            content = [{"type": "text", "text": json.dumps(out)}]
+                            if a.get("screenshot") or tool == "wait":
+                                content.append(_image(settled_screenshot(target, before)))
+                record(tool, a, target)
                 send({"jsonrpc": "2.0", "id": rid, "result": {"content": content}})
             except (Exception, SystemExit) as e:  # report failures to the agent instead of dying
+                record(tool, a, target, str(e))
                 send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": str(e)}], "isError": True}})
         elif method == "ping":
             send({"jsonrpc": "2.0", "id": rid, "result": {}})
@@ -992,13 +1623,24 @@ def main(argv=None):
     c.add_argument("--cpus", type=float); c.add_argument("--memory", type=float, help="GiB")
     c.add_argument("--desktop", action="store_true", help="Xvnc + Openbox on top of the image")
     c.add_argument("--width", type=int, default=1280); c.add_argument("--height", type=int, default=800)
+    c.add_argument("--sandbox", action="store_true"); c.add_argument("--offline", action="store_true")
+    c.add_argument("--net", action="append", default=[], help="an isolated network (repeatable)")
+    r = sub.add_parser("resources"); r.add_argument("name")
+    r.add_argument("--cpus", type=float); r.add_argument("--memory", type=float, help="GiB")
+    q = sub.add_parser("quota"); q.add_argument("--cpus", type=int); q.add_argument("--memory", type=int, help="GiB")
+    q.add_argument("--disk", type=int, help="GiB"); q.add_argument("--containers", type=int)
+    nt = sub.add_parser("net"); nt.add_argument("net_cmd", choices=["create", "rm", "ls", "attach", "detach"])
+    nt.add_argument("args", nargs="*")
+    for n in ("internet", "sandbox"):
+        t = sub.add_parser(n); t.add_argument("name"); t.add_argument("state", nargs="?" if n == "internet" else None,
+                                                                       choices=["on", "off"])
     a = sub.add_parser("action"); a.add_argument("name")
     a.add_argument("tool", choices=["screenshot", "click", "move", "drag", "scroll", "type", "key", "wait", "status"])
     a.add_argument("args", nargs="*"); a.add_argument("--output"); a.add_argument("--button", default="left")
     a.add_argument("--double", action="store_true"); a.add_argument("--dy", type=int)
     a.add_argument("--x", type=float); a.add_argument("--y", type=float)
     a.add_argument("--timeout", type=float, default=30); a.add_argument("--stable", type=float, default=1)
-    sub.add_parser("mcp").add_argument("name")
+    sub.add_parser("mcp").add_argument("name", nargs="?")
     for n in ("view", "show"):
         v = sub.add_parser(n); v.add_argument("name"); v.add_argument("--read-only", action="store_true")
     for n in ("start", "rm", "status"):
@@ -1008,7 +1650,7 @@ def main(argv=None):
     x.add_argument("command", nargs=argparse.REMAINDER)
     im = sub.add_parser("image"); im.add_argument("image_cmd", choices=["ls", "pull", "build", "rm"])
     im.add_argument("ref", nargs="?"); im.add_argument("path", nargs="?")
-    for n in ("ls", "doctor", "help", "version"):
+    for n in ("ls", "top", "doctor", "help", "version"):
         sub.add_parser(n)
     o = p.parse_args(argv)
     global NODE
@@ -1019,7 +1661,23 @@ def main(argv=None):
     if o.cmd == "doctor": return doctor()
     if o.cmd == "ls": return ls()
     if o.cmd == "create":
-        return create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width, height=o.height)
+        return create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width,
+                      height=o.height, sandbox=o.sandbox, internet=False if o.offline else None, nets=o.net)
+    show_json = lambda r: print(json.dumps(r, indent=1))
+    if o.cmd == "resources": return show_json(resources(o.name, o.cpus, o.memory))
+    if o.cmd == "quota":
+        return show_json(quota({"cpus": o.cpus, "memory_gb": o.memory, "disk_gb": o.disk, "containers": o.containers}))
+    if o.cmd == "top": return show_json(top())
+    if o.cmd == "internet": return show_json(internet(o.name, None if o.state is None else o.state == "on"))
+    if o.cmd == "sandbox": return show_json(sandbox(o.name, o.state == "on"))
+    if o.cmd == "net":
+        want = {"create": 1, "rm": 1, "ls": 0, "attach": 2, "detach": 2}[o.net_cmd]
+        if len(o.args) != want:
+            raise SystemExit({0: "net ls", 1: f"net {o.net_cmd} NET", 2: f"net {o.net_cmd} NAME NET"}[want])
+        if o.net_cmd == "ls": return show_json(networks())
+        if o.net_cmd == "create": return show_json(net_create(o.args[0]))
+        if o.net_cmd == "rm": return show_json(net_rm(o.args[0]))
+        return show_json(net_attach(o.args[0], o.args[1], o.net_cmd == "attach"))
     if o.cmd == "mcp": return mcp(o.name)
     if o.cmd == "show": return show(o.name)
     if o.cmd == "view":

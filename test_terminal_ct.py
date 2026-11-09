@@ -1,4 +1,4 @@
-import contextlib, io, json, os, shutil, socket, struct, subprocess, tempfile, threading, unittest, zlib
+import contextlib, io, json, os, shutil, socket, struct, subprocess, tempfile, threading, unittest, unittest.mock, zlib
 
 import terminal_ct as ct
 
@@ -8,7 +8,7 @@ class FakeNode(ct.Node):
     os_release = 'NAME="Alpine Linux"\nID=alpine\n'
 
     def __init__(self, engine="docker"):
-        self.engine, self.calls, self.objects, self.images = engine, [], {}, {
+        self.engine, self.calls, self.objects, self.nets, self.images = engine, [], {}, {}, {
             "debian:stable-slim": {"Config": {"Cmd": ["bash"]}},
             "alpine:3.20": {"Config": {"Cmd": ["/bin/sh"]}},
             "nginx": {"Config": {"Entrypoint": ["/docker-entrypoint.sh"], "Cmd": ["nginx", "-g", "daemon off;"]}}}
@@ -16,16 +16,23 @@ class FakeNode(ct.Node):
     def run(self, args, check=True, timeout=None, capture=True):
         self.calls.append(args)
         out, code = "", 0
+        opt = lambda flag, conv=str: conv(args[args.index(flag) + 1]) if flag in args else None
         if args[:2] == ["image", "inspect"]:
             img = self.images.get(args[2])
             out, code = (json.dumps([img]), 0) if img else ("", 1)
         elif args[0] == "pull":
             self.images[args[1]] = {"Config": {"Cmd": ["sh"]}}
+        elif args[0] == "info":
+            out = f"8 {16 * 2 ** 30} {ct.STORE}"
         elif args[0] == "create":
             name = args[args.index("--name") + 1]
             labels = dict(a.split("=", 1) for a in args[args.index("--name"):] if a.startswith("terminal-ct."))
-            self.objects[name] = {"Id": "abc123def4567890", "Name": "/" + name,
-                                  "State": {"Status": "created"}, "Config": {"Labels": labels, "Image": "img"}}
+            net = opt("--network")
+            self.objects[name] = {"Id": "abc123def4567890", "Name": "/" + name, "State": {"Status": "created"},
+                                  "Config": {"Labels": labels, "Image": "img"},
+                                  "HostConfig": {"NanoCpus": int(float(opt("--cpus") or 0) * 1e9),
+                                                 "Memory": int(opt("--memory") or 0), "NetworkMode": net},
+                                  "NetworkSettings": {"Networks": {net: {}}}}
             out = "abc123def4567890"
         elif args[0] == "inspect":
             assert args[1:3] == ["--type", "container"], args  # untyped, it matched images and volumes too
@@ -33,12 +40,42 @@ class FakeNode(ct.Node):
             out, code = json.dumps(found), (0 if found else 1)
         elif args[0] == "start":
             self.objects[args[1]]["State"]["Status"] = "running"
+        elif args[0] == "stop":
+            self.objects[args[-1]]["State"]["Status"] = "exited"
+        elif args[0] == "update":
+            hc = self.objects[args[-1]]["HostConfig"]
+            if "--cpus" in args: hc["NanoCpus"] = int(float(opt("--cpus")) * 1e9)
+            if "--memory" in args: hc["Memory"] = int(opt("--memory"))
         elif args[0] == "ps":
             out = "\n".join(self.objects)
         elif args[0] == "rm":
             self.objects.pop(args[-1], None)
         elif args[0] == "exec":
             out = "hi\n"
+        elif args[0] == "stats":
+            out = "\n".join(f"{n}|12.5%|512MiB / 1GiB|7" for n in args[4:])
+        elif args[:2] == ["network", "create"]:
+            self.nets[args[-1]] = dict(a.split("=", 1) for a in args if a.startswith("terminal-ct."))
+        elif args[:2] == ["network", "ls"]:
+            out = "\n".join(self.nets)
+        elif args[:2] == ["network", "inspect"]:
+            out = json.dumps([{"Labels": self.nets[n]} for n in args[2:]])
+        elif args[:2] == ["network", "rm"]:
+            self.nets.pop(args[2])
+        elif args[:2] in (["network", "connect"], ["network", "disconnect"]):
+            net, c = args[-2], self.objects[args[-1]]["NetworkSettings"]["Networks"]
+            if net not in self.nets and net != ct.BRIDGE[self.engine]:
+                code = 1
+            elif args[1] == "connect":
+                c[net] = {}
+            else:
+                c.pop(net, None)
+        elif args[:2] == ["volume", "inspect"]:
+            code = 0 if args[2] in getattr(self, "volumes", ()) else 1
+        elif args[:2] == ["system", "df"]:
+            out = json.dumps([{"Name": "tct-web-data", "Size": "2GB"}, {"Name": "theirs", "Size": "9GB"}])
+        elif args[:2] == ["image", "ls"] and "--format" in args:
+            out = "tct-desktop 1GB\ndebian 80MB"
         elif args[0] == "run" and "cat" in args:  # os_family
             out = self.os_release
         elif args[0] == "build":
@@ -58,6 +95,7 @@ def quiet(f, *a, **k):
 class Lifecycle(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
 
     def test_create_labels_volume_and_keep_alive(self):
         quiet(ct.create, "web", cpus=1, memory=0.5)
@@ -66,7 +104,8 @@ class Lifecycle(unittest.TestCase):
         self.assertIn("terminal-ct.name=web", args)
         self.assertIn("tct-web-data:/data", args)
         self.assertEqual(args[-3:], ["tail", "-f", "/dev/null"])        # bash default: kept alive
-        self.assertIn("0.5g", args)
+        self.assertEqual(args[args.index("--memory") + 1], str(2 ** 29))
+        self.assertEqual(args[args.index("--memory-swap") + 1], str(2 ** 29))  # no swap past the ceiling
         with self.assertRaises(SystemExit):
             ct.create("web")                                           # already exists
 
@@ -112,6 +151,202 @@ class Lifecycle(unittest.TestCase):
         for name in ("/tct-w", "tct-w"):  # Docker prefixes a slash, Podman does not
             c = ct.normalize(dict(base, Name=name))
             self.assertEqual((c["name"], c["status"], c["exit_code"], c["created_by"]), ("w", "exited", 3, "agent"))
+
+
+class Phase3(unittest.TestCase):
+    """Quota, resources, top, networks, internet, sandbox, agent authority."""
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
+
+    def created(self, name):
+        return [c for c in self.n.calls if c[0] == "create" and c[c.index("--name") + 1] == "tct-" + name][-1]
+
+    def test_defaults_ceiling_bridge_and_internet(self):
+        quiet(ct.create, "u")
+        args = self.created("u")
+        self.assertEqual((args[args.index("--cpus") + 1], args[args.index("--network") + 1]), ("1", "bridge"))
+        self.assertEqual(args[args.index("--memory") + 1], str(2 ** 30))
+        self.assertNotIn(["network", "disconnect", "bridge", "tct-u"], self.n.calls)  # the user's: online
+        quiet(ct.create, "s", sandbox=True)
+        args = self.created("s")
+        for flag in ("--cap-drop", "no-new-privileges", "--pids-limit", "--tmpfs", "terminal-ct.sandbox=1"):
+            self.assertTrue(any(flag in a for a in args), flag)
+        self.assertFalse(any(a.endswith(":/data") for a in args))      # no volume: /data in memory
+        self.assertIn(["network", "disconnect", "bridge", "tct-s"], self.n.calls)  # sandbox: offline
+        quiet(ct.create, "a", created_by="agent")
+        self.assertIn(["network", "disconnect", "bridge", "tct-a"], self.n.calls)  # agent's: offline
+        self.assertEqual(ct.status.__name__, "status")
+        c = ct.normalize(ct.find("s"))
+        self.assertEqual((c["cpus"], c["memory_gb"], c["internet"], c["sandbox"]), (1, 1, False, True))
+
+    def test_quota_blocks_start_and_resize(self):
+        with open(os.path.join(ct.STORE, "quota.json"), "w") as f:
+            json.dump({"cpus": 3, "memory_gb": 4}, f)
+        quiet(ct.create, "a", cpus=2); quiet(ct.create, "b", cpus=2)
+        quiet(ct.start, "a")
+        with self.assertRaisesRegex(SystemExit, "cpus: 2 used \\+ 2 > 3"):
+            ct.start("b")
+        self.assertEqual(self.n.objects["tct-b"]["State"]["Status"], "created")
+        with self.assertRaisesRegex(SystemExit, "memory_gb"):
+            ct.resources("a", memory=5)                                   # running: the increase is checked
+        self.assertEqual(ct.resources("a", memory=4)["memory_gb"], 4)    # exactly the quota: fits
+        self.assertEqual(ct.resources("a", cpus=3)["cpus"], 3)
+        self.assertEqual(ct.resources("b", cpus=8)["cpus"], 8)           # stopped: checked at start
+        q = ct.quota()
+        self.assertEqual((q["cpus"]["used"], q["cpus"]["source"], q["containers"]["source"]), (3, "user", "host default"))
+        self.assertAlmostEqual(q["disk_gb"]["used"], (2e9 + 1e9) / 2 ** 30, 2)  # its volume + desktop image, not theirs
+        self.assertFalse(os.path.exists(os.path.join(ct.STORE, ".quota.lock")))  # released after a refusal too
+
+    def test_disk_quota_blocks_create(self):
+        with open(os.path.join(ct.STORE, "quota.json"), "w") as f:
+            json.dump({"disk_gb": 2}, f)
+        with self.assertRaisesRegex(SystemExit, "disk_gb"):
+            ct.create("x")
+
+    def test_unlimited_old_containers(self):
+        quiet(ct.create, "old"); quiet(ct.create, "run")
+        for n in ("tct-old", "tct-run"):
+            self.n.objects[n]["HostConfig"].update(NanoCpus=0, Memory=0)
+        self.n.objects["tct-run"]["State"]["Status"] = "running"         # started before the upgrade
+        self.assertEqual(ct.quota_usage(disk=False)["cpus"], 8)          # counts as the whole host
+        self.assertEqual(ct.normalize(ct.find("run"))["cpus"], "unlimited")
+        quiet(ct.stop, "run")
+        self.assertTrue(quiet(ct.start, "old")["limits_set"])            # given the defaults, then started
+        self.assertEqual(ct.resources("old")["cpus"], 1)
+
+    def test_top(self):
+        quiet(ct.create, "a"); quiet(ct.start, "a")
+        row = ct.top()["containers"][0]
+        self.assertEqual((row["name"], row["cpu_percent"], row["used_memory_gb"], row["pids"]), ("a", 12.5, 0.5, 7))
+
+    def test_parse_size(self):
+        for s, b in (("3MB", 3e6), ("498 MB", 498e6), ("352KiB", 352 * 1024), ("0B", 0), ("1.5GiB", 1.5 * 2 ** 30)):
+            self.assertEqual(ct.parse_size(s), b)
+
+    def test_networks_and_internet(self):
+        quiet(ct.create, "a")
+        self.assertEqual(ct.net_create("lab")["internal"], True)
+        self.assertIn("--internal", next(c for c in self.n.calls if c[:2] == ["network", "create"]))
+        quiet(ct.start, "a")
+        with self.assertRaisesRegex(SystemExit, "stop a first"):
+            ct.net_attach("a", "lab")
+        quiet(ct.stop, "a")
+        self.assertEqual(ct.net_attach("a", "lab")["networks"], ["lab"])
+        self.assertIn(["network", "connect", "--alias", "a", "tct-net-lab", "tct-a"], self.n.calls)
+        with self.assertRaisesRegex(SystemExit, "still has containers"):
+            ct.net_rm("lab")
+        self.assertEqual(ct.internet("a", False)["internet"], False)
+        self.assertEqual(ct.internet("a")["internet"], False)
+        quiet(ct.create, "b", nets=["lab"], internet=False)
+        self.assertEqual(sorted(ct.networks()["lab"]["members"]), ["a", "b"])
+        with self.assertRaisesRegex(SystemExit, "no network"):
+            ct.create("c", nets=["nope"])
+        ct.net_attach("a", "lab", False); quiet(ct.rm, "b")
+        self.assertEqual(ct.net_rm("lab"), {"removed": "lab"})
+
+    def test_sandbox_starts_fresh_and_toggles(self):
+        quiet(ct.create, "s", sandbox=True)
+        self.assertNotIn("fresh", quiet(ct.start, "s"))                   # first start: as created
+        quiet(ct.stop, "s")
+        n_creates = sum(c[0] == "create" for c in self.n.calls)
+        self.assertTrue(quiet(ct.start, "s")["fresh"])                    # again: recreated from its spec
+        self.assertEqual(sum(c[0] == "create" for c in self.n.calls), n_creates + 1)
+        self.assertFalse(ct.normalize(ct.find("s"))["internet"])          # still offline after recreation
+        quiet(ct.stop, "s")
+        self.assertEqual(ct.sandbox("s", False), {"name": "s", "sandbox": False, "internet": False})
+        self.assertIn("tct-s-data:/data", self.created("s"))
+        quiet(ct.create, "u")
+        self.assertEqual(ct.sandbox("u", True), {"name": "u", "sandbox": True, "internet": False})
+
+    def test_leftover_volume_not_adopted(self):
+        self.n.volumes = {"tct-work-data"}
+        with self.assertRaisesRegex(SystemExit, "left from an earlier work"):
+            ct.create("work")
+
+    def test_network_failure_fails_closed(self):
+        self.n.nets["tct-net-gone"] = {"terminal-ct.net": "gone"}
+        real = self.n.run
+
+        def run(args, **k):
+            if args[:2] == ["network", "connect"]:
+                raise SystemExit("network vanished")
+            return real(args, **k)
+        self.n.run = run
+        with self.assertRaisesRegex(SystemExit, "vanished"):
+            ct.create("x", internet=False, nets=["gone"])
+        self.assertNotIn("tct-x", self.n.objects)                        # not left behind, online or not
+
+    def test_pre_03_container_cannot_change_networks(self):
+        quiet(ct.create, "old")
+        self.n.objects["tct-old"]["HostConfig"]["NetworkMode"] = "pasta"
+        with self.assertRaisesRegex(SystemExit, "before terminal-ct 0.3"):
+            ct.internet("old", False)
+
+
+class AgentAuthority(unittest.TestCase):
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
+        self.asked = []
+
+    def approve(self, message, cli):
+        self.asked.append(cli)
+
+    def refuse(self, message, cli):
+        raise RuntimeError(f"The user did not approve. They can still run: {cli}")
+
+    def test_agent_creates_sandboxes_offline_and_owns_them(self):
+        out = ct.agent_call("ct_create", {"name": "job"}, self.refuse)       # image here, sandbox: no question
+        self.assertEqual((out["sandbox"], out["internet"]), (True, False))
+        self.assertTrue(ct.managed(ct.find("job")) and ct.agent_owned(ct.find("job")))
+        ct.agent_call("ct_start", {"name": "job"}, self.refuse)
+        ct.agent_call("ct_resources", {"name": "job", "cpus": 2}, self.refuse)
+        ct.agent_call("ct_stop", {"name": "job"}, self.refuse)
+        ct.agent_call("ct_remove", {"name": "job"}, self.refuse)
+        self.assertEqual(self.asked, [])
+
+    def test_risky_steps_ask(self):
+        ct.agent_call("ct_create", {"name": "dl", "image": "busybox:1.36", "internet": True}, self.approve)
+        self.assertEqual(self.asked, ["terminal-ct image pull busybox:1.36", "terminal-ct internet dl on"])
+        quiet(ct.create, "mine")                                           # the user's own
+        with self.assertRaisesRegex(RuntimeError, "terminal-ct start mine"):
+            ct.agent_call("ct_start", {"name": "mine"}, self.refuse)
+        self.assertEqual(self.n.objects["tct-mine"]["State"]["Status"], "created")
+        ct.net_create("theirs")
+        with self.assertRaisesRegex(RuntimeError, "net attach dl theirs"):
+            ct.agent_call("net_attach", {"name": "dl", "net": "theirs"}, self.refuse)
+        with self.assertRaisesRegex(SystemExit, "not one this agent created"):
+            ct.agent_call("net_remove", {"net": "theirs"}, self.refuse)
+        ct.agent_call("net_create", {"net": "lab"}, self.refuse)
+        self.assertEqual(ct.agent_call("net_attach", {"name": "dl", "net": "lab"}, self.refuse)["networks"], ["lab"])
+        listed = {c["name"]: c["managed"] for c in ct.agent_call("ct_list", {}, self.refuse)}
+        self.assertEqual(listed, {"dl": True, "mine": False})
+
+    def test_user_sandbox_removal_asks(self):
+        quiet(ct.create, "box", sandbox=True)                              # the user's sandbox: managed...
+        ct.agent_call("ct_start", {"name": "box"}, self.refuse)
+        with self.assertRaisesRegex(RuntimeError, "terminal-ct rm box"):  # ...but deleting it is theirs to say
+            ct.agent_call("ct_remove", {"name": "box"}, self.refuse)
+        quiet(ct.stop, "box"); ct.internet("box", True)                   # the user put it online: not the agent's
+        with self.assertRaisesRegex(RuntimeError, "terminal-ct start box"):
+            ct.agent_call("ct_start", {"name": "box"}, self.refuse)
+
+    def test_mcp_elicitation_round_trip(self):
+        quiet(ct.create, "mine")
+        lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {"elicitation": {}}}},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ct_start", "arguments": {"name": "mine"}}},
+                 {"jsonrpc": "2.0", "id": "ask-1", "result": {"action": "accept", "content": {"approve": True}}},
+                 {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "exec", "arguments": {"command": "x"}}}]
+        stdin, stdout = io.StringIO("".join(json.dumps(m) + "\n" for m in lines)), io.StringIO()
+        with unittest.mock.patch("sys.stdin", stdin), contextlib.redirect_stdout(stdout):
+            ct.mcp()
+        replies = [json.loads(l) for l in stdout.getvalue().splitlines()]
+        self.assertEqual(replies[1]["method"], "elicitation/create")
+        self.assertEqual(json.loads(replies[2]["result"]["content"][0]["text"]), {"started": "mine"})
+        self.assertTrue(replies[3]["result"]["isError"])                  # no server container: name one
+        with open(os.path.join(ct.STORE, "agent.log")) as f:
+            self.assertEqual(json.loads(f.readline())["tool"], "ct_start")
 
 
 @unittest.skipIf(ct.WINDOWS, "desktop containers need a Linux host or WSL")
@@ -228,6 +463,44 @@ class RealEngines(unittest.TestCase):
                 quiet(ct.stop, name, 1)
                 quiet(ct.rm, name)
                 self.assertNotIn(name, [c["name"] for c in ct.containers()])
+
+    def test_phase3(self):
+        """Limits in the cgroup and changed live, top, isolated network by name, internet off, sandbox reset."""
+        ct.STORE = tempfile.mkdtemp()
+        sh = lambda n, c: quiet(ct.exec_, n, ["sh", "-c", c])
+        for engine in ("podman", "docker"):
+            if not shutil.which(engine):
+                continue
+            with self.subTest(engine=engine):
+                ct.NODE = ct.Node(engine)
+                a, b, s = f"p3a-{engine}", f"p3b-{engine}", f"p3s-{engine}"
+                for n in (a, b, s):
+                    subprocess.run([engine, "rm", "-f", "tct-" + n], capture_output=True)
+                subprocess.run([engine, "network", "rm", "-f", f"tct-net-p3-{engine}"], capture_output=True)
+                net = f"p3-{engine}"
+                ct.net_create(net)
+                quiet(ct.create, a, image="alpine:3.20", cpus=0.5, memory=0.25, nets=[net])
+                quiet(ct.create, b, image="alpine:3.20", nets=[net], internet=False)
+                quiet(ct.create, s, image="alpine:3.20", sandbox=True)
+                for n in (a, b, s):
+                    quiet(ct.start, n)
+                self.assertEqual(sh(a, "cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max")["stdout"].split(),
+                                 ["50000", "100000", str(2 ** 28)])
+                ct.resources(a, cpus=1, memory=0.5)
+                self.assertEqual(sh(a, "cat /sys/fs/cgroup/memory.max")["stdout"].strip(), str(2 ** 29))
+                self.assertEqual({r["name"] for r in ct.top()["containers"]} >= {a, b, s}, True)
+                self.assertEqual(sh(b, f"ping -c1 -W3 {a} >/dev/null && echo ok")["stdout"].strip(), "ok")
+                self.assertNotEqual(sh(b, "wget -q -T3 -O /dev/null http://1.1.1.1/")["exit"], 0)  # offline
+                self.assertEqual(sh(s, "id -u; touch /etc/x 2>/dev/null || echo ro; echo hi > /data/f; "
+                                       "touch /tmp/mark; ls /tmp")["stdout"].split()[:2], [str(os.getuid()), "ro"])
+                quiet(ct.stop, s, 1)
+                self.assertTrue(quiet(ct.start, s)["fresh"])
+                self.assertEqual(sh(s, "ls /tmp /data")["stdout"].split(), ["/data:", "/tmp:"])  # all gone
+                for n in (a, b, s):
+                    quiet(ct.rm, n)
+                ct.net_rm(net)
+                left = subprocess.run([engine, "volume", "ls", "-q"], capture_output=True, text=True).stdout.split()
+                self.assertFalse([v for v in left if v.startswith("tct-p3")])
 
 
 if __name__ == "__main__":
