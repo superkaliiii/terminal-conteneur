@@ -639,20 +639,20 @@ class NodeRemote(NodeVM):
             raise RuntimeError(f"ssh {target}: {r.stderr.strip() or 'connection failed'}")
         return {"exit": r.returncode, "stdout": r.stdout, "stderr": r.stderr}
 
-    def copy(self, direction, src, dest):
+    def copy(self, direction, src, dest, timeout=3600):
         try:
             if self.remote["url"].startswith("https://"):
                 if direction == "push":
                     with open(src, "rb") as f:
                         agent_request(self.remote, "POST", "/push?" + urllib.parse.urlencode({"path": dest}), f,
-                                      timeout=3600, length=os.fstat(f.fileno()).st_size)
+                                      timeout=timeout, length=os.fstat(f.fileno()).st_size)
                 else:
                     agent_request(self.remote, "GET", "/pull?" + urllib.parse.urlencode({"path": src}),
-                                  timeout=3600, out=dest)
+                                  timeout=timeout, out=dest)
                 return
             cmd, target = self._ssh(scp=True)
             pair = [src, f"{target}:{dest}"] if direction == "push" else [f"{target}:{src}", dest]
-            r = subprocess.run([*cmd, "--", *pair], capture_output=True, text=True, timeout=3600,
+            r = subprocess.run([*cmd, "--", *pair], capture_output=True, text=True, timeout=timeout,
                                stdin=subprocess.DEVNULL, **NO_WINDOW)
             if r.returncode:
                 raise RuntimeError(r.stderr.strip() or "scp failed")
@@ -3181,11 +3181,61 @@ def vm_module():
         return _VM_MODULE[key]
 
 
-def vm_call(args, timeout=60, **k):
+def vm_call(args, timeout=60, host=None, **k):
+    """terminal-vm here, or on another PC (host)."""
+    if host:
+        return host_vm_call(host, args, timeout, **k)
     cli = vm_cli()
     if not cli:
         raise RuntimeError("terminal-vm not found: put it on the PATH, or set TERMINAL_VM")
     return cli_call(cli, args, timeout, **k)
+
+
+# TERMINAL_VM there as here ("python3 /path/terminal_vm.py": no spaces), else the login PATH, else install.sh's
+# ~/.local/bin (a Mac's zsh profile is not read by sh -l)
+VM_FIND = ('c=${TERMINAL_VM:-}; [ -n "$c" ] || c=$(command -v terminal-vm) || c="$HOME/.local/bin/terminal-vm"; '
+           'set -f; ')
+VM_ON_PC = ["sh", "-lc", VM_FIND + 'exec $c "$@"', "terminal-vm"]
+
+
+def vm_missing(r):
+    """Whether a reply is terminal-vm itself not found there (not a 127 of a guest's command)."""
+    return r.get("exit") == 127 and "terminal-vm" in (r.get("stderr") or "") and "not found" in (r.get("stderr") or "")
+
+
+def host_vm_call(host, args, timeout=60, lines=False):
+    """terminal-vm on another PC, run there by its agent or over SSH: its JSON reply; RuntimeError as vm_call."""
+    try:
+        n = node_obj(host, timeout)
+        if not isinstance(n, NodeRemote):
+            raise RuntimeError(f"{host} is not another PC (terminal-ct host ls)")
+        r = n._exec([*VM_ON_PC, *args], timeout)
+    except SystemExit as e:
+        raise RuntimeError(str(e)) from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{host}: terminal-vm {args[0]} timed out") from None
+    out = (r.get("stdout") or "").strip()
+    if r.get("exit"):
+        msg = ((r.get("stderr") or "") or out).strip()
+        with contextlib.suppress(ValueError, AttributeError, IndexError, TypeError):
+            msg = json.loads(msg.splitlines()[-1])["error"]
+        if vm_missing(r):
+            msg = "terminal-vm not found there (install it on that PC: install.sh, or TERMINAL_VM)"
+        raise RuntimeError(f"{host}: {msg or f'terminal-vm {args[0]} failed'}")
+    if lines:
+        return [json.loads(x) for x in out.splitlines() if x.strip()]
+    try:
+        return json.loads(out) if out else {}
+    except ValueError:  # progress lines first: the reply is the last one
+        return json.loads(out.splitlines()[-1])
+
+
+def vm_where(name):
+    """A dashboard VM name: "VM" (here) or "VM@PC" (another PC) -> (VM, PC or None); ValueError otherwise."""
+    vm, at, host = (name or "").partition("@")
+    if not _VM_NAME.fullmatch(vm) or at and not (host and is_host(host)):
+        raise ValueError(f"invalid VM name {name!r}")
+    return vm, host or None
 
 
 _VM_CACHE = {}  # project: (time, reply): several tabs, one terminal-vm call every few seconds
@@ -3200,32 +3250,97 @@ def vm_state(project=None, max_age=3):
     return out
 
 
-def _vm_state(project=None):
-    """terminal-vm's VMs (ls), with the real use of the running ones (top). terminal-vm runs on the daemon's side
-    (both in WSL, or both on the host): screenshots go through a file path of that side."""
-    if not vm_cli():
-        return {"vms": [], "note": "terminal-vm not found (PATH or TERMINAL_VM)"}
-    try:
-        vms = [v for v in vm_call(["ls"]) if under(v.get("project") or DEFAULT_PROJECT, project)]
-        if any(v.get("status") not in (None, "stopped") for v in vms):
-            use = {v["name"]: v for v in vm_call(["top"]).get("vms", [])}
+def _vm_one(host, project):
+    """(VMs, events) of terminal-vm here (None) or on another PC; another PC's VMs named VM@PC."""
+    t = {"timeout": LOOK_TIMEOUT} if host else {}  # another PC: a hung one costs a listing's wait, not minutes
+    vms = vm_call(["ls"], host=host, **t)
+    if not isinstance(vms, list) or not all(isinstance(v, dict) and isinstance(v.get("name"), str) for v in vms):
+        raise ValueError("unreadable VM list")
+    vms = [v for v in vms if under(v.get("project") or DEFAULT_PROJECT, project)]
+    if any(v.get("status") not in (None, "stopped") for v in vms):
+        with contextlib.suppress(RuntimeError, ValueError, AttributeError, subprocess.TimeoutExpired):
+            use = {v["name"]: v for v in vm_call(["top"], host=host, **t).get("vms", [])}
             for v in vms:
                 v.update({k: use.get(v["name"], {}).get(k) for k in ("cpu_percent", "host_memory_gb")})
-        evs = []
-        with contextlib.suppress(RuntimeError, ValueError):  # an older terminal-vm has no events
-            evs = vm_call(["events", "-n", "8"], lines=True)
-        return {"vms": vms, "events": [e for e in evs if not e.get("vm") or e["vm"] in {v["name"] for v in vms}]}
-    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
-        return {"vms": [], "note": f"terminal-vm: {e}"}
+    evs = []
+    with contextlib.suppress(RuntimeError, ValueError, subprocess.TimeoutExpired):  # an older terminal-vm: none
+        evs = [e for e in vm_call(["events", "-n", "8"], host=host, lines=True, **t) if isinstance(e, dict)]
+    mine = {v["name"] for v in vms}
+    evs = [e for e in evs if not e.get("vm") or e["vm"] in mine]
+    if host:  # one name per VM across PCs; the dashboard's actions send it back (vm_where splits it)
+        for v in vms:
+            v.update(name=f"{v['name']}@{host}", host=host)
+        for e in evs:
+            if e.get("vm"):
+                e["vm"] = f"{e['vm']}@{host}"
+            else:
+                e["detail"] = f"{e.get('detail') or ''} (on {host})".strip()
+            e["host"] = host
+    return vms, evs
+
+
+_VM_STATE_LOCK = threading.Lock()
+
+
+def _vm_state(project=None):
+    """terminal-vm's VMs (ls) here and on each other PC that answers (at once), with the real use of the running
+    ones (top). One PC failing in any way is a note, never an empty panel."""
+    with _VM_STATE_LOCK:  # several tabs: one round at a time, the others take its answer from the cache
+        hit = _VM_CACHE.get(project)
+        if hit and time.time() - hit[0] < 1:
+            return hit[1]
+        hosts = [n for n, i in _nodes()["nodes"].items() if i.get("kind") == "host"]
+        pcs = sorted(n for n, ok in nodes_up().items() if ok and n in hosts) if hosts else []
+        got, notes = {}, []
+
+        def one(host):
+            try:
+                got[host] = _vm_one(host, project)
+            except Exception as e:  # another PC is pinned, not trusted to answer well
+                got[host] = f"terminal-vm{' on ' + host if host else ''}: {e}"
+        threads = [threading.Thread(target=one, args=(h,), daemon=True) for h in ([None] if vm_cli() else []) + pcs]
+        for t in threads:
+            t.start()
+        end = time.monotonic() + LOOK_TIMEOUT + 35  # a hung PC is left out of this round
+        for t in threads:
+            t.join(max(0, end - time.monotonic()))
+        out = {"vms": [], "events": []}
+        for host in ([None] if vm_cli() else []) + pcs:
+            r = got.get(host, f"terminal-vm on {host}: no answer in time")
+            if isinstance(r, str):
+                notes.append(r)
+            else:
+                out["vms"] += r[0]
+                out["events"] += r[1]
+        if not vm_cli():
+            notes.insert(0, "terminal-vm not found (PATH or TERMINAL_VM)")
+        if notes:
+            out["note"] = "; ".join(notes)
+        return out
 
 
 def vm_screenshot(name):
-    if not _VM_NAME.fullmatch(name or ""):
-        raise ValueError(f"invalid VM name {name!r}")
+    vm, host = vm_where(name)
     os.makedirs(os.path.join(STORE, "web"), mode=0o700, exist_ok=True)
-    path = os.path.join(STORE, "web", f"vm-{name}.{threading.get_ident()}.png")  # one per request: two tabs at once
+    path = os.path.join(STORE, "web", f"vm-{vm}.{threading.get_ident()}.png")  # one per request: two tabs at once
     try:
-        vm_call(["action", name, "screenshot", "--output", path], timeout=20)
+        if not host:
+            vm_call(["action", vm, "screenshot", "--output", path], timeout=20)
+        else:  # written in a private folder there, then brought here
+            n, tmp = node_obj(host, 30), f"/tmp/tct-{secrets.token_hex(6)}"
+            try:
+                try:
+                    r = n._exec(["sh", "-lc", f"mkdir -m 700 {tmp} && " + VM_FIND + 'exec $c "$@"', "terminal-vm",
+                                 "action", vm, "screenshot", "--output", f"{tmp}/s.png"], 30)
+                except (RuntimeError, subprocess.TimeoutExpired) as e:
+                    raise RuntimeError(f"{host}: {e}") from None
+                if r.get("exit"):
+                    raise RuntimeError(f"{host}: " + ((r.get("stderr") or r.get("stdout") or "").strip()[-300:]
+                                                      or "screenshot failed"))
+                n.copy("pull", f"{tmp}/s.png", path, timeout=30)
+            finally:
+                with contextlib.suppress(SystemExit):
+                    n.sh(f"rm -rf {tmp}", timeout=30)
         with open(path, "rb") as f:
             return f.read()
     finally:
@@ -3300,9 +3415,10 @@ def _web_api(method, path, q, body=None):
             raise ValueError("a JSON object")
         op, name = body.get("op"), body.get("name") or ""
         if body.get("kind") == "vm":
-            if op not in ("start", "stop", "force_stop") or not _VM_NAME.fullmatch(name):
+            if op not in ("start", "stop", "force_stop"):
                 raise ValueError("VMs: start, stop or force_stop, and a VM name")
-            out = vm_call(["stop", name, "--force"] if op == "force_stop" else [op, name], timeout=300)
+            vm, host = vm_where(name)
+            out = vm_call(["stop", vm, "--force"] if op == "force_stop" else [op, vm], timeout=300, host=host)
             _VM_CACHE.clear()  # the next refresh shows the new state at once (else: a second click on start)
             return "application/json", out
         if op in ("start", "stop", "restart", "rm"):
@@ -3374,8 +3490,11 @@ def peer_cli(env, exe):
 def cli_call(cli, args, timeout=60, lines=False, raw=False):
     """Run a JSON command line: its reply (the last line when progress lines come first; every line with lines;
     the text with raw). A failure raises RuntimeError with the tool's own message."""
-    r = subprocess.run(cli + args, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
-                       **NO_WINDOW)
+    try:
+        r = subprocess.run(cli + args, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
+                           errors="replace", **NO_WINDOW)
+    except OSError as e:  # TERMINAL_VM naming a program that is not there
+        raise RuntimeError(f"{cli[0]}: {e.strerror or e}") from None
     if r.returncode:
         err = (r.stderr or r.stdout).strip()
         with contextlib.suppress(ValueError, AttributeError, IndexError):
@@ -5334,6 +5453,8 @@ def main(argv=None):
     p.add_argument("--node", "--host", help="run in this node: a Linux VM of terminal-vm with Docker (node add), or "
                                             "another PC (host add)")
     sub = p.add_subparsers(dest="cmd", required=True)
+    vmp = sub.add_parser("vm", help="terminal-vm on another PC: terminal-ct --host PC vm ARGS")
+    vmp.add_argument("vm_args", nargs=argparse.REMAINDER)
     hs = sub.add_parser("host", help="other PCs as nodes (their agent, or SSH)")
     hs.add_argument("host_cmd", choices=["add", "ls", "rm"]); hs.add_argument("host_name", nargs="?")
     hs.add_argument("url", nargs="?"); hs.add_argument("--fingerprint"); hs.add_argument("--force", action="store_true")
@@ -5413,6 +5534,26 @@ def main(argv=None):
         NODE = node_named(o.node)
     elif o.cmd != "node" and isinstance(getattr(o, "name", None), str) and o.name in _nodes()["placement"]:
         NODE = node_obj(_nodes()["placement"][o.name])  # that container lives in a node
+    if o.cmd == "vm":
+        if not isinstance(NODE, NodeRemote):
+            raise SystemExit("vm ARGS runs terminal-vm on another PC: terminal-ct --host PC vm ARGS (on this PC, run "
+                             "terminal-vm itself)")
+        if not o.vm_args:
+            raise SystemExit("terminal-ct --host PC vm ARGS (e.g. vm ls)")
+        try:
+            r = NODE._exec([*VM_ON_PC, *o.vm_args, *(["--", *cmd_args] if cmd_args else [])], 3600)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            raise SystemExit(f"host {NODE.name}: {e}") from None
+        for stream, text in ((sys.stdout, r.get("stdout")), (sys.stderr, r.get("stderr"))):
+            stream.flush()  # its bytes as they came: a Windows console code page cannot refuse them
+            (stream.buffer.write(text.encode("utf-8")) if hasattr(stream, "buffer") else stream.write(text)) \
+                if text else None
+            stream.flush()
+        if vm_missing(r):
+            print(f"terminal-vm not found on {NODE.name} (install it there: install.sh, or TERMINAL_VM)",
+                  file=sys.stderr)
+        code = r.get("exit") or 0
+        sys.exit(128 - code if code < 0 else code)  # killed by a signal there: 128 + its number, as a shell says
     if o.cmd == "host":
         if o.host_cmd != "ls" and not o.host_name or o.host_cmd == "add" and not o.url:
             raise SystemExit({"add": "host add NAME https://IP:PORT --fingerprint SHA256 (token: typed, piped, or "

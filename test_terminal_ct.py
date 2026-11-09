@@ -787,7 +787,7 @@ class Phase8(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "f1c7258c1765ba1682b5e2fb241d7c55b97c6768fb0e10079ae8bec43e333889"
+    SHARED_SHA = "107763a31819e193f9c19d1199f58350ea2a9bad0c80669135a846d232fbbcb2"
 
     @staticmethod
     def block(path):
@@ -1665,6 +1665,7 @@ class Hosts(unittest.TestCase):
         self.local = ct.NODE = FakeNode("podman")
         ct.STORE = tempfile.mkdtemp()
         self.engines, self.down, self.uname, self.execs = {}, set(), {}, []
+        self.pc_vms, self.pc_files, self.vm_runs = {}, {}, []
 
         def _exec(node, argv, timeout):
             self.execs.append((node.name, argv))
@@ -1674,6 +1675,34 @@ class Hosts(unittest.TestCase):
                 return {"exit": 0, "stdout": self.uname.get(node.name, "Linux") + "\n", "stderr": ""}
             if argv == ["true"]:
                 return {"exit": 0, "stdout": "", "stderr": ""}
+            if argv[:2] == ["sh", "-lc"] and argv[3] == "terminal-vm" and ct.VM_FIND in argv[2]:  # terminal-vm there
+                args = argv[4:]
+                self.vm_runs.append((node.name, args))
+                vms = self.pc_vms.get(node.name)
+                if vms is None:
+                    return {"exit": 127, "stdout": "", "stderr": "sh: terminal-vm: not found"}
+                if args == ["ls"]:
+                    if vms == "garbled":
+                        return {"exit": 0, "stdout": json.dumps({"error": "half an answer"})}
+                    return {"exit": 0, "stdout": json.dumps([{"name": n, "status": s} for n, s in vms.items()])}
+                if args == ["top"]:
+                    return {"exit": 0, "stdout": json.dumps({"vms": [{"name": n, "cpu_percent": 3.0,
+                                                                      "host_memory_gb": 1.5} for n in vms]})}
+                if args[:2] == ["events", "-n"]:
+                    return {"exit": 0, "stdout": json.dumps({"event": "started", "vm": "deb"}) + "\n"}
+                if args[0] in ("start", "stop"):
+                    if args[1] not in vms:
+                        return {"exit": 1, "stdout": "", "stderr": json.dumps({"error": f"no VM named {args[1]}"})}
+                    vms[args[1]] = "running" if args[0] == "start" else "stopped"
+                    return {"exit": 0, "stdout": json.dumps({args[0]: args[1]})}
+                if args[:3] == ["action", "deb", "screenshot"]:
+                    self.pc_files[args[-1]] = b"PNG of deb"
+                    return {"exit": 0, "stdout": "{}"}
+                if args[:2] == ["action", "win"]:
+                    return {"exit": 1, "stdout": "", "stderr": json.dumps({"error": "win is not running"})}
+                if args[:2] == ["exec", "deb"] and "missing" in args:              # the guest's own 127
+                    return {"exit": 127, "stdout": "", "stderr": "sh: missing: not found"}
+                return {"exit": 0, "stdout": "plain text\n", "stderr": ""}
             if argv[0] == "df":
                 if argv[-1] != "/" and node.name in getattr(self, "mac", ()):  # Docker Desktop: store in its VM
                     return {"exit": 1, "stdout": "Filesystem 1K-blocks Used Available\n", "stderr": "no such file"}
@@ -1685,10 +1714,16 @@ class Hosts(unittest.TestCase):
                 return {"exit": r.returncode, "stdout": r.stdout, "stderr": "no such object" if r.returncode else ""}
             return {"exit": 0, "stdout": "", "stderr": ""}
         alive = lambda name: name not in self.down
+
+        def copy(node, direction, src, dest, timeout=3600):
+            with open(dest, "wb") as f:
+                f.write(self.pc_files.pop(src))
         self.patches = [unittest.mock.patch.object(ct.NodeRemote, "_exec", _exec),
+                        unittest.mock.patch.object(ct.NodeRemote, "copy", copy),
                         unittest.mock.patch.object(ct, "host_alive", alive),
                         unittest.mock.patch.object(ct, "UP_MAX_AGE", -1),
-                        unittest.mock.patch.object(ct, "vm_call", lambda *a, **k: [])]
+                        unittest.mock.patch.object(ct, "vm_call", lambda args, timeout=60, host=None, **k:
+                                                   ct.host_vm_call(host, args, timeout, **k) if host else [])]
         for p in self.patches:
             p.start()
 
@@ -1879,6 +1914,53 @@ class Hosts(unittest.TestCase):
         self.cli("host", "rm", "pc1", "--force")
         self.assertEqual(ct.load_stack("ag").get("approved_hosts"), [])
         self.assertFalse(os.path.exists(os.path.join(ct.STORE, "quota-pc1.json")))
+
+    def test_vms_of_other_pcs(self):
+        self.add("pc1"); self.add("pc2", "https://192.168.1.21:7173")
+        self.pc_vms["pc1"] = {"deb": "running", "win": "stopped"}             # pc2: no terminal-vm
+        with unittest.mock.patch.object(ct, "vm_cli", lambda: None):
+            s = ct._vm_state()
+            self.assertEqual([(v["name"], v["host"], v["status"]) for v in s["vms"]],
+                             [("deb@pc1", "pc1", "running"), ("win@pc1", "pc1", "stopped")])
+            self.assertEqual(s["vms"][0]["cpu_percent"], 3.0)
+            self.assertEqual(s["events"], [{"event": "started", "vm": "deb@pc1", "host": "pc1"}])
+            self.assertIn("pc2: terminal-vm not found there", s["note"])
+            api = lambda m, path, q=None, body=None: ct.web_api(m, path, q or {}, body)
+            self.assertEqual(api("GET", "/api/shot", {"kind": "vm", "name": "deb@pc1"}), ("image/png", b"PNG of deb"))
+            self.assertEqual(self.pc_files, {})                                # nothing left there
+            api("POST", "/api/do", body={"kind": "vm", "op": "start", "name": "win@pc1"})
+            self.assertEqual(self.pc_vms["pc1"]["win"], "running")
+            for bad in ("win@nope", "../x@pc1", "a@b@pc1", ""):
+                with self.assertRaises(ValueError, msg=bad):
+                    api("POST", "/api/do", body={"kind": "vm", "op": "stop", "name": bad})
+            with self.assertRaisesRegex(RuntimeError, "pc1: no VM named gone"):
+                api("POST", "/api/do", body={"kind": "vm", "op": "start", "name": "gone@pc1"})
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as e:
+            ct.main(["--host", "pc1", "vm", "exec", "deb", "--", "uname", "-a"])  # passed on as it is
+        ct.NODE = self.local
+        self.assertEqual((e.exception.code, out.getvalue()), (0, "plain text\n"))
+        self.assertEqual(self.vm_runs[-1], ("pc1", ["exec", "deb", "--", "uname", "-a"]))
+        with self.assertRaisesRegex(SystemExit, "another PC"):
+            self.cli("vm", "ls")
+        with unittest.mock.patch.object(ct, "vm_cli", lambda: None):
+            with self.assertRaisesRegex(RuntimeError, "not running"):          # failed there: nothing left
+                ct.web_api("GET", "/api/shot", {"kind": "vm", "name": "win@pc1"}, None)
+            self.assertEqual(os.listdir(os.path.join(ct.STORE, "web")), [])
+            with self.assertRaises(ValueError):
+                ct.vm_where("deb@")
+            self.pc_vms["pc2"] = "garbled"                                     # one PC answering badly
+            ct._VM_CACHE.clear()
+            s = ct._vm_state()
+            self.assertEqual(len(s["vms"]), 2)                                 # the others still shown
+            self.assertIn("pc2: unreadable VM list", s["note"])
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit) as e:
+            ct.main(["--host", "pc1", "vm", "exec", "deb", "--", "missing"])
+        ct.NODE = self.local
+        self.assertEqual(e.exception.code, 127)
+        self.assertNotIn("terminal-vm not found", err.getvalue())            # the guest's 127, not ours
+        with self.assertRaisesRegex(RuntimeError, "nonexistent"):              # TERMINAL_VM naming nothing
+            ct.cli_call([os.path.join(ct.STORE, "nonexistent", "terminal-vm")], ["ls"])
 
     def test_quota_of_a_vm_node_is_its_size(self):
         d = ct._nodes(); d["nodes"]["vm1"] = {"image": "alpine"}; ct._save_nodes(d)
