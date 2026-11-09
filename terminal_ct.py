@@ -23,6 +23,9 @@ labels; containers without them are never touched.
                       user); with --project, only that project, and project_status / notes_write to resume
   create ... --project P  |  project ls | project show [P] | project notes [P [TEXT]] | project move NAME P
   resume [--stay]  |  autostart [on|off]     start again what was running before a restart; at each logon
+  snapshot NAME save|load|rm TAG | snapshot NAME ls     file system + /data (load: stopped container)
+  clone SRC NEW [--project P]                          NEW from SRC as it is (files and a copy of /data)
+  push NAME LOCAL PATH | pull NAME PATH LOCAL          copy files in or out
   view NAME [--read-only]   terminal viewer: Kitty graphics or Sixel (Windows Terminal, foot); Ctrl+] exits
   show NAME                 native window (TigerVNC viewer, through the desktop's unix socket)
   image ls | image pull REF | image build NAME DIR | image rm NAME
@@ -31,7 +34,7 @@ Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if inst
 import argparse, base64, collections, contextlib, io, json, os, queue, re, shlex, shutil, socket, struct, \
     subprocess, sys, threading, time, zlib
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 WINDOWS = os.name == "nt"
 if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
@@ -46,7 +49,7 @@ SHELLS = {"sh", "bash", "ash", "zsh", "/bin/sh", "/bin/bash", "/bin/ash", "/bin/
 
 
 def check_name(name):
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,47}", name or ""):
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9_.-]{0,46}[a-z0-9])?", name or ""):
         raise SystemExit(f"invalid name: {name!r} (lowercase letters, digits, _ . -)")
     return name
 
@@ -108,6 +111,15 @@ class Node:
     def json(self, args):
         out = self.run(args).stdout.strip()
         return json.loads(out) if out else []
+
+    def pipe(self, args, stdin=None, stdout=None):
+        """An engine call with binary files as stdin/stdout (tar streams)."""
+        with open(stdin, "rb") if stdin else contextlib.nullcontext() as i, \
+                open(stdout, "wb") if stdout else contextlib.nullcontext() as o:
+            r = subprocess.run([self.engine, *args], stdin=i or subprocess.DEVNULL, stdout=o or subprocess.DEVNULL,
+                               stderr=subprocess.PIPE)
+        if r.returncode:
+            raise SystemExit(r.stderr.decode("utf-8", "replace").strip() or f"{self.engine} {args[0]} failed")
 
 
 NODE = None
@@ -312,7 +324,9 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
         # LANG: without UTF-8, xterm wrote é as Latin-1
         extra += ["-e", "LANG=C.UTF-8", "-e", f"TCT_WIDTH={spec['width']}", "-e", f"TCT_HEIGHT={spec['height']}",
                   "-v", f"{os.path.join(ct_dir(name), 'run')}:/run/tct"]
-        cmd = [DESKTOP_ENTRY]
+        # X locks left in a file system committed while the desktop ran (snapshot, clone): their PID is alive again
+        # in the new container (same small numbers), and Xvnc refused to start
+        cmd = ["sh", "-c", f"rm -f /tmp/.X0-lock /tmp/.X11-unix/X0; exec {DESKTOP_ENTRY}"]
     else:
         entry, default = image_cmd(image)
         # a bare shell as the main process exits at once without a terminal: keep such containers alive instead
@@ -393,7 +407,7 @@ def remake(name, info, keep=False, **change):
         raise SystemExit(f"stop {name} first (terminal-ct stop {name})")
     lab = labels_of(info)
     raw = lab.get(f"{LABEL}.spec")
-    keep = keep or needs_upgrade(info)
+    keep = (keep or needs_upgrade(info)) and "image" not in change  # a given image (snapshot load) replaces it
     spec = json.loads(raw) if raw else legacy_spec(info)
     project = change.pop("project", None) or lab.get(f"{LABEL}.project") or DEFAULT_PROJECT
     internet = change.pop("internet", online(info))
@@ -526,6 +540,8 @@ def rm(name):
     node().run(["rm", "-f", PREFIX + name + "-OLD"], check=False)  # it would keep the volume in use
     node().run(["volume", "rm", f"{PREFIX}{name}-data"], check=False)  # absent if never created
     node().run(["image", "rm", f"{KEEP}{name}:latest"], check=False)  # its committed file system, if any
+    for tag in snapshots(name):
+        node().run(["image", "rm", f"{SNAP}{name}:{tag}"], check=False)
     shutil.rmtree(os.path.join(STORE, name), ignore_errors=True)
     print(json.dumps({"removed": name}))
 
@@ -596,7 +612,8 @@ def disk_bytes(infos):
         if repo.split("/")[-1] == "tct-desktop":
             total += parse_size(size)
     # a kept image counts only the layers its commits added (its Size includes the base image's, already counted)
-    total += sum(keep_bytes(labels_of(c).get(f"{LABEL}.name")) for c in infos)
+    total += sum(keep_bytes(labels_of(c).get(f"{LABEL}.name")) + sum(snapshots(labels_of(c).get(f"{LABEL}.name")).values())
+                 for c in infos)
     return total
 
 
@@ -929,7 +946,9 @@ def autostart(on=None):
     with open(unit, "w") as f:
         # no After=default.target: WantedBy already orders it, and both made an ordering cycle
         f.write(f"[Unit]\nDescription=terminal-ct: start again the containers that were running\n\n"
-                f"[Service]\nType=oneshot\n" + "".join(f"Environment={shlex.quote(f'{k}={v}')}\n" for k, v in env.items())
+                # resume exits at once: without these, systemd would kill what it started (same cgroup: podman's
+                # conmon) as the unit ends
+                f"[Service]\nType=oneshot\nRemainAfterExit=yes\nKillMode=process\n" +"".join(f"Environment={shlex.quote(f'{k}={v}')}\n" for k, v in env.items())
                 + f"ExecStart={shlex.join(me + ['resume'])}\n\n[Install]\nWantedBy=default.target\n")
     r = subprocess.run(["systemctl", "--user", "enable", f"{AUTOSTART}.service"], capture_output=True, text=True)
     if r.returncode:
@@ -972,9 +991,12 @@ def project_status(project=None, log_lines=30):
     with contextlib.suppress(OSError):
         with open(os.path.join(d, AGENT_LOG), encoding="utf-8") as f:
             log = [json.loads(l) for l in collections.deque(f, log_lines) if l.strip()]
+    mine = [c for c in containers() if under(c["project"], project)]
+    own = {c["name"] for c in mine}
     return {"project": project,
-            "containers": [dict(c, want=wanted(c["name"])) for c in containers() if under(c["project"], project)],
-            "networks": {k: v for k, v in networks().items() if under(v["project"], project)},
+            "containers": [dict(c, want=wanted(c["name"])) for c in mine],
+            "networks": {k: dict(v, members=[m for m in v["members"] if m in own])
+                         for k, v in networks().items() if under(v["project"], project)},
             "sub_projects": sorted(p["project"] for p in projects() if p["project"].startswith(project + "/")),
             "notes": notes, "recent_actions": log}
 
@@ -992,6 +1014,200 @@ def project_move(name, project):
     # a sandbox starts from its image anyway: committing would make whatever is in it now its new image
     remake(name, info, keep=labels_of(info).get(f"{LABEL}.sandbox") != "1", project=check_project(project))
     return {"name": name, "project": project}
+
+
+# ---------- snapshots, clones, files ----------
+# A snapshot is the container's file system committed to an image (tct-snap-NAME:TAG) plus its /data volume as a
+# tar file (STORE/NAME/snaps/TAG.tar): load brings both back. A clone starts from the same two. Sandboxes have
+# neither: they start from their image at every start anyway.
+SNAP = "tct-snap-"
+
+
+def _data_tar(name, image, path, mode="save"):
+    """NAME's /data volume through a throwaway container of `image` (as root, offline, the volume its only mount).
+    save: /data to a tar file. stage: unpack a tar file into /data/.tct-restore, leaving /data as it is (a failure
+    loses nothing). swap: replace /data's content by the staged one. clear: drop a staged copy."""
+    base = ["run", "--rm", "-i", "--network", "none", "--user", "0", "-v", f"{PREFIX}{name}-data:/data",
+            "--entrypoint", "sh", image, "-c"]
+    staged = "/data/.tct-restore"
+    script = {"save": "tar -C /data -cf - .",
+              "stage": f"rm -rf {staged} && mkdir {staged} && tar -C {staged} -xf -",
+              "swap": f"cd /data && for f in * .[!.]* ..?*; do [ -e \"$f\" ] && [ \"$f\" != .tct-restore ] && rm -rf \"$f\"; done; "
+                      f"cd {staged} && for f in * .[!.]* ..?*; do [ -e \"$f\" ] && mv \"$f\" /data/; done; cd / && rmdir {staged}",
+              "clear": f"rm -rf {staged}"}[mode]
+    node().pipe([*base, script], stdin=path if mode == "stage" else None, stdout=path if mode == "save" else None)
+
+
+def _snap_dir(name):
+    d = os.path.join(ct_dir(name), "snaps")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _check_tag(tag):
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9_.-]{0,62}[a-z0-9])?", tag or ""):
+        raise SystemExit(f"invalid tag: {tag!r} (lowercase letters, digits, _ . -; ends with a letter or digit)")
+    return tag
+
+
+def _snap_entries(name):
+    """{tag: {"bytes": what the commit added, "image": the image that wrote its /data tar}}."""
+    try:
+        with open(os.path.join(STORE, name, "snaps", "index.json")) as f:
+            idx = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {t: v if isinstance(v, dict) else {"bytes": v} for t, v in idx.items()}
+
+
+def snapshots(name):
+    """{tag: bytes} of NAME's snapshots (what each commit added, plus its /data tar)."""
+    d = os.path.join(STORE, name, "snaps")
+    return {t: e.get("bytes", 0) + (os.path.getsize(os.path.join(d, t + ".tar")) if os.path.isfile(os.path.join(d, t + ".tar")) else 0)
+            for t, e in _snap_entries(name).items()}
+
+
+def _snap_index(name, tag, entry=None):
+    """Add (entry) or drop (None) one snapshot, under the lock: two saves at once must not lose one."""
+    with quota_lock():
+        idx = _snap_entries(name)
+        if entry is None:
+            idx.pop(tag, None)
+        else:
+            idx[tag] = entry
+        with open(os.path.join(_snap_dir(name), "index.json"), "w") as f:
+            json.dump(idx, f)
+
+
+@contextlib.contextmanager
+def paused(info):
+    """A running container paused: its file system and /data are taken at the same instant."""
+    on = (info.get("State") or {}).get("Status") == "running"
+    if on:
+        node().run(["pause", info["Name"].lstrip("/")])
+    try:
+        yield
+    finally:
+        if on:
+            node().run(["unpause", info["Name"].lstrip("/")], check=False)
+
+
+def _layer(info):
+    return (node().json(["inspect", "--type", "container", "--size", info["Name"].lstrip("/")]) or [{}])[0].get("SizeRw") or 0
+
+
+def snapshot(name, cmd, tag=None):
+    info = find(name)
+    if cmd == "ls":
+        return {"name": name, "snapshots": snapshots(name)}
+    _check_tag(tag)
+    if labels_of(info).get(f"{LABEL}.sandbox") == "1":
+        raise SystemExit(f"{name} is a sandbox: it starts from its image every time, a snapshot would never be used")
+    ref, tar = f"{SNAP}{name}:{tag}", os.path.join(_snap_dir(name), tag + ".tar")
+    if cmd == "save":
+        if tag in _snap_entries(name):
+            raise SystemExit(f"{name} already has a snapshot {tag!r} (snapshot {name} rm {tag} first)")
+        layer = _layer(info)
+        quota_check({"disk_gb": layer / 2 ** 30})  # its /data tar comes on top: measured once written
+        _snap_index(name, tag, {"bytes": layer, "image": info["Image"]})  # first: a crash leaves it for rm to clean
+        try:
+            with paused(info):
+                node().run(["commit", PREFIX + name, ref])
+                _data_tar(name, info["Image"], tar)
+        except BaseException:
+            node().run(["image", "rm", ref], check=False)
+            with contextlib.suppress(OSError):
+                os.remove(tar)
+            _snap_index(name, tag)
+            raise
+        return {"name": name, "snapshot": tag, "saved": True, "bytes": snapshots(name)[tag]}
+    entry = _snap_entries(name).get(tag)
+    if entry is None:
+        raise SystemExit(f"{name} has no snapshot {tag!r} (snapshot {name} ls)")
+    if cmd == "load":
+        if running(info):
+            raise SystemExit(f"stop {name} first (terminal-ct stop {name})")
+        helper = entry.get("image") or info["Image"]  # the image whose tar wrote it: it has tar
+        # /data unpacked aside first, the container remade (put back if that fails), then /data swapped: no step
+        # leaves the user with neither the old state nor the snapshot's
+        _data_tar(name, helper, tar, "stage")
+        try:
+            spec = json.loads(labels_of(info).get(f"{LABEL}.spec") or "{}")
+            remake(name, info, image=ref, prebuilt=bool(spec.get("desktop") or labels_of(info).get(f"{LABEL}.desktop") == "1"))
+        except BaseException:
+            _data_tar(name, helper, None, "clear")
+            raise
+        _data_tar(name, helper, None, "swap")
+        return {"name": name, "snapshot": tag, "loaded": True}
+    if cmd == "rm":
+        spec = json.loads(labels_of(info).get(f"{LABEL}.spec") or "{}")
+        if spec.get("image") == ref:
+            raise SystemExit(f"{name} runs from snapshot {tag!r}: load another one first, or keep it")
+        r = node().run(["image", "rm", ref], check=False)
+        if r.returncode and node().run(["image", "inspect", ref], check=False).returncode == 0:
+            raise SystemExit(f"snapshot {tag!r} of {name} is still used (a container made from it?): "
+                             f"{(r.stderr or r.stdout).strip()}")
+        with contextlib.suppress(OSError):
+            os.remove(tar)
+        _snap_index(name, tag)
+        return {"name": name, "snapshot": tag, "removed": True}
+    raise SystemExit("snapshot NAME save|load|rm TAG | snapshot NAME ls")
+
+
+def clone(src, new, created_by="user", project=None, internet=None):
+    """NEW from SRC as it is now: its file system (committed to tct-keep-NEW, removed with NEW) and a copy of its
+    /data, same ceiling and project. Networks are not copied; internet as SRC unless said otherwise."""
+    info = find(src)
+    check_name(new)
+    recover(new)
+    if node().run(["inspect", "--type", "container", PREFIX + new], check=False).returncode == 0:
+        raise SystemExit(f"{new!r} already exists")
+    if node().run(["volume", "inspect", f"{PREFIX}{new}-data"], check=False).returncode == 0:
+        raise SystemExit(f"a volume {PREFIX}{new}-data is left from an earlier {new}: keep it under another name, "
+                         f"or remove it: {node().engine} volume rm {PREFIX}{new}-data")
+    lab = labels_of(info)
+    spec = json.loads(lab.get(f"{LABEL}.spec") or "null") or legacy_spec(info)
+    sandbox = lab.get(f"{LABEL}.sandbox") == "1"
+    cpus, mem = allotted(info, None)
+    project = check_project(project or lab.get(f"{LABEL}.project") or DEFAULT_PROJECT)
+    tar = os.path.join(ct_dir(new), "clone.tar")
+    try:
+        if not sandbox:  # a sandbox clone is a new sandbox of the same image: nothing of SRC's to carry
+            ref, layer = f"{KEEP}{new}:latest", _layer(info)
+            quota_check({"disk_gb": layer / 2 ** 30})
+            with paused(info):
+                node().run(["commit", PREFIX + src, ref])
+                _data_tar(src, info["Image"], tar)
+            spec = dict(spec, image=ref, prebuilt=bool(spec.get("desktop")))
+            with open(os.path.join(ct_dir(new), "keep_bytes"), "w") as f:
+                f.write(str(int(layer)))
+        out = _make(new, spec, created_by, cpus or DEFAULT_CPUS, mem or DEFAULT_MEMORY,
+                    online(info) if internet is None else internet, (), project, fresh=True)
+        if not sandbox:
+            _data_tar(new, info["Image"], tar, "stage")
+            _data_tar(new, info["Image"], None, "swap")
+    except BaseException:  # no half-made clone: only what is NEW's (it did not exist, nor its volume)
+        node().run(["rm", "-f", PREFIX + new], check=False)
+        node().run(["volume", "rm", f"{PREFIX}{new}-data"], check=False)
+        node().run(["image", "rm", f"{KEEP}{new}:latest"], check=False)
+        shutil.rmtree(os.path.join(STORE, new), ignore_errors=True)
+        raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tar)
+    want(new, "stopped")
+    return dict(out, cloned_from=src)
+
+
+def transfer(name, direction, src, dest):
+    """push NAME LOCAL PATH | pull NAME PATH LOCAL: files in or out, running or stopped. A sandbox's /data is in
+    memory: reachable only while it runs, and gone at its stop."""
+    find(name)
+    args = [src, f"{PREFIX}{name}:{dest}"] if direction == "push" else [f"{PREFIX}{name}:{src}", dest]
+    # -a: the host file's owner kept (Docker made it root's, which a desktop's user could not change; Podman's
+    # default already)
+    node().run(["cp", *(["-a"] if direction == "push" else []), *args])
+    return {direction: name, "from": src, "to": dest}
 
 
 def image(cmd, ref=None, path=None):
@@ -1637,6 +1853,13 @@ AGENT_TOOLS = [
     ("ct_stop", "Stop a container.", _schema({**_NAME, "timeout": {"type": "integer"}}, ["name"])),
     ("ct_remove", "Delete a container and its /data volume (one the agent did not create needs approval).",
      _schema(_NAME, ["name"])),
+    ("ct_snapshot", "Snapshots of a container (file system and /data): save, load (stopped), rm or ls. Loading or "
+                    "removing one in a container the agent did not create needs the user's approval. Not for sandboxes.",
+     _schema({**_NAME, "action": {"type": "string", "enum": ["save", "load", "rm", "ls"]}, "tag": {"type": "string"}},
+             ["name", "action"])),
+    ("ct_clone", "A new container from one as it is now (file system and a copy of /data), in seconds. Cloning one "
+                 "of the user's containers needs their approval, and the clone starts offline.",
+     _schema({**_NAME, "new": {"type": "string"}, "project": {"type": "string"}}, ["name", "new"])),
     ("ct_resources", "Show, or change at once (even running), a container's CPUs and memory within the quota.",
      _schema({**_NAME, "cpus": _N, "memory_gb": _N}, ["name"])),
     ("ct_internet", "Show (without on) or change a stopped container's internet access; on needs the user's approval.",
@@ -1667,7 +1890,7 @@ INSTRUCTIONS = ("terminal-ct: containers with a desktop and a shell. Call projec
                 "project already has and what earlier sessions did and noted. Before you stop, record with "
                 "notes_write what you set up and what is left, so the next session can pick up from there.")
 AGENT_NAMES = {n for n, _, _ in AGENT_TOOLS}
-PROJECT_ARG_TOOLS = {"ct_create", "net_create", "project_status", "notes_write"}  # take `project` without one of their own
+PROJECT_ARG_TOOLS = {"ct_create", "ct_clone", "net_create", "project_status", "notes_write"}  # take `project` without one of their own
 AGENT_LOG = "agent.log"
 
 
@@ -1703,8 +1926,9 @@ def managed(info):
 def in_scope(info, project, name=None):
     """An MCP server with a project reaches nothing outside it, approval or not."""
     p = labels_of(info).get(f"{LABEL}.project") or DEFAULT_PROJECT
-    if not under(p, project):
-        raise SystemExit(f"{name or labels_of(info).get(LABEL + '.name')} is not in this agent's project {project!r}")
+    if not under(p, project):  # the same answer as for no container: other projects' names stay unseen
+        n = name or labels_of(info).get(LABEL + '.name')
+        raise SystemExit(f"no container named {n!r}; create it with: terminal-ct create {n}")
     return info
 
 
@@ -1723,7 +1947,11 @@ def agent_call(tool, a, approve, project=None):
     """project: the server's own (--project); then nothing outside it is visible or reachable."""
     name, net = a.get("name"), a.get("net")
     mine = lambda p: under(p, project)
-    nets = {k: v for k, v in networks().items() if mine(v["project"])} if tool.startswith("net_") or tool == "ct_create" else {}
+    nets = {}
+    if tool.startswith("net_") or tool == "ct_create":  # its networks, and only its containers on them
+        own = {c["name"] for c in containers() if mine(c["project"])}
+        nets = {k: dict(v, members=[m for m in v["members"] if m in own])
+                for k, v in networks().items() if mine(v["project"])}
     guard_ = lambda what, cli, destructive=False: guard(name, approve, what, cli, destructive, project)
     # the project a creation or a note goes to: the one named if it is this server's or below it, else the server's
     asked = a.get("project")
@@ -1768,7 +1996,7 @@ def agent_call(tool, a, approve, project=None):
             raise SystemExit(f"the network name {net!r} is not available: choose another")
         return net_create(net, "agent", where)
     if tool in ("net_remove", "net_attach") and check_name(net) not in nets and net in networks():
-        raise SystemExit(f"network {net!r} is not in this agent's project {project!r}")
+        raise SystemExit(f"no network {net!r}; create it with: terminal-ct net create {net}")
     if tool == "net_remove":
         if nets.get(net, {}).get("created_by") != "agent":
             raise SystemExit(f"network {net!r} is not one this agent created")
@@ -1787,7 +2015,7 @@ def agent_call(tool, a, approve, project=None):
             approve(f"Give the new container {name} internet access?", f"terminal-ct internet {name} on")
         for n in a.get("networks") or []:
             if project and n not in nets and n in networks():
-                raise SystemExit(f"network {n!r} is not in this agent's project {project!r}")
+                raise SystemExit(f"no network {n!r}; create it with: terminal-ct net create {n}")
             if nets.get(n, {}).get("created_by") != "agent":
                 approve(f"Plug {name} into your network {n!r} (it would reach your containers on it)?",
                         f"terminal-ct net attach {name} {n}")
@@ -1795,6 +2023,24 @@ def agent_call(tool, a, approve, project=None):
                      width=int(a.get("width", 1280)), height=int(a.get("height", 800)),
                      sandbox=a.get("sandbox", True), internet=bool(a.get("internet")), nets=a.get("networks") or (),
                      project=where)
+    if tool == "ct_snapshot":
+        act_ = a.get("action", "ls")
+        if act_ in ("load", "rm"):
+            guard_(f"{act_} snapshot {a.get('tag')} of", f"terminal-ct snapshot {name} {act_} {a.get('tag')}",
+                   destructive=True)
+        elif act_ == "save":
+            guard_("snapshot", f"terminal-ct snapshot {name} save {a.get('tag')}")
+        return snapshot(name, act_, a.get("tag"))
+    if tool == "ct_clone":
+        info = find(name)
+        users = not managed(info)
+        if users:  # a copy of their files the agent would own
+            approve(f"Clone your container {name} as {a['new']} (a copy of its files the agent manages, offline)?",
+                    f"terminal-ct clone {name} {a['new']}")
+        if node().run(["inspect", "--type", "container", PREFIX + check_name(a["new"])], check=False).returncode == 0:
+            raise SystemExit(f"the name {a['new']!r} is not available: choose another")
+        return clone(name, a["new"], created_by="agent", project=where or labels_of(info).get(f"{LABEL}.project"),
+                     internet=False if users else None)
     if tool == "ct_start":
         guard_("start", f"terminal-ct start {name}")
         return quiet(start, name)
@@ -1831,8 +2077,9 @@ def mcp(name=None, project=None):
         check_project(project)
     if name:
         check_name(name)
-        if project:
-            in_scope(find(name), project, name)
+        with contextlib.suppress(SystemExit):
+            if project and not under(labels_of(find(name)).get(f"{LABEL}.project") or DEFAULT_PROJECT, project):
+                name = None  # its container is outside the project: serve without one of its own
     allowed = {name}  # containers this session may drive: the server's own, and those the user approved
     can_ask, pending, asks = False, collections.deque(), iter(range(1, 1 << 30))
 
@@ -1851,7 +2098,7 @@ def mcp(name=None, project=None):
             p = project or (a.get("project") if tool in PROJECT_ARG_TOOLS else None) or lab.get(f"{LABEL}.project")
             p = p if isinstance(p, str) and _PROJECT.fullmatch(p) and under(p, project) else project or DEFAULT_PROJECT
             mine = under(lab.get(f"{LABEL}.project") or DEFAULT_PROJECT, project)
-            path = os.path.join(project_dir(p), AGENT_LOG) if tool in AGENT_NAMES else \
+            path = os.path.join(project_dir(p), AGENT_LOG) if tool in AGENT_NAMES or tool == "exec" else \
                 os.path.join(ct_dir(target), "actions.log") if lab.get(f"{LABEL}.sandbox") == "1" and mine else None
             if path:
                 with open(path, "a", encoding="utf-8") as f:
@@ -1922,7 +2169,8 @@ def mcp(name=None, project=None):
                               project=project)
                         allowed.add(target)
                     if tool == "exec":
-                        out = quiet(exec_, target, ["sh", "-c", a["command"]], float(a.get("timeout", 60)))
+                        out = quiet(exec_, target, ["sh", "-c", a["command"]],
+                                    max(1.0, min(float(a.get("timeout", 60)), 600)))
                         content = [{"type": "text", "text": json.dumps(out)}]
                     else:
                         before = _pixels(target) if a.get("screenshot") and tool in INPUT_TOOLS else None
@@ -1978,6 +2226,11 @@ def main(argv=None):
     c.add_argument("--net", action="append", default=[], help="an isolated network (repeatable)")
     c.add_argument("--project")
     rs = sub.add_parser("resume"); rs.add_argument("--stay", action="store_true")
+    sn = sub.add_parser("snapshot"); sn.add_argument("name"); sn.add_argument("snap_cmd", choices=["save", "load", "rm", "ls"])
+    sn.add_argument("tag", nargs="?")
+    cl = sub.add_parser("clone"); cl.add_argument("src"); cl.add_argument("new"); cl.add_argument("--project")
+    for n in ("push", "pull"):
+        tr = sub.add_parser(n); tr.add_argument("name"); tr.add_argument("src"); tr.add_argument("dest")
     sub.add_parser("autostart").add_argument("state", nargs="?", choices=["on", "off"])
     pj = sub.add_parser("project"); pj.add_argument("project_cmd", choices=["ls", "show", "notes", "move"])
     pj.add_argument("args", nargs="*")
@@ -2022,6 +2275,9 @@ def main(argv=None):
                       project=o.project)
     show_json = lambda r: print(json.dumps(r, indent=1))
     if o.cmd == "resume": return resume(o.stay)
+    if o.cmd == "snapshot": return show_json(snapshot(o.name, o.snap_cmd, o.tag))
+    if o.cmd == "clone": return show_json(clone(o.src, o.new, project=o.project))
+    if o.cmd in ("push", "pull"): return show_json(transfer(o.name, o.cmd, o.src, o.dest))
     if o.cmd == "autostart": return show_json(autostart(None if o.state is None else o.state == "on"))
     if o.cmd == "project":
         want_n = {"ls": (0, 0), "show": (0, 1), "notes": (0, 2), "move": (2, 2)}[o.project_cmd]

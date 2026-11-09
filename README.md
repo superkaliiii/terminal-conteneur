@@ -4,9 +4,9 @@ Containers with a desktop and a shell, for people and computer-use agents. The c
 [terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm): same command and
 MCP shape, independent of it (each installs and works alone), and able to show its VMs when both are installed.
 
-Status: **phase 3** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
+Status: **phase 4** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
 screen tools, terminal viewer, quota and live resources, isolated networks, sandboxes, and an MCP server that
-manages containers under agent-authority rules. Snapshots, orchestration (desired state, restarts, replicas) and
+manages containers under agent-authority rules; snapshots, clones and file copies. Orchestration (desired state, restarts, replicas) and
 dashboards (terminal and web) come next.
 
 ## Requirements
@@ -33,6 +33,9 @@ dashboards (terminal and web) come next.
 | `quota [--cpus N] [--memory GiB] [--disk GiB] [--containers N]` | show the host quota and its use, or set it |
 | `net create NET`, `net rm NET`, `net ls`, `net attach NAME NET`, `net detach NAME NET` | isolated networks: no LAN, no internet; containers on one reach each other by name |
 | `internet NAME [on\|off]` | show or change internet access (stopped container) |
+| `snapshot NAME save\|load\|rm TAG`, `snapshot NAME ls` | file system and `/data` (load: stopped container), see [Snapshots and clones](#snapshots-and-clones) |
+| `clone SRC NEW [--project P]` | NEW from SRC as it is: its files and a copy of its `/data` |
+| `push NAME LOCAL PATH`, `pull NAME PATH LOCAL` | copy files in or out (`/data` included), running or stopped |
 | `sandbox NAME on\|off` | make a stopped container a sandbox, or a normal one again (recreated from its image) |
 | `image ls`, `image pull REF`, `image build NAME DIR`, `image rm NAME` | images (Docker Hub short names are completed for Podman) |
 | `doctor`, `version`, `help` | checks |
@@ -87,13 +90,29 @@ those labels are never listed or touched. An image whose default command is a ba
   `/data`, ceiling and owner, and the old one is only renamed until then (put back if anything fails). Measured:
   5.4 s, files in `/etc` and `/data` kept, desktop working.
 
+## Snapshots and clones
+
+- `snapshot NAME save TAG` commits the file system to an image `tct-snap-NAME:TAG` and archives `/data` next to it
+  (`STORE/NAME/snaps/TAG.tar`, owners kept); `load` remakes the container from that image (the old one is put
+  back if anything fails) and restores `/data` as it was; `rm` refuses the snapshot the container runs from. A
+  sandbox has none: it starts from its image every time.
+- `clone SRC NEW`: NEW gets SRC's file system (`tct-keep-NEW`, removed with NEW) and a copy of its `/data`, same
+  ceiling and project, no networks; a clone of a sandbox is a new sandbox of the same image.
+- The disk quota counts what each snapshot's commit added and its `/data` archive, not the base image again.
+- Measured (WSL): snapshot of a desktop 0.2-0.5 s; clone of a desktop 4 s with Docker, 27 s with Podman (rootless
+  `keep-id` makes a copy of each new image with shifted owners, once); load + start of a desktop: ready in 0.6 s.
+- Agents: `ct_snapshot` and `ct_clone`; loading or removing a snapshot of a container the agent did not create
+  needs approval, and so does cloning one of the user's containers (the clone starts offline). `push`/`pull` are
+  CLI only: an agent tool would read or write any host file.
+
 ## Agents
 
 `mcp [NAME] [--project P]` serves, over stdio:
 
 - screen tools and `exec` (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `status`, `exec`;
   input tools take `screenshot: true`) on NAME, or on another container with `container`;
-- `ct_list`, `ct_create`, `ct_start`, `ct_stop`, `ct_remove`, `ct_resources`, `ct_internet`, `net_list`,
+- `ct_list`, `ct_create`, `ct_start`, `ct_stop`, `ct_remove`, `ct_resources`, `ct_internet`, `ct_snapshot`,
+  `ct_clone`, `net_list`,
   `net_create`, `net_remove`, `net_attach`, `net_detach`, `top`, `quota`;
 - `autostart` (restart after a PC restart; changing it asks the user);
 - `project_status` (where things stand: containers and networks with what each should be doing, notes, latest

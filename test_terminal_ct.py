@@ -13,6 +13,12 @@ class FakeNode(ct.Node):
             "alpine:3.20": {"Config": {"Cmd": ["/bin/sh"]}},
             "nginx": {"Config": {"Entrypoint": ["/docker-entrypoint.sh"], "Cmd": ["nginx", "-g", "daemon off;"]}}}
 
+    def pipe(self, args, stdin=None, stdout=None):
+        self.calls.append(["pipe", *args])
+        if stdout:
+            with open(stdout, "wb") as f:
+                f.write(b"tar of /data")
+
     def run(self, args, check=True, timeout=None, capture=True):
         self.calls.append(args)
         out, code = "", 0
@@ -29,6 +35,7 @@ class FakeNode(ct.Node):
             labels = dict(a.split("=", 1) for a in args[args.index("--name"):] if a.startswith("terminal-ct."))
             net = opt("--network")
             self.objects[name] = {"Id": "abc123def4567890", "Name": "/" + name, "State": {"Status": "created"},
+                                  "Image": "sha256:" + name,
                                   "Config": {"Labels": labels, "Image": "img"},
                                   "HostConfig": {"NanoCpus": int(float(opt("--cpus") or 0) * 1e9),
                                                  "Memory": int(opt("--memory") or 0), "NetworkMode": net},
@@ -383,6 +390,86 @@ class AgentAuthority(unittest.TestCase):
             self.assertEqual(json.loads(f.readline())["tool"], "ct_start")
 
 
+class SnapshotsAndClones(unittest.TestCase):
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
+
+    def test_snapshot_cycle(self):
+        quiet(ct.create, "w")
+        self.n.objects["tct-w"]["SizeRw"] = 1000
+        out = ct.snapshot("w", "save", "t1")
+        self.assertEqual((out["saved"], out["bytes"]), (True, 1000 + len(b"tar of /data")))
+        self.assertIn(["commit", "tct-w", "tct-snap-w:t1"], self.n.calls)
+        with self.assertRaisesRegex(SystemExit, "already has a snapshot"):
+            ct.snapshot("w", "save", "t1")
+        self.assertEqual(list(ct.snapshot("w", "ls")["snapshots"]), ["t1"])
+        ct.snapshot("w", "load", "t1")
+        self.assertIn("tct-snap-w:t1", self.created("w"))                              # remade from the snapshot
+        restore = [c for c in self.n.calls if c[0] == "pipe" and "-i" in c][-1]
+        self.assertIn("tct-w-data:/data", restore)                                     # /data back
+        with self.assertRaisesRegex(SystemExit, "runs from snapshot"):
+            ct.snapshot("w", "rm", "t1")
+        for bad in ("../x", "A", ""):
+            with self.assertRaises(SystemExit):
+                ct.snapshot("w", "save", bad)
+        quiet(ct.rm, "w")
+        self.assertIn(["image", "rm", "tct-snap-w:t1"], self.n.calls)
+
+    def created(self, name):
+        return [c for c in self.n.calls if c[0] == "create" and c[c.index("--name") + 1] == "tct-" + name][-1]
+
+    def test_failed_load_leaves_data_and_container(self):
+        quiet(ct.create, "w"); ct.snapshot("w", "save", "t1")
+        before = self.n.objects["tct-w"]
+        real = self.n.run
+        def run(args, **k):
+            if args[0] == "create":
+                raise SystemExit("engine down")
+            return real(args, **k)
+        self.n.run = run
+        with self.assertRaisesRegex(SystemExit, "engine down"):
+            ct.snapshot("w", "load", "t1")
+        scripts = [c[-1] for c in self.n.calls if c[0] == "pipe"]
+        self.assertTrue(scripts[-2].startswith("rm -rf /data/.tct-restore && mkdir"))     # unpacked aside...
+        self.assertEqual(scripts[-1], "rm -rf /data/.tct-restore")                       # ...then dropped: no swap
+        self.assertIs(self.n.objects["tct-w"], before)
+
+    def test_snapshot_within_disk_quota(self):
+        quiet(ct.create, "w")
+        self.n.objects["tct-w"]["SizeRw"] = 5 * 2 ** 30
+        with open(os.path.join(ct.STORE, "quota.json"), "w") as f:
+            json.dump({"disk_gb": 6}, f)
+        with self.assertRaisesRegex(SystemExit, "disk_gb"):
+            ct.snapshot("w", "save", "big")
+        self.assertEqual(ct.snapshots("w"), {})
+
+    def test_sandbox_has_no_snapshots(self):
+        quiet(ct.create, "s", sandbox=True)
+        with self.assertRaisesRegex(SystemExit, "sandbox"):
+            ct.snapshot("s", "save", "t")
+
+    def test_clone_copies_files_and_data(self):
+        quiet(ct.create, "src", project="lab")
+        out = ct.clone("src", "copy")
+        self.assertEqual((out["cloned_from"], out["project"]), ("src", "lab"))
+        self.assertIn(["commit", "tct-src", "tct-keep-copy:latest"], self.n.calls)
+        pipes = [c for c in self.n.calls if c[0] == "pipe"]
+        self.assertTrue(any("tct-src-data:/data" in c for c in pipes) and any("tct-copy-data:/data" in c for c in pipes))
+        with self.assertRaisesRegex(SystemExit, "already exists"):
+            ct.clone("src", "copy")
+
+    def test_agent_clone_of_users_container_asks_and_stays_offline(self):
+        quiet(ct.create, "mine")
+        asked = []
+        out = ct.agent_call("ct_clone", {"name": "mine", "new": "c"}, lambda m, c: asked.append(c))
+        self.assertEqual((asked, out["internet"]), (["terminal-ct clone mine c"], False))
+        self.assertTrue(ct.agent_owned(ct.find("c")))
+        with self.assertRaisesRegex(RuntimeError, "snapshot mine load"):
+            ct.agent_call("ct_snapshot", {"name": "mine", "action": "load", "tag": "t"},
+                          lambda m, c: (_ for _ in ()).throw(RuntimeError(c)))
+
+
 class ProjectsAndResume(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
@@ -398,10 +485,10 @@ class ProjectsAndResume(unittest.TestCase):
         approve = lambda m, c: None                                                 # even approving would not help
         for tool, a in (("ct_start", {"name": "mine"}), ("ct_resources", {"name": "mine"}),
                         ("ct_internet", {"name": "mine"})):
-            with self.assertRaisesRegex(SystemExit, "not in this agent's project 'beta'"):
+            with self.assertRaisesRegex(SystemExit, "no container named 'mine'"):
                 ct.agent_call(tool, a, approve, project="beta")
         ct.net_create("alab", project="alpha")
-        with self.assertRaisesRegex(SystemExit, "not in this agent's project"):
+        with self.assertRaisesRegex(SystemExit, "no network 'alab'"):
             ct.agent_call("net_attach", {"name": "job", "net": "alab"}, approve, project="beta")
         self.assertEqual(ct.agent_call("net_list", {}, approve, project="beta"), {})
         self.assertEqual({p["project"]: p["containers"] for p in ct.projects()}, {"alpha": 1, "beta": 1, "default": 0})
@@ -489,7 +576,7 @@ class ProjectsAndResume(unittest.TestCase):
         self.assertEqual(listed, ["top", "web"])
         with self.assertRaisesRegex(SystemExit, "not this agent's project"):
             ct.agent_call("ct_create", {"name": "x", "project": "other"}, approve, project="lab")
-        with self.assertRaisesRegex(SystemExit, "not in this agent's project"):
+        with self.assertRaisesRegex(SystemExit, "no container named 'web'"):
             ct.agent_call("ct_start", {"name": "web"}, approve, project="lab/other")
         st = ct.project_status("lab")
         self.assertEqual((sorted(c["name"] for c in st["containers"]), st["sub_projects"]), (["top", "web"], ["lab/web"]))
@@ -554,7 +641,8 @@ class Desktop(unittest.TestCase):
                 for want in ("TCT_WIDTH=1024", "TCT_HEIGHT=640", "HOME=/data", "LANG=C.UTF-8",
                              "terminal-ct.desktop=1", f"{os.path.join(self.tmp, 'd', 'run')}:/run/tct"):
                     self.assertIn(want, joined)
-                self.assertEqual(args[-2:], ["tct-desktop:alpine-3.20", ct.DESKTOP_ENTRY])
+                self.assertEqual(args[-4], "tct-desktop:alpine-3.20")
+                self.assertEqual(args[-3:-1], ["sh", "-c"]); self.assertTrue(args[-1].endswith("exec " + ct.DESKTOP_ENTRY))
                 if engine == "podman":
                     self.assertIn("--userns=keep-id", args); self.assertIn("tct-d-data:/data:U", args)
                 else:  # docker: the volume is handed to the user before the desktop runs as them
@@ -650,6 +738,44 @@ class RealEngines(unittest.TestCase):
                 quiet(ct.stop, name, 1)
                 quiet(ct.rm, name)
                 self.assertNotIn(name, [c["name"] for c in ct.containers()])
+
+    def test_phase4(self):
+        """Snapshot of files and /data, load back, clone with a copy of /data, push and pull."""
+        ct.STORE = tempfile.mkdtemp()
+        sh = lambda n, c: quiet(ct.exec_, n, ["sh", "-c", c])["stdout"].strip()
+        for engine in ("podman", "docker"):
+            if not shutil.which(engine):
+                continue
+            with self.subTest(engine=engine):
+                ct.NODE = ct.Node(engine)
+                a, b = f"p4a-{engine}", f"p4b-{engine}"
+                for n in (a, b):
+                    subprocess.run([engine, "rm", "-f", "tct-" + n], capture_output=True)
+                    subprocess.run([engine, "volume", "rm", "-f", f"tct-{n}-data"], capture_output=True)
+                quiet(ct.create, a, image="alpine:3.20"); quiet(ct.start, a)
+                sh(a, "echo v1 > /etc/mark; echo d1 > /data/mark; mkdir /data/sub; chown 1234 /data/sub")
+                self.assertTrue(ct.snapshot(a, "save", "one")["saved"])
+                sh(a, "echo v2 > /etc/mark; echo d2 > /data/mark; touch /data/extra")
+                quiet(ct.stop, a, 1)
+                ct.snapshot(a, "load", "one"); quiet(ct.start, a)
+                self.assertEqual(sh(a, "cat /etc/mark /data/mark; ls /data; stat -c %u /data/sub").split(),
+                                 ["v1", "d1", "mark", "sub", "1234"])               # files, /data, owners back
+                quiet(ct.stop, a, 1)
+                self.assertEqual(ct.clone(a, b)["cloned_from"], a); quiet(ct.start, b)
+                self.assertEqual(sh(b, "cat /etc/mark /data/mark"), "v1\nd1")
+                src = os.path.join(ct.STORE, "in.txt")
+                with open(src, "w") as f:
+                    f.write("pushed")
+                ct.transfer(b, "push", src, "/data/in.txt")
+                ct.transfer(b, "pull", "/data/in.txt", os.path.join(ct.STORE, "out.txt"))
+                with open(os.path.join(ct.STORE, "out.txt")) as f:
+                    self.assertEqual(f.read(), "pushed")
+                self.assertGreater(ct.snapshot(a, "ls")["snapshots"]["one"], 0)
+                for n in (a, b):
+                    quiet(ct.rm, n)
+                imgs = subprocess.run([engine, "image", "ls", "--format", "{{.Repository}}"], capture_output=True,
+                                      text=True).stdout
+                self.assertNotIn(f"tct-snap-{a}", imgs); self.assertNotIn(f"tct-keep-{b}", imgs)
 
     def test_phase3(self):
         """Limits in the cgroup and changed live, top, isolated network by name, internet off, sandbox reset."""
