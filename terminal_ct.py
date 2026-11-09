@@ -162,11 +162,11 @@ def node_for(engine):
 
 class NodeVM(Node):
     """Where containers run when they run in a node VM: each engine call is `docker ...` in that VM."""
-    def __init__(self, name):
-        self.name, self.engine = name, "docker"
+    def __init__(self, name, timeout=None):
+        self.name, self.engine, self.timeout = name, "docker", timeout  # timeout: each call's, when looking around
 
     def run(self, args, check=True, timeout=None, capture=True):
-        t = timeout or (600 if capture else 3600)  # uncaptured: a pull or a build, minutes on a slow link
+        t = timeout or self.timeout or (600 if capture else 3600)  # uncaptured: a pull or a build, minutes
         try:
             r = vm_call(["exec", self.name, "--timeout", str(t), "--", "docker", *args], timeout=t + 30)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
@@ -244,6 +244,7 @@ def node_add(name, image="debian", cpus=2, memory=2, disk=20, project=None, wait
         raise SystemExit(f"node {name!r} already exists")
     t0 = time.monotonic()
     made = _vm(["create", name, "--image", image, "--node", "--cpus", str(cpus), "--memory", str(memory),
+                "--max-memory", str(memory),  # a node's ceiling is its size: the quota counts no headroom
                 "--disk", str(disk), *(["--project", check_project(project)] if project else [])], timeout=1800)
     ready = made.get("ready_file") or "/var/lib/terminal-vm/ready"  # left by cloud-init once Docker answers
     with quota_lock("nodes"):
@@ -738,6 +739,8 @@ def rm(name):
     for tag in snapshots(name):
         node().run(["image", "rm", f"{SNAP}{name}:{tag}"], check=False)
     shutil.rmtree(os.path.join(STORE, name), ignore_errors=True)
+    if isinstance(node(), NodeVM):
+        place(name, None)
     print(json.dumps({"removed": name}))
 
 
@@ -745,8 +748,23 @@ def status(name):
     print(json.dumps(normalize(find(name))))
 
 
+def everywhere():
+    """[(node or None, raw containers there)]: this host's engine, then each running node (one not answering is
+    left out of this view)."""
+    out = [(None, raw_containers())]
+    for n in sorted(n for n, ok in nodes_up().items() if ok):
+        with contextlib.suppress(SystemExit), on_node(n, LOOK_TIMEOUT):
+            out.append((n, raw_containers()))
+    return out
+
+
+def all_containers():
+    """containers() of this host and of the nodes, each node's marked with "node"."""
+    return [dict(normalize(c), **({"node": where} if where else {})) for where, cs in everywhere() for c in cs]
+
+
 def ls():
-    print(json.dumps(containers(), indent=1))
+    print(json.dumps(all_containers(), indent=1))
 
 
 def exec_(name, cmd, timeout=60):
@@ -854,11 +872,14 @@ def host_free_bytes(path):
 
 def quota_limits(use):
     """The user's quota; defaults from the engine's host for what was never set: cores - 1, 75% of its memory, half
-    of the space containers can have (free now plus what they hold), 16 running containers."""
-    set_ = _quota_file()
+    of the space containers can have (free now plus what they hold), 16 running containers. In a node: its whole
+    size, and never the host's quota file (terminal-vm's quota already fences its VM)."""
     cpus, mem, root = node().host()
     free = node().free_bytes(root)
-    default = {"cpus": max(1, cpus - 1), "memory_gb": max(1, int(mem * 3 // 4)),
+    own = isinstance(node(), NodeVM)
+    set_ = {} if own else _quota_file()
+    default = {"cpus": cpus if own else max(1, cpus - 1),
+               "memory_gb": max(1, round(mem)) if own else max(1, int(mem * 3 // 4)),  # a 1 GiB VM shows ~0.95
                "disk_gb": int((free / 2 ** 30 + use.get("disk_gb", 0)) // 2), "containers": 16}
     return {k: set_.get(k, default[k]) for k in QUOTA_KEYS}, {k: k in set_ for k in QUOTA_KEYS}
 
@@ -1240,7 +1261,7 @@ def project_move(name, project):
 # few seconds and runs the health probes. Everything it does goes to the event log.
 STACK_LABELS = ("stack", "service", "replica", "hash")
 SERVICE_KEYS = {"image", "cmd", "replicas", "cpus", "memory_gb", "desktop", "width", "height", "sandbox", "internet",
-                "networks", "restart", "health", "ttl"}
+                "networks", "restart", "health", "ttl", "node", "spread"}
 RECREATE_KEYS = ("image", "cmd", "desktop", "width", "height", "sandbox", "internet", "networks")  # cpus, memory: live
 RESTARTS = ("always", "on-failure", "never")
 TICK = 3  # seconds between the daemon's passes
@@ -1308,6 +1329,14 @@ def check_stack(s):
             raise SystemExit(f"service {svc}: cmd is a list of strings")
         for n in c.get("networks") or []:
             check_name(n)
+        if c.get("node") is not None:
+            check_name(c["node"])
+        if c.get("spread") not in (None, "nodes"):
+            raise SystemExit(f'service {svc}: spread is "nodes" (its replicas across the nodes)')
+        if c.get("node") and c.get("spread"):
+            raise SystemExit(f"service {svc}: node (all replicas there) or spread, not both")
+        if (c.get("node") or c.get("spread")) and (c.get("desktop") or c.get("networks")):
+            raise SystemExit(f"service {svc}: desktops and isolated networks on nodes come later; leave node/spread out")
         h = c.get("health")
         if h is not None:
             if not isinstance(h, dict) or not isinstance(h.get("exec"), str):
@@ -1416,6 +1445,55 @@ def _started(c):
     return _time((c.get("State") or {}).get("StartedAt"))
 
 
+@contextlib.contextmanager
+def on_node(name, timeout=None):
+    """Engine calls inside go to that node (None: the stack's own engine); the previous engine after.
+    timeout: per call, for listings (a frozen node answers nothing: give up quickly)."""
+    before = getattr(_LOCAL, "node", None)
+    if name:
+        _LOCAL.node = NodeVM(name, timeout)
+    try:
+        yield
+    finally:
+        _LOCAL.node = before
+
+
+LOOK_TIMEOUT = 15  # seconds for a listing call in a node
+UP_MAX_AGE = 2  # seconds a nodes_up() answer is reused
+_UP = {}
+
+
+def nodes_up():
+    """Registered nodes and whether each one's VM runs (one terminal-vm ls, reused for UP_MAX_AGE seconds)."""
+    names = _nodes()["nodes"]
+    if not names:
+        return {}
+    if time.time() - _UP.get("t", 0) > UP_MAX_AGE or set(_UP.get("up", ())) != set(names):
+        try:
+            vms = {v["name"]: v.get("status") for v in vm_call(["ls"], timeout=30)}
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+            vms = {}
+        _UP.update(t=time.time(), up={n: vms.get(n) == "running" for n in names})
+    return dict(_UP["up"])
+
+
+def _target(cname, c, up, placement, load):
+    """Where a replica should live: None (this host), a node, or False (nowhere now: its pinned node is down,
+    or no node runs). spread keeps a replica where it is while that node runs, else the least loaded node."""
+    if c.get("node"):
+        return c["node"] if up.get(c["node"]) is not False and c["node"] in up else False
+    if not c.get("spread"):
+        return None
+    if placement.get(cname) in up and up[placement[cname]] is not False:  # running, or not answering this pass
+        return placement[cname]
+    alive = sorted(n for n, ok in up.items() if ok)
+    if not alive:
+        return False
+    best = min(alive, key=lambda n: (load.get(n, 0), n))
+    load[best] = load.get(best, 0) + 1
+    return best
+
+
 def reconcile(name, now=None):
     """One pass over a stack; returns the events it caused."""
     with quota_lock("reconcile"):
@@ -1425,6 +1503,13 @@ def reconcile(name, now=None):
         finally:
             _save_state(st)
         return out
+
+
+def _rm_copy(name):
+    """One copy of a replica on the current engine (left on a node that was down): its container and /data volume,
+    not the host's state of the replica (want, snapshots), which the copy kept elsewhere still has."""
+    node().run(["rm", "-f", PREFIX + name], check=False)
+    node().run(["volume", "rm", f"{PREFIX}{name}-data"], check=False)
 
 
 def _rm_quiet(name, keep_data=False):
@@ -1438,7 +1523,28 @@ def _reconcile(s, st, now):
     name, owner, project = s["stack"], s.get("created_by", "user"), s.get("project") or DEFAULT_PROJECT
     done = []
     ev = lambda kind, svc=None, c=None, detail=None: done.append(event(kind, name, svc, c, detail))
-    have = {labels_of(c).get(f"{LABEL}.name"): c for c in raw_containers() if labels_of(c).get(f"{LABEL}.stack") == name}
+    mine = lambda: {labels_of(c).get(f"{LABEL}.name"): c for c in raw_containers()
+                    if labels_of(c).get(f"{LABEL}.stack") == name}
+    have = collections.defaultdict(list)  # name: [(container, node where it is: None here)], a copy per place
+    for n, c in mine().items():
+        have[n].append((c, None))
+    placement = _nodes()["placement"]
+    on_nodes = any(c.get("node") or c.get("spread") for c in s["services"].values()) or \
+        any(k.startswith(name + "-") for k in placement)  # it uses nodes, or did
+    up = nodes_up() if on_nodes else {}
+    fails = st.setdefault("-nodes", {})  # failed listings in a row per node ("-": never a container's name)
+    for n, ok in up.items():
+        if ok:
+            try:
+                with on_node(n, LOOK_TIMEOUT):
+                    found = mine()
+                fails.pop(n, None)
+                for k, c in found.items():
+                    have[k].append((c, n))
+            except SystemExit:  # VM running, its agent or Docker not answering: a hiccup, or frozen
+                fails[n] = fails.get(n, 0) + 1
+                up[n] = False if fails[n] >= 3 else None  # None: left as it is this pass; down from the third
+    load = collections.Counter(placement.values())
     known = networks()
     for svc, c in s["services"].items():
         h = service_hash(c)
@@ -1453,85 +1559,127 @@ def _reconcile(s, st, now):
         ttl = parse_ttl(c.get("ttl"))
         for i in range(1, c["replicas"] + 1):
             cname = f"{name}-{svc}-{i}"
-            info, mem = have.pop(cname, None), st.setdefault(cname, {})
-            if mem.get("expired"):
-                if info is not None:
-                    _rm_quiet(cname)
-                continue
-            if info is not None and labels_of(info).get(f"{LABEL}.hash") != h:
-                _rm_quiet(cname, keep_data=True)
-                ev("recreated", svc, cname, "its configuration changed (its /data kept)")
-                info = None
-                mem = st[cname] = {"born": mem.get("born")}
-            if info is None:
-                if now < mem.get("next", 0):
-                    continue  # backing off after a failed creation
-                if blocked:
-                    ev("create_failed", svc, cname, f"network {blocked!r} is the user's: apply the stack again "
-                                                    "so they can approve it"); continue
-                try:
-                    with captured(io.StringIO()):
-                        create(cname, c.get("image") or DEFAULT_IMAGE, c.get("cpus"), c.get("memory_gb"), c.get("cmd"),
-                               created_by=owner, desktop=bool(c.get("desktop")), width=int(c.get("width", 1280)),
-                               height=int(c.get("height", 800)), sandbox=bool(c.get("sandbox")),
-                               internet=c.get("internet"), nets=c.get("networks") or (), project=project,
-                               labels={"stack": name, "service": svc, "replica": i, "hash": h}, own_volume=True)
-                except SystemExit as e:
-                    mem["fails"] = mem.get("fails", 0) + 1
-                    mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["fails"])
-                    ev("create_failed", svc, cname, str(e)); continue
-                mem["fails"] = 0
-                mem.setdefault("born", None)
-                mem["born"] = mem["born"] or now  # a ttl runs from the first creation (a sandbox is remade at starts)
-                ev("created", svc, cname)
-                info = find(cname)
-            mem.setdefault("born", _time(info.get("Created")) or now)
-            want_c, want_m = c.get("cpus") or DEFAULT_CPUS, c.get("memory_gb") or DEFAULT_MEMORY
-            have_c, have_m = allotted(info, None)
-            if abs(have_c - want_c) > 1e-6 or abs(have_m - want_m) > 1e-3:  # changed in place, nothing remade
-                try:
-                    resources(cname, want_c, want_m)
-                    ev("resized", svc, cname, f"{want_c:g} CPUs, {want_m:g} GiB")
-                except SystemExit as e:
-                    ev("pending", svc, cname, str(e))
-            if ttl and now - mem["born"] > ttl:
-                _rm_quiet(cname)
-                mem["expired"] = True
-                ev("expired", svc, cname, f"ttl {c['ttl']}")
-                continue
-            started = _started(info)
-            if running(info):
-                if started and now - started > 60:
-                    mem["restarts"] = 0  # a minute up: the next failure starts the backoff over
-                continue
-            status, code = (info.get("State") or {}).get("Status"), (info.get("State") or {}).get("ExitCode", 0)
-            first = status == "created" or mem.get("unhealthy", False)  # dropped once it started again
-            if not first and wanted(cname) == "stopped":
-                continue  # stopped by the user (terminal-ct stop): left so until they start it
-            if not first and (c["restart"] == "never" or c["restart"] == "on-failure" and code == 0):
-                continue  # stopped and meant to stay so (a finished job, or a policy of never)
-            if now < mem.get("next", 0):
-                continue  # backing off
             try:
-                with captured(io.StringIO()):
-                    start(cname)
-            except SystemExit as e:
-                mem["fails"] = mem.get("fails", 0) + 1
-                mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["fails"])
-                ev("pending" if "quota" in str(e) else "start_failed", svc, cname, str(e)); continue
-            mem["fails"] = 0
-            mem["started_at"] = now
-            mem.pop("unhealthy", None)
-            if status == "created":
-                ev("started", svc, cname)
-            else:
-                mem["restarts"] = mem.get("restarts", 0) + 1
-                mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["restarts"])
-                ev("restarted", svc, cname, f"exit code {code}, restart {mem['restarts']}")
-    for cname in have:  # replicas no service asks for any more: removed with their /data
-        _rm_quiet(cname)
-        st.pop(cname, None)
-        ev("removed", labels_of(have[cname]).get(f"{LABEL}.service"), cname, "not in the stack any more (its /data too)")
+                copies, mem = have.pop(cname, []), st.setdefault(cname, {})
+                if mem.get("expired") and not copies:
+                    continue  # its ttl is over and nothing is left of it: nowhere to place it
+                target = _target(cname, c, up, placement, load)
+                if target is False:
+                    if not copies:
+                        if not mem.get("pending"):  # said once, not every pass while the node is down
+                            ev("pending", svc, cname, f"node {c['node']} is down" if c.get("node") else "no node runs")
+                        mem["pending"] = True
+                        continue
+                    target = copies[0][1]  # keep it where it still runs
+                mem.pop("pending", None)
+                if target and up.get(target) is None:
+                    continue  # its node did not answer this pass: left as it is
+                info = next((x for x, w in copies if w == target), None)
+                for _, w in copies:
+                    if w != target:  # placement changed, or a copy left on a node that was down: /data does not follow
+                        with on_node(w):
+                            _rm_copy(cname)
+                        ev("moved" if info is None else "removed", svc, cname,
+                           f"from {w or 'this host'} to {target or 'this host'}" if info is None
+                           else f"a copy left on {w or 'this host'} (it runs on {target or 'this host'})")
+                if info is None and copies:
+                    mem = st[cname] = {"born": mem.get("born"), **({"expired": True} if mem.get("expired") else {})}
+                if info is None and placement.get(cname) and placement[cname] != target:
+                    old = placement.pop(cname)
+                    place(cname, None)  # its node is down or gone: made again elsewhere, the old copy removed on return
+                    if up.get(old) is not True:
+                        ev("failover", svc, cname, f"node {old} is down: made again on {target or 'this host'}")
+                with on_node(target):
+                    if mem.get("expired"):
+                        if info is not None:
+                            _rm_quiet(cname)
+                        continue
+                    if info is not None and labels_of(info).get(f"{LABEL}.hash") != h:
+                        _rm_quiet(cname, keep_data=True)
+                        ev("recreated", svc, cname, "its configuration changed (its /data kept)")
+                        info = None
+                        mem = st[cname] = {"born": mem.get("born")}
+                    if info is None:
+                        if now < mem.get("next", 0):
+                            continue  # backing off after a failed creation
+                        if blocked:
+                            ev("create_failed", svc, cname, f"network {blocked!r} is the user's: apply the stack again "
+                                                            "so they can approve it"); continue
+                        try:
+                            with captured(io.StringIO()):
+                                create(cname, c.get("image") or DEFAULT_IMAGE, c.get("cpus"), c.get("memory_gb"), c.get("cmd"),
+                                       created_by=owner, desktop=bool(c.get("desktop")), width=int(c.get("width", 1280)),
+                                       height=int(c.get("height", 800)), sandbox=bool(c.get("sandbox")),
+                                       internet=c.get("internet"), nets=c.get("networks") or (), project=project,
+                                       labels={"stack": name, "service": svc, "replica": i, "hash": h}, own_volume=True)
+                        except SystemExit as e:
+                            mem["fails"] = mem.get("fails", 0) + 1
+                            mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["fails"])
+                            ev("create_failed", svc, cname, str(e)); continue
+                        mem["fails"] = 0
+                        mem.setdefault("born", None)
+                        mem["born"] = mem["born"] or now  # a ttl runs from the first creation (a sandbox is remade at starts)
+                        if target:
+                            place(cname, target)
+                            placement[cname] = target
+                        ev("created", svc, cname, f"on node {target}" if target else None)
+                        info = find(cname)
+                    mem.setdefault("born", _time(info.get("Created")) or now)
+                    want_c, want_m = c.get("cpus") or DEFAULT_CPUS, c.get("memory_gb") or DEFAULT_MEMORY
+                    have_c, have_m = allotted(info, None)
+                    if abs(have_c - want_c) > 1e-6 or abs(have_m - want_m) > 1e-3:  # changed in place, nothing remade
+                        try:
+                            resources(cname, want_c, want_m)
+                            ev("resized", svc, cname, f"{want_c:g} CPUs, {want_m:g} GiB")
+                        except SystemExit as e:
+                            ev("pending", svc, cname, str(e))
+                    if ttl and now - mem["born"] > ttl:
+                        _rm_quiet(cname)
+                        mem["expired"] = True
+                        ev("expired", svc, cname, f"ttl {c['ttl']}")
+                        continue
+                    started = _started(info)
+                    if running(info):
+                        if started and now - started > 60:
+                            mem["restarts"] = 0  # a minute up: the next failure starts the backoff over
+                        continue
+                    status, code = (info.get("State") or {}).get("Status"), (info.get("State") or {}).get("ExitCode", 0)
+                    first = status == "created" or mem.get("unhealthy", False)  # dropped once it started again
+                    if not first and wanted(cname) == "stopped":
+                        continue  # stopped by the user (terminal-ct stop): left so until they start it
+                    if not first and (c["restart"] == "never" or c["restart"] == "on-failure" and code == 0):
+                        continue  # stopped and meant to stay so (a finished job, or a policy of never)
+                    if now < mem.get("next", 0):
+                        continue  # backing off
+                    try:
+                        with captured(io.StringIO()):
+                            start(cname)
+                    except SystemExit as e:
+                        mem["fails"] = mem.get("fails", 0) + 1
+                        mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["fails"])
+                        ev("pending" if "quota" in str(e) else "start_failed", svc, cname, str(e)); continue
+                    mem["fails"] = 0
+                    mem["started_at"] = now
+                    mem.pop("unhealthy", None)
+                    if status == "created":
+                        ev("started", svc, cname)
+                    else:
+                        mem["restarts"] = mem.get("restarts", 0) + 1
+                        mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["restarts"])
+                        ev("restarted", svc, cname, f"exit code {code}, restart {mem['restarts']}")
+            except SystemExit as e:  # one replica's engine error must not stop the pass: next pass tries again
+                ev("reconcile_failed", svc, cname, str(e))
+    for cname, copies in have.items():  # replicas no service asks for any more: removed with their /data
+        try:
+            for k, (info, where) in enumerate(copies):
+                with on_node(where):  # the last copy takes the replica's state on this host with it
+                    _rm_quiet(cname) if k == len(copies) - 1 else _rm_copy(cname)
+                ev("removed", labels_of(info).get(f"{LABEL}.service"), cname, "not in the stack any more (its /data too)")
+            if placement.get(cname):
+                place(cname, None)
+            st.pop(cname, None)
+        except SystemExit as e:
+            ev("reconcile_failed", None, cname, str(e))
     return done
 
 
@@ -1542,6 +1690,32 @@ def probe(s, now=None):
     now, out, results = now or time.time(), [], {}
     with quota_lock("reconcile"):
         st = _state()
+    probed_on_nodes = any(c.get("health") and (c.get("node") or c.get("spread")) for c in s["services"].values())
+    for where in [None] + ([n for n, ok in nodes_up().items() if ok] if probed_on_nodes else []):
+        try:
+            with on_node(where):
+                results.update(_probe(s, st, now, where))
+        except SystemExit:  # a node not answering this pass: its replicas wait for the next one
+            continue
+    with quota_lock("reconcile"):
+        st = _state()  # what reconcile wrote meanwhile stays
+        for cname, (ok, cfg, svc, where) in results.items():
+            mem = st.setdefault(cname, {})
+            mem["probed"] = now
+            mem["health_fails"] = 0 if ok else mem.get("health_fails", 0) + 1
+            if mem["health_fails"] >= cfg["health"]["retries"]:
+                mem.update(health_fails=0, unhealthy=cfg["restart"] != "never")
+                with on_node(where), contextlib.suppress(SystemExit):
+                    node().run(["stop", "-t", "5", PREFIX + cname], check=False)  # not stop(): the user did not ask
+                out.append(event("unhealthy", s["stack"], svc, cname,
+                                 f"{cfg['health']['retries']} failed probes: {cfg['health']['exec']}"))
+        _save_state(st)
+    return out
+
+
+def _probe(s, st, now, where):
+    """The probes due on the current engine: {name: (ok, service config, service, where)}."""
+    results = {}
     for c in raw_containers():
         lab = labels_of(c)
         cfg = s["services"].get(lab.get(f"{LABEL}.service")) if lab.get(f"{LABEL}.stack") == s["stack"] else None
@@ -1555,20 +1729,8 @@ def probe(s, now=None):
             ok = quiet(exec_, cname, ["sh", "-c", h["exec"]], h["every"])["exit"] == 0
         except SystemExit:
             ok = False
-        results[cname] = (ok, cfg, lab.get(f"{LABEL}.service"))
-    with quota_lock("reconcile"):
-        st = _state()  # what reconcile wrote meanwhile stays
-        for cname, (ok, cfg, svc) in results.items():
-            mem = st.setdefault(cname, {})
-            mem["probed"] = now
-            mem["health_fails"] = 0 if ok else mem.get("health_fails", 0) + 1
-            if mem["health_fails"] >= cfg["health"]["retries"]:
-                mem.update(health_fails=0, unhealthy=cfg["restart"] != "never")
-                node().run(["stop", "-t", "5", PREFIX + cname], check=False)  # not stop(): the user did not ask
-                out.append(event("unhealthy", s["stack"], svc, cname,
-                                 f"{cfg['health']['retries']} failed probes: {cfg['health']['exec']}"))
-        _save_state(st)
-    return out
+        results[cname] = (ok, cfg, lab.get(f"{LABEL}.service"), where)
+    return results
 
 
 def apply(s, created_by="user", project=None, approved_networks=()):
@@ -1629,8 +1791,8 @@ def stack_show(name):
     with quota_lock("reconcile"):
         st = _state()
     reps = [dict(normalize(c), **{k: v for k, v in st.get(labels_of(c).get(f"{LABEL}.name"), {}).items()
-                                  if k in ("restarts", "expired", "health_fails")})
-            for c in raw_containers() if labels_of(c).get(f"{LABEL}.stack") == name]
+                                  if k in ("restarts", "expired", "health_fails")}, **({"node": where} if where else {}))
+            for where, cs in everywhere() for c in cs if labels_of(c).get(f"{LABEL}.stack") == name]
     return {"stack": name, "project": s.get("project") or DEFAULT_PROJECT, "created_by": s.get("created_by", "user"),
             "services": {svc: dict(c, running=sum(r["status"] == "running" for r in reps
                                                   if r["name"].startswith(f"{name}-{svc}-")))
@@ -1644,16 +1806,22 @@ def stack_rm(name):
     load_stack(name)
     with quota_lock("stacks"), quota_lock("reconcile"):
         st, gone = _state(), []
-        for c in raw_containers():  # first: an unreachable engine keeps the stack, not orphan containers
-            if labels_of(c).get(f"{LABEL}.stack") == name:
-                n = labels_of(c).get(f"{LABEL}.name")
-                _rm_quiet(n)
-                st.pop(n, None)
-                gone.append(n)
+        for where, cs in everywhere():  # first: an unreachable engine keeps the stack, not orphan containers
+            for c in cs:
+                if labels_of(c).get(f"{LABEL}.stack") == name:
+                    n = labels_of(c).get(f"{LABEL}.name")
+                    with on_node(where):
+                        _rm_quiet(n)
+                    if where:
+                        place(n, None)
+                    st.pop(n, None)
+                    gone.append(n)
         _save_state(st)
         os.remove(os.path.join(stacks_dir(), name + ".json"))
-    event("stack_removed", name, detail=f"{len(gone)} containers")
-    return {"removed": name, "containers": gone}
+    left = sorted(f"{c} (node {n})" for c, n in _nodes()["placement"].items() if c.startswith(name + "-"))
+    event("stack_removed", name, detail=f"{len(gone)} containers" + (f"; left on nodes down: {', '.join(left)}"
+                                                                    if left else ""))
+    return {"removed": name, "containers": gone, **({"left_on_nodes_down": left} if left else {})}
 
 
 def prune():
@@ -1771,15 +1939,19 @@ def dashboard_data(project=None, with_quota=True):
     """Everything the dashboards show: each container (state, health, stack and replica, CPU and memory used next
     to its ceiling, age, restarts, flags), the daemon, the quota (an agent's project: its use and the room left),
     the latest events."""
-    infos = [c for c in raw_containers() if under(labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT, project)]
-    stats = _stats([c for c in infos if running(c)])
+    groups = [(where, [c for c in cs if under(labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT, project)])
+              for where, cs in everywhere()]
+    infos, stats = groups[0][1], {}  # infos: this host's, for its quota; nodes have their own capacity
+    for where, cs in groups:
+        with contextlib.suppress(SystemExit), on_node(where):
+            stats.update(_stats([c for c in cs if running(c)]))
     st, now = _state(), time.time()  # read only: a snapshot of the reconciler's memory
     services = {}
     for sname in stacks():
         with contextlib.suppress(SystemExit):
             services[sname] = load_stack(sname)["services"]
     rows = []
-    for c in infos:
+    for where, c in ((w, c) for w, cs in groups for c in cs):
         n, lab = normalize(c), labels_of(c)
         mem = st.get(n["name"], {})
         svc = services.get(lab.get(f"{LABEL}.stack"), {}).get(lab.get(f"{LABEL}.service")) or {}
@@ -1793,7 +1965,8 @@ def dashboard_data(project=None, with_quota=True):
                      "memory_gb": n["memory_gb"], "age": now - _started(c) if running(c) and _started(c) else None,
                      "restarts": mem.get("restarts", 0),
                      "flags": "".join(f for f, on in (("D", n.get("desktop")), ("S", n.get("sandbox")),
-                                                      ("I", n["internet"]), ("A", n["created_by"] == "agent")) if on)})
+                                                      ("I", n["internet"]), ("A", n["created_by"] == "agent")) if on),
+                     **({"node": where} if where else {})})
     q = None
     if with_quota:
         q = project_quota(project, infos)
@@ -2088,6 +2261,14 @@ def on_stack_engine(stack):
 
 
 def web_api(method, path, q, body=None):
+    """One dashboard call, on the engine of the container it names (its node, if it lives in one)."""
+    name = q.get("name") or (body.get("name") if isinstance(body, dict) else None)
+    with on_node(_nodes()["placement"].get(name) if isinstance(name, str) and q.get("kind") != "vm"
+                 and not (isinstance(body, dict) and body.get("kind") == "vm") else None):
+        return _web_api(method, path, q, body)
+
+
+def _web_api(method, path, q, body=None):
     """One dashboard call: (content type, bytes or a JSON-able value). Raises on a bad request."""
     project = q.get("project") or None
     if project:
@@ -3608,8 +3789,8 @@ def agent_call(tool, a, approve, project=None):
     if name and project and tool != "ct_create":  # reads too: another project's containers are not this agent's business
         in_scope(find(name), project, name)
     if tool == "ct_list":
-        return [dict(normalize(c), managed=managed(c)) for c in raw_containers()
-                if mine(labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT)]
+        return [dict(normalize(c), managed=managed(c), **({"node": where} if where else {}))
+                for where, cs in everywhere() for c in cs if mine(labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT)]
     if tool == "top":
         t = top()
         keep = {c["name"] for c in containers() if mine(c["project"])}
@@ -3820,6 +4001,8 @@ def mcp(name=None, project=None):
             p = req.get("params", {})
             tool, a = p.get("name"), dict(p.get("arguments") or {})
             target = a.get("name") if tool in AGENT_NAMES else a.pop("container", None) or name
+            where = _nodes()["placement"].get(target) if isinstance(target, str) else None
+            _LOCAL.node = NodeVM(where) if where else None  # a container in a node: every engine call goes there
             try:
                 if tool in AGENT_NAMES:
                     with captured(io.StringIO()):  # engine output must not reach the MCP channel
@@ -4147,11 +4330,7 @@ def main(argv=None):
         return
     if o.cmd == "start": return start(o.name)
     if o.cmd == "stop": return stop(o.name, o.timeout)
-    if o.cmd == "rm":
-        r = rm(o.name)
-        if isinstance(NODE, NodeVM):  # removed from its node; a same-named local one (--engine) leaves it placed
-            place(o.name, None)
-        return r
+    if o.cmd == "rm": return rm(o.name)  # from its node, rm forgets where it was
     if o.cmd == "status": return status(o.name)
     if o.cmd == "exec":
         out = exec_(o.name, o.command or cmd_args, o.timeout)

@@ -816,6 +816,10 @@ class Nodes(unittest.TestCase):
             self.vm_calls.append(args)
             if args[0] == "exec":
                 name, argv = args[1], args[args.index("--") + 1:]
+                if name in getattr(self, "frozen", ()):
+                    raise RuntimeError("guest command timed out (15 s)")
+                if argv[0] == "docker" and argv[1] in getattr(self, "refuse", {}).get(name, ()):
+                    return {"exit": 1, "stdout": "", "stderr": "Docker is restarting"}
                 if argv[0] == "docker":
                     r = self.engines.setdefault(name, FakeNode("docker")).run(argv[1:], check=False)
                     return {"exit": r.returncode, "stdout": r.stdout, "stderr": "no such object" if r.returncode else ""}
@@ -837,9 +841,11 @@ class Nodes(unittest.TestCase):
             return {}
         self.patch = unittest.mock.patch.object(ct, "vm_call", vm_call)
         self.patch.start()
+        self.age = unittest.mock.patch.object(ct, "UP_MAX_AGE", -1)  # the test changes VM states at once
+        self.age.start()
 
     def tearDown(self):
-        self.patch.stop()
+        self.patch.stop(); self.age.stop()
         ct.NODE = None
 
     def cli(self, *argv):
@@ -852,7 +858,7 @@ class Nodes(unittest.TestCase):
     def test_add_create_follow_and_remove(self):
         r = self.cli("node", "add", "n1", "--image", "alpine", "--memory", "1")
         self.assertEqual(r["node"], "n1")
-        self.assertIn(["create", "n1", "--image", "alpine", "--node", "--cpus", "2", "--memory", "1", "--disk", "20"],
+        self.assertIn(["create", "n1", "--image", "alpine", "--node", "--cpus", "2", "--memory", "1", "--max-memory", "1", "--disk", "20"],
                       self.vm_calls)
         self.assertIn(["supervise", "n1", "--restart", "always"], self.vm_calls)          # restarted if it falls
         self.cli("--node", "n1", "create", "web")
@@ -918,6 +924,80 @@ class Nodes(unittest.TestCase):
         self.cli("node", "rm", "n1", "--force")
         self.assertFalse(os.path.exists(os.path.join(ct.STORE, "web")))
 
+    def test_spread_failover_and_return(self):
+        """9.3/9.4: replicas spread over the nodes; a node down -> made again on another; back -> its copies go."""
+        with unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"):
+            self.cli("node", "add", "n1"); self.cli("node", "add", "n2")
+            ct.apply({"stack": "lab", "services": {"app": {"image": "alpine:3.20", "replicas": 3, "spread": "nodes"}}})
+            where = lambda: {r["name"]: r.get("node") for r in ct.all_containers()}
+            self.assertEqual(where(), {"lab-app-1": "n1", "lab-app-2": "n2", "lab-app-3": "n1"})   # least loaded first
+            self.assertEqual(self.local.objects, {})                                                # none on this host
+            self.assertEqual(ct.stack_show("lab")["services"]["app"]["running"], 3)
+            self.vms["n1"] = "stopped"                                                              # n1 falls
+            out = ct.reconcile("lab")
+            self.assertEqual(sorted(e["container"] for e in out if e["event"] == "failover"), ["lab-app-1", "lab-app-3"])
+            self.assertEqual(where(), {"lab-app-1": "n2", "lab-app-2": "n2", "lab-app-3": "n2"})
+            self.vms["n1"] = "running"                                                              # n1 back, old copies
+            self.assertEqual(sorted(self.engines["n1"].objects), ["tct-lab-app-1", "tct-lab-app-3"])
+            out = ct.reconcile("lab")
+            self.assertEqual(sorted(e["container"] for e in out if e["event"] == "removed"), ["lab-app-1", "lab-app-3"])
+            self.assertEqual(self.engines["n1"].objects, {})
+            self.assertEqual(where(), {"lab-app-1": "n2", "lab-app-2": "n2", "lab-app-3": "n2"})   # stays put
+            self.assertEqual(sorted(ct.stack_rm("lab")["containers"]), ["lab-app-1", "lab-app-2", "lab-app-3"])
+            self.assertEqual((self.engines["n2"].objects, ct._nodes()["placement"]), ({}, {}))
+
+    def test_frozen_node_hiccups_and_copies(self):
+        """Review: a node not answering is left alone for two passes, down at the third; a copy removed on its
+        return keeps the replica's state on this host; one replica's error does not stop the pass."""
+        with unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"):
+            self.cli("node", "add", "n1"); self.cli("node", "add", "n2")
+            ct.apply({"stack": "lab", "services": {"app": {"image": "alpine:3.20", "replicas": 2, "spread": "nodes"}}})
+            self.frozen = {"n1"}                                                    # VM runs, its agent is silent
+            for _ in range(2):
+                self.assertEqual([e for e in ct.reconcile("lab") if e["event"] == "failover"], [])
+            self.assertEqual([e["container"] for e in ct.reconcile("lab") if e["event"] == "failover"], ["lab-app-1"])
+            os.makedirs(os.path.join(ct.STORE, "lab-app-1"), exist_ok=True)
+            with open(os.path.join(ct.STORE, "lab-app-1", "want"), "w") as f:
+                f.write("stopped")                                                  # the user stopped the new copy
+            self.frozen = set()
+            out = ct.reconcile("lab")                                               # n1 back: its copy goes...
+            self.assertIn(("removed", "lab-app-1"), [(e["event"], e.get("container")) for e in out])
+            self.assertTrue(os.path.exists(os.path.join(ct.STORE, "lab-app-1", "want")))   # ...the state stays
+            self.refuse = {"n1": {"inspect"}}                                       # made, then not found
+            ct.apply({"stack": "lab", "services": {"app": {"image": "alpine:3.20", "replicas": 4, "spread": "nodes"}}})
+            kinds = [(e["event"], e.get("container")) for e in ct.events("lab", 50)]
+            self.assertIn(("reconcile_failed", "lab-app-3"), kinds)                 # one replica's error...
+            self.assertLess(kinds.index(("reconcile_failed", "lab-app-3")),         # ...and the pass went on
+                            max(i for i, k in enumerate(kinds) if k[1] == "lab-app-4"))
+
+    def test_pending_said_once_and_rm_forgets_placement(self):
+        with unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"):
+            self.cli("node", "add", "n1")
+            ct.apply({"stack": "db", "services": {"pg": {"image": "alpine:3.20", "node": "n1"}}})
+            self.vms["n1"] = "stopped"; self.engines["n1"].objects.clear()
+            self.assertEqual([e["event"] for e in ct.reconcile("db")], ["pending"])
+            self.assertEqual(ct.reconcile("db"), [])                                # not again every pass
+            self.vms["n1"] = "running"
+            ct.reconcile("db")
+            with ct.on_node("n1"):
+                quiet(ct.rm, "db-pg-1")                                             # as the web or MCP would
+            self.assertEqual(ct._nodes()["placement"], {})
+
+    def test_pinned_node_down_waits(self):
+        with unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"):
+            self.cli("node", "add", "n1")
+            ct.apply({"stack": "db", "services": {"pg": {"image": "alpine:3.20", "node": "n1"}}})
+            self.assertIn("tct-db-pg-1", self.engines["n1"].objects)
+            self.vms["n1"] = "stopped"
+            self.engines["n1"].objects.clear()                                                      # gone with it
+            out = ct.reconcile("db")
+            self.assertEqual([e["event"] for e in out], ["pending"])                                # never moved
+            self.assertEqual(self.local.objects, {})
+        for bad in ({"node": "n1", "spread": "nodes"}, {"node": "n1", "desktop": True},
+                    {"spread": "nodes", "networks": ["back"]}, {"spread": "all"}):
+            with self.assertRaises(SystemExit, msg=bad):
+                ct.check_stack({"stack": "x", "services": {"a": bad}})
+
     def test_engine_errors_and_free_space(self):
         n = ct.NodeVM("n1")
         with self.assertRaisesRegex(SystemExit, "no such object"):
@@ -925,6 +1005,11 @@ class Nodes(unittest.TestCase):
         self.assertEqual(n.run(["inspect", "--type", "container", "tct-x"], check=False).returncode, 1)
         self.assertEqual(n.free_bytes("/var/lib/docker"), 10485760 * 1024)
         self.assertEqual(n.host(), (8, 16.0, ct.STORE))
+        with open(os.path.join(ct.STORE, "quota.json"), "w") as f:
+            json.dump({"cpus": 1, "memory_gb": 1}, f)                                 # the host's quota file
+        with ct.on_node("n1"):
+            limits, set_ = ct.quota_limits({})
+        self.assertEqual((limits["cpus"], limits["memory_gb"], set_["cpus"]), (8, 16, False))  # the node's own size
         with self.assertRaisesRegex(SystemExit, "come later"):
             n.pipe(["cp"])
 

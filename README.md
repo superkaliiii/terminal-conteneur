@@ -84,8 +84,16 @@ of a VM, the lightness of containers inside it.
 - terminal-ct stays on the host and decides: each engine call is `docker ...` run in the node by its guest agent
   (`terminal-vm exec`), no network port opened, nothing listening (about 0.15 s per call; a command takes about 1 s).
 - `node rm NAME` refuses while containers live there; `--force` removes them first (their `/data` with them).
-- Not yet in a node: desktops, file copies, snapshots and clones (later steps of phase 9), and the
-  host's `ls`/dashboard listing nodes' containers.
+- `ls`, `stack show`, the dashboards and the MCP `ct_list` show the nodes' containers too (field `node`); MCP and
+  web actions on one go to its node.
+- Quota in a node: the node's own size (all its CPUs and memory); the host's quota file does not apply there,
+  terminal-vm's quota already fences the node's VM.
+- Stacks: a service with `"node": "N"` keeps all its replicas there (none made elsewhere while N is down: `pending`);
+  `"spread": "nodes"` spreads them over the running nodes, the least loaded first, and moves a node's replicas to
+  another when it is down (`failover` events; their `/data` does not follow). When the node is back, the copies left
+  there are removed. Real run (WSL, two Alpine nodes, 3 replicas): node killed, its 2 replicas made again and running
+  on the other in 23 s; old copies gone at its return. Not yet with desktops or isolated networks.
+- Not yet in a node: desktops, file copies, snapshots and clones (later steps of phase 9).
 
 ## Desktops
 
