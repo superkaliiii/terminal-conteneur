@@ -4,11 +4,11 @@ Containers with a desktop and a shell, for people and computer-use agents. The c
 [terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm): same command and
 MCP shape, independent of it (each installs and works alone), and able to show its VMs when both are installed.
 
-Status: **phase 6** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
+Status: **phase 7** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
 screen tools, terminal viewer, quota and live resources, isolated networks, sandboxes, and an MCP server that
-manages containers under agent-authority rules; snapshots, clones and file copies; stacks kept in their desired state by a daemon (replicas, restarts, health
-probes, ttl, events); a terminal dashboard and its text for agents. The web dashboard (desired state, restarts, replicas) and
-dashboards (terminal and web) come next.
+manages containers under agent-authority rules; snapshots, clones and file copies; stacks kept in their desired
+state by a daemon (replicas, restarts, health probes, ttl, events); a terminal dashboard and its text for agents;
+a web dashboard (containers and terminal-vm's VMs). Documentation, CI and measurements come next.
 
 ## Requirements
 
@@ -104,6 +104,21 @@ Windows Terminal (keys through msvcrt there). `logs NAME [-n 100]` prints a cont
 
 Agents get the same view as text with the MCP tool `dashboard` (only their project with `--project`), and a
 container's output with `ct_logs` (one of the user's containers needs approval).
+
+### Web dashboard
+
+`terminal-ct web [--project P] [--no-open]` starts the daemon if needed and opens its dashboard in the browser:
+containers (state, health, stack, CPU and memory with a short history, age, restarts; start, stop, restart, logs,
+remove), screen thumbnails of running desktops and VMs (click: a larger, refreshed view), terminal-vm's VMs (start,
+stop, force stop), stacks (running / wanted per service, -/+ replicas, an editor that applies the JSON, remove),
+the quota and the latest events. From WSL it opens the Windows browser (WSL forwards 127.0.0.1 ports).
+
+- Served by the daemon on 127.0.0.1 only, port `TERMINAL_CT_WEB_PORT` (default 7171; another free port if taken).
+- Every API call needs the token of `STORE/web.token` (owner only, kept across restarts): `web` puts it in the URL
+  fragment, the page keeps it for the tab and removes it from the address bar. Other Host names are refused.
+- VMs come from terminal-vm's JSON CLI (`ls`, `top`, `action NAME screenshot`, `start`, `stop`): on the PATH, or
+  `TERMINAL_VM="python3 /path/terminal_vm.py"` in the daemon's environment. Without it, the VM section is empty.
+- The quota is fetched apart every 15 s (measuring the disk takes seconds with Podman); the table every 2 s.
 
 ## Snapshots and clones
 

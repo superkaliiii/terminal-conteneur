@@ -1,4 +1,4 @@
-import contextlib, io, json, os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest, unittest.mock, zlib
+import contextlib, io, json, os, shutil, socket, struct, subprocess, sys, tempfile, threading, time, unittest, unittest.mock, zlib
 
 import terminal_ct as ct
 
@@ -590,6 +590,164 @@ class Dashboard(unittest.TestCase):
             ct.agent_call("ct_logs", {"name": "mine"}, lambda m, c: (_ for _ in ()).throw(RuntimeError(c)))
         self.assertEqual(ct._age(None), "-"); self.assertEqual([ct._age(s) for s in (5, 300, 7300, 200000)],
                                                                ["5s", "5m", "2h", "2d"])
+
+
+class Web(unittest.TestCase):
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct._NODES, ct._VM_CACHE = {"docker": self.n}, {}                                    # stacks name their engine
+        ct.STORE = tempfile.mkdtemp()
+        self.p = unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test")
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_api(self):
+        api = lambda m, path, q=None, body=None: ct.web_api(m, path, q or {}, body)[1]
+        api("POST", "/api/do", body={"op": "apply", "stack": {"stack": "lab", "services": {"web": {"image": "alpine:3.20"}}}})
+        quiet(ct.create, "solo", project="other")
+        d = api("GET", "/api/state")
+        self.assertEqual([r["name"] for r in d["rows"]], ["lab-web-1", "solo"])
+        self.assertEqual(d["stacks"][0]["services"], {"web": {"replicas": 1, "image": "alpine:3.20"}})
+        self.assertIsNone(d["quota"])                                                      # apart: it is slow
+        qd = api("GET", "/api/quota")
+        self.assertIn("other", qd["projects"]); self.assertIn("cpus", qd["quota"])
+        self.assertEqual(api("GET", "/api/quota", {"project": "other"})["quota"]["cpus"]["used"], 0)
+        self.assertEqual([r["name"] for r in api("GET", "/api/state", {"project": "other"})["rows"]], ["solo"])
+        self.assertEqual(api("GET", "/api/state", {"project": "other"})["stacks"], [])      # lab is in default
+        self.assertEqual(api("GET", "/api/stack", {"name": "lab"})["desired"],
+                         {"stack": "lab", "services": {"web": {"image": "alpine:3.20", "replicas": 1, "restart": "always"}}})
+        self.assertEqual(api("GET", "/api/logs", {"name": "solo", "n": "2"}), b"line 0\nline 1\n")
+        self.assertEqual(api("POST", "/api/do", body={"op": "start", "name": "solo"}), {"started": "solo"})
+        self.assertEqual(api("POST", "/api/do", body={"op": "restart", "name": "solo"}), {"started": "solo"})
+        self.assertEqual(self.n.objects["tct-solo"]["State"]["Status"], "running")
+        self.assertEqual(api("POST", "/api/do", body={"op": "stop", "name": "solo"}), {"stopped": "solo"})
+        self.assertEqual(ct.wanted("solo"), "stopped")                                     # resume leaves it
+        api("POST", "/api/do", body={"op": "scale", "stack": "lab", "service": "web", "replicas": 2})
+        self.assertIn("tct-lab-web-2", self.n.objects)
+        self.assertEqual(api("POST", "/api/do", body={"op": "rm", "name": "solo"}), {"removed": "solo"})
+        self.assertEqual(api("POST", "/api/do", body={"op": "stack_rm", "stack": "lab"})["removed"], "lab")
+        self.assertEqual(self.n.objects, {})
+        for bad in ({"op": "rm", "name": "../x"}, {"op": "format"}, {"kind": "vm", "op": "rm", "name": "wn"},
+                    {"kind": "vm", "op": "start", "name": "-x"}):
+            with self.assertRaises((SystemExit, ValueError)):
+                api("POST", "/api/do", body=bad)
+        with self.assertRaises(SystemExit):
+            api("GET", "/api/state", {"project": "Bad Name"})
+        with self.assertRaises(ct.NoRoute):
+            api("GET", "/api/nothing")
+        with self.assertRaises(SystemExit):                                                 # project checked
+            api("POST", "/api/do", body={"op": "apply", "project": "Bad/../x",
+                                         "stack": {"stack": "b", "services": {"s": {"image": "alpine:3.20"}}}})
+        with unittest.mock.patch.object(ct, "act", lambda n, t, a: (b"PNG" + n.encode(), (1, 1))):
+            self.assertEqual(ct.web_api("GET", "/api/shot", {"name": "lab-web-1"}), ("image/png", b"PNGlab-web-1"))
+
+    def test_vms_through_terminal_vm(self):
+        fake = os.path.join(ct.STORE, "fake_vm.py")
+        with open(fake, "w") as f:
+            f.write("import json, sys\na = sys.argv[1:]\n"
+                    "if a[0] == 'ls': print(json.dumps([{'name': 'wn', 'status': 'running', 'project': 'default', "
+                    "'memory_gb': 4}, {'name': 'deb', 'status': 'stopped', 'project': 'lab'}], indent=1))\n"
+                    "elif a[0] == 'top': print(json.dumps({'vms': [{'name': 'wn', 'cpu_percent': 7, 'host_memory_gb': 3.1}]}))\n"
+                    "elif a[0] == 'action': open(a[a.index('--output') + 1], 'wb').write(b'PNGVM'); print('{}')\n"
+                    "elif a[0] == 'start': print('booting'); print(json.dumps({'started': a[1]}))\n"
+                    "elif a[0] == 'stop' and a[1] == 'wn': print(json.dumps({'stopped': a[1:]}))\n"
+                    "else: sys.stderr.write(json.dumps({'error': 'no such VM'}) + '\\n'); sys.exit(1)\n")
+        with unittest.mock.patch.dict(os.environ, {"TERMINAL_VM": f'"{sys.executable}" "{fake}"'}):
+            v = ct.vm_state()
+            self.assertIs(ct.vm_state(), v)                                                  # cached: one call for all tabs
+            self.assertEqual([(m["name"], m.get("cpu_percent")) for m in v["vms"]], [("wn", 7), ("deb", None)])
+            self.assertEqual([m["name"] for m in ct.vm_state("lab")["vms"]], ["deb"])
+            self.assertEqual(ct.web_api("GET", "/api/shot", {"kind": "vm", "name": "wn"}), ("image/png", b"PNGVM"))
+            self.assertEqual(os.listdir(os.path.join(ct.STORE, "web")), [])                 # temporary file removed
+            self.assertEqual(ct.web_api("POST", "/api/do", {}, {"kind": "vm", "op": "start", "name": "wn"})[1],
+                             {"started": "wn"})                                              # progress lines skipped
+            self.assertEqual(ct.web_api("POST", "/api/do", {}, {"kind": "vm", "op": "force_stop", "name": "wn"})[1],
+                             {"stopped": ["wn", "--force"]})
+            with self.assertRaisesRegex(RuntimeError, "no such VM"):
+                ct.web_api("POST", "/api/do", {}, {"kind": "vm", "op": "stop", "name": "zz"})
+        with unittest.mock.patch.dict(os.environ, {"TERMINAL_VM": ""}), \
+                unittest.mock.patch.object(ct.shutil, "which", lambda e: None):
+            ct._VM_CACHE.clear()
+            self.assertEqual(ct.vm_state()["vms"], [])                                       # alone: no VM section
+
+    def test_http_server(self):
+        threading.Thread(target=ct.web_serve, args=(0,), daemon=True).start()
+        for _ in range(100):
+            if os.path.exists(ct._daemon_file("web")):
+                break
+            time.sleep(0.05)
+        with open(ct._daemon_file("web")) as f:
+            port = json.load(f)["port"]
+        token = ct.web_token()
+        self.assertEqual(token, ct.web_token())                                              # kept
+
+        def call(path, method="GET", headers=None, body=None):
+            import http.client
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.request(method, path, body=body, headers=headers or {})
+            r = c.getresponse()
+            return r.status, r.read()
+        status, page = call("/")
+        self.assertEqual(status, 200); self.assertIn(b"terminal-ct", page)
+        self.assertNotIn(token.encode(), page)                                               # the page holds no secret
+        self.assertEqual(call("/api/state")[0], 401)
+        self.assertEqual(call("/api/state", headers={"X-Token": "wrong"})[0], 401)
+        self.assertEqual(call("/", headers={"Host": "evil.example:80"})[0], 403)             # DNS rebinding
+        status, body = call("/api/state", headers={"X-Token": token})
+        self.assertEqual((status, json.loads(body)["engine"]), (200, "docker"))
+        status, body = call("/api/do", "POST", {"X-Token": token, "Content-Type": "application/json"},
+                            b'{"op": "start", "name": "nobody"}')
+        self.assertEqual(status, 400); self.assertIn("nobody", json.loads(body)["error"])   # the server goes on
+        status, body = call("/api/do", "POST", {"X-Token": token, "Content-Type": "text/plain"}, b'{"op": "rm"}')
+        self.assertIn("Content-Type", json.loads(body)["error"])                             # no simple request
+        with open(os.path.join(ct.STORE, "web.token"), "w"):                                 # cut short by a crash
+            pass
+        self.assertEqual(call("/api/state", headers={"X-Token": ""})[0], 401)                # never "" == ""
+        token = ct.web_token()
+        self.assertEqual(len(token), 32)
+        self.assertEqual(call("/api/state", headers={"X-Token": token})[0], 200)
+        self.assertEqual(call("/api/state", headers={"X-Token": "été"})[0], 401)  # not ASCII: refused
+        self.assertEqual(call("/api/nothing", headers={"X-Token": token})[0], 404)
+        self.assertEqual(call("/api/state", headers={"X-Token": token})[0], 200)
+
+    def test_threads_capture_their_own_output(self):
+        out = {}
+
+        def work(i):
+            for _ in range(200):
+                buf = io.StringIO()
+                with ct.captured(buf):
+                    print(i)
+                    time.sleep(0)
+                if buf.getvalue() != f"{i}\n":
+                    out[i] = buf.getvalue()
+        ts = [threading.Thread(target=work, args=(i,)) for i in range(4)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        self.assertEqual(out, {})
+
+    def test_stack_calls_on_the_stacks_engine(self):
+        pod = FakeNode("podman")
+        ct._NODES["podman"] = pod
+        ct._LOCAL.node = pod
+        try:
+            ct.apply({"stack": "lab", "services": {"web": {"image": "alpine:3.20"}}})        # applied on podman
+        finally:
+            ct._LOCAL.node = None
+        ct.web_api("POST", "/api/do", {}, {"op": "scale", "stack": "lab", "service": "web", "replicas": 2})
+        self.assertEqual((sorted(pod.objects), self.n.objects), (["tct-lab-web-1", "tct-lab-web-2"], {}))
+        ct.web_api("POST", "/api/do", {}, {"op": "apply", "stack": {"stack": "lab", "services": {"web": {"image": "alpine:3.20"}}}})
+        self.assertEqual(ct.load_stack("lab")["engine"], "podman")                           # not moved to docker
+        ct.web_api("POST", "/api/do", {}, {"op": "stack_rm", "stack": "lab"})
+        self.assertEqual(pod.objects, {})
+
+    def test_reconciler_engine_is_its_threads(self):
+        seen = []
+        t = threading.Thread(target=lambda: (setattr(ct._LOCAL, "node", FakeNode("podman")), seen.append(ct.node().engine)))
+        t.start(); t.join()
+        self.assertEqual((seen, ct.node().engine), (["podman"], "docker"))
 
 
 class SnapshotsAndClones(unittest.TestCase):

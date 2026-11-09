@@ -26,6 +26,8 @@ labels; containers without them are never touched.
   apply FILE [--project P] | scale STACK SERVICE N | stack ls|show|rm [STACK] | events [--stack S] [-n 50] [--follow]
   daemon run|start|stop|status | prune      desired state kept by the daemon (restarts, health, ttl); stale images
   dash [--project P]  |  logs NAME [-n 100]    live dashboard (keys: s start, t stop, r rm, +/- scale, l logs, v view)
+  web [--project P] [--no-open]   web dashboard (containers, terminal-vm's VMs, screens, stacks), served by the
+                      daemon on 127.0.0.1 (TERMINAL_CT_WEB_PORT, default 7171) behind a token; opens the browser
   snapshot NAME save|load|rm TAG | snapshot NAME ls     file system + /data (load: stopped container)
   clone SRC NEW [--project P]                          NEW from SRC as it is (files and a copy of /data)
   push NAME LOCAL PATH | pull NAME PATH LOCAL          copy files in or out
@@ -34,11 +36,12 @@ labels; containers without them are never touched.
   image ls | image pull REF | image build NAME DIR | image rm NAME
 Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if installed, else docker).
 """
-import argparse, base64, calendar, collections, contextlib, hashlib, io, json, os, queue, re, secrets, shlex, shutil, socket, struct, \
-    subprocess, sys, threading, time, zlib
+import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, queue, re, secrets, shlex, shutil, \
+    socket, struct, subprocess, sys, threading, time, urllib.parse, webbrowser, zlib
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 WINDOWS = os.name == "nt"
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {}  # the daemon has no console: no flash
 if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
 _DATA = os.environ.get("LOCALAPPDATA", os.path.expanduser("~")) if WINDOWS else \
@@ -84,9 +87,14 @@ class Node:
             # WSL's kernel lacks nftables pieces netavark needs: a bridge container failed to start ("nft did not
             # return successfully"). Its iptables driver works; set for terminal-ct's own calls only.
             os.makedirs(STORE, exist_ok=True)
-            conf = os.path.join(STORE, "podman-wsl.conf")
-            with open(conf, "w") as f:
-                f.write('[network]\nfirewall_driver = "iptables"\n')
+            conf, text = os.path.join(STORE, "podman-wsl.conf"), '[network]\nfirewall_driver = "iptables"\n'
+            try:
+                with open(conf) as f:
+                    same = f.read() == text
+            except OSError:
+                same = False
+            if not same:  # atomic: a podman call of another thread must never read it half written
+                _write_atomic(conf, text)
             os.environ["CONTAINERS_CONF_OVERRIDE"] = conf
 
     def host(self):
@@ -106,7 +114,7 @@ class Node:
     def run(self, args, check=True, timeout=None, capture=True):
         # uncaptured output (pull, build progress) goes to stderr: stdout is the JSON reply, or the MCP channel
         r = subprocess.run([self.engine, *args], text=True, timeout=timeout, encoding="utf-8", errors="replace",
-                           **({"capture_output": True} if capture else {"stdout": sys.stderr}))
+                           **({"capture_output": True} if capture else {"stdout": sys.stderr}), **NO_WINDOW)
         if check and r.returncode:
             raise SystemExit((r.stderr or r.stdout or f"{self.engine} {args[0]} failed").strip())
         return r
@@ -120,16 +128,29 @@ class Node:
         with open(stdin, "rb") if stdin else contextlib.nullcontext() as i, \
                 open(stdout, "wb") if stdout else contextlib.nullcontext() as o:
             r = subprocess.run([self.engine, *args], stdin=i or subprocess.DEVNULL, stdout=o or subprocess.DEVNULL,
-                               stderr=subprocess.PIPE)
+                               stderr=subprocess.PIPE, **NO_WINDOW)
         if r.returncode:
             raise SystemExit(r.stderr.decode("utf-8", "replace").strip() or f"{self.engine} {args[0]} failed")
 
 
 NODE = None
+_LOCAL = threading.local()  # .node: a thread working on one stack, on that stack's engine (not the others')
+_NODES = {}
+
+
+def node_for(engine):
+    """One Node per engine (its host facts cached), for the daemon's stacks; None: the default engine."""
+    if not engine:
+        return None
+    if engine not in _NODES:
+        _NODES[engine] = Node(engine)
+    return _NODES[engine]
 
 
 def node():
     global NODE
+    if getattr(_LOCAL, "node", None):
+        return _LOCAL.node
     if NODE is None:
         NODE = Node()
     return NODE
@@ -1154,7 +1175,7 @@ def _replace(tmp, path):
 
 
 def _write_atomic(path, text):
-    tmp = f"{path}.{os.getpid()}.new"  # one per writer: two writers never share it
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.new"  # one per writer (threads of the daemon too)
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     _replace(tmp, path)
@@ -1246,7 +1267,7 @@ def reconcile(name, now=None):
 
 
 def _rm_quiet(name, keep_data=False):
-    with contextlib.redirect_stdout(io.StringIO()):
+    with captured(io.StringIO()):
         if not keep_data:
             return rm(name)
         node().run(["rm", "-f", PREFIX + name])  # the replica remade: same name, same /data
@@ -1288,7 +1309,7 @@ def _reconcile(s, st, now):
                     ev("create_failed", svc, cname, f"network {blocked!r} is the user's: apply the stack again "
                                                     "so they can approve it"); continue
                 try:
-                    with contextlib.redirect_stdout(io.StringIO()):
+                    with captured(io.StringIO()):
                         create(cname, c.get("image") or DEFAULT_IMAGE, c.get("cpus"), c.get("memory_gb"), c.get("cmd"),
                                created_by=owner, desktop=bool(c.get("desktop")), width=int(c.get("width", 1280)),
                                height=int(c.get("height", 800)), sandbox=bool(c.get("sandbox")),
@@ -1331,7 +1352,7 @@ def _reconcile(s, st, now):
             if now < mem.get("next", 0):
                 continue  # backing off
             try:
-                with contextlib.redirect_stdout(io.StringIO()):
+                with captured(io.StringIO()):
                     start(cname)
             except SystemExit as e:
                 mem["fails"] = mem.get("fails", 0) + 1
@@ -1394,7 +1415,7 @@ def apply(s, created_by="user", project=None, approved_networks=()):
     Applying again also runs again the replicas whose ttl had expired."""
     s = check_stack(s)
     if project:
-        s["project"] = project
+        s["project"] = check_project(project)
     with quota_lock("stacks"):
         path = os.path.join(stacks_dir(), s["stack"] + ".json")
         if os.path.isfile(path):
@@ -1433,7 +1454,13 @@ def scale(stack, service, replicas):
         s = dict(check_stack(s), **keep)
         _save_stack(s)
     event("scaled", stack, service, detail=f"{replicas} replicas")
-    return {"stack": stack, "service": service, "replicas": replicas, "events": reconcile(stack)}
+    try:
+        out = reconcile(stack)
+    except SystemExit as e:  # saved: the daemon reconciles it at its next pass
+        if "lock" not in str(e):
+            raise
+        out = [{"event": "queued", "detail": "the daemon is busy; it reconciles this stack at its next pass"}]
+    return {"stack": stack, "service": service, "replicas": replicas, "events": out}
 
 
 def stack_show(name):
@@ -1533,7 +1560,6 @@ def daemon(cmd="status"):
         return "started"
     if cmd != "run":
         raise SystemExit("daemon run|start|stop|status")
-    global NODE
     with quota_lock("daemon"):  # a second daemon waits, then gives up: one per store
 
         def beat():  # its own thread: a long pass (a desktop image build) must not make the daemon look dead
@@ -1544,12 +1570,13 @@ def daemon(cmd="status"):
                     print(f"{time.strftime('%H:%M:%S')} beat: {e}", file=sys.stderr, flush=True)
                 time.sleep(TICK)
         threading.Thread(target=beat, daemon=True).start()
+        threading.Thread(target=web_serve, daemon=True).start()
         event("daemon_started", detail=f"pid {os.getpid()}")
         while not os.path.exists(_daemon_file("stop")):
             for name in stacks():
                 try:
                     s = load_stack(name)
-                    NODE = Node(s.get("engine")) if s.get("engine") else NODE  # each stack on the engine it was applied to
+                    _LOCAL.node = node_for(s.get("engine"))  # each stack on the engine it was applied to
                     reconcile(name)
                     probe(s)
                 except (SystemExit, Exception) as e:  # one broken stack must not stop the others
@@ -1558,6 +1585,8 @@ def daemon(cmd="status"):
         with contextlib.suppress(OSError):
             os.remove(_daemon_file("stop"))
             os.remove(_daemon_file("beat"))
+        with contextlib.suppress(OSError):
+            os.remove(_daemon_file("web"))
         event("daemon_stopped")
 
 
@@ -1606,17 +1635,23 @@ def dashboard_data(project=None, with_quota=True):
                                                       ("I", n["internet"]), ("A", n["created_by"] == "agent")) if on)})
     q = None
     if with_quota:
-        q = quota()
-        if project:  # its own use, and what is left all told
-            use = {"cpus": 0, "memory_gb": 0, "containers": 0}
-            for c in infos:
-                if running(c):
-                    cpus, m = allotted(c)
-                    use["cpus"] += cpus; use["memory_gb"] += m; use["containers"] += 1
-            q = {k: {"limit": v["limit"], "free": v["free"], "used": round(use[k], 1) if k in use else "-"}
-                 for k, v in q.items()}
+        q = project_quota(project, infos)
     return {"engine": node().engine, "daemon": daemon_alive(), "project": project, "rows": sorted(rows, key=lambda r: r["name"]),
             "quota": q, "events": events(n=8, project=project)}
+
+
+def project_quota(project, infos):
+    """The quota; for a project (infos: its containers), its own use next to what is left all told."""
+    q = quota()
+    if project:
+        use = {"cpus": 0, "memory_gb": 0, "containers": 0}
+        for c in infos:
+            if running(c):
+                cpus, m = allotted(c)
+                use["cpus"] += cpus; use["memory_gb"] += m; use["containers"] += 1
+        q = {k: {"limit": v["limit"], "free": v["free"], "used": round(use[k], 1) if k in use else "-"}
+             for k, v in q.items()}
+    return q
 
 
 _COLOURS = {"running": "32", "created": "33", "paused": "33", "exited": "31", "unhealthy": "31", "ok": "32"}
@@ -1813,6 +1848,524 @@ def dash(project=None, refresh=2.0):
         stop_.set()
         out.write("\x1b[?25h\x1b[?1049l"); out.flush()
         restore()
+
+
+# ---------- web dashboard: served by the daemon on 127.0.0.1, behind a token ----------
+# GET / is the page (no data in it); every /api/ call needs the X-Token header, which a cross-site page cannot set
+# without a CORS preflight this server never grants, and a Host header naming this server (DNS rebinding).
+WEB_PORT = int(os.environ.get("TERMINAL_CT_WEB_PORT") or 7171)
+_VM_NAME = re.compile(r"\w[\w.-]{0,63}")
+
+
+def web_token():
+    """The dashboard's token (STORE/web.token, owner only): kept across daemon restarts, so open tabs go on."""
+    path = os.path.join(STORE, "web.token")
+    with contextlib.suppress(OSError):
+        with open(path) as f:
+            t = f.read().strip()
+        if len(t) >= 32:
+            return t
+    # missing, or cut short (a crash while writing): an empty token would let any request in
+    os.makedirs(STORE, exist_ok=True)
+    t, tmp = secrets.token_urlsafe(24), f"{path}.{os.getpid()}.{threading.get_ident()}.new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(t)
+    _replace(tmp, path)
+    return t
+
+
+def vm_cli():
+    """terminal-vm's command (TERMINAL_VM, e.g. "python3 /path/terminal_vm.py", else on the PATH), or None."""
+    if os.environ.get("TERMINAL_VM"):
+        return [a.strip('"') for a in shlex.split(os.environ["TERMINAL_VM"], posix=not WINDOWS)]  # Windows paths keep their backslashes
+    exe = shutil.which("terminal-vm")
+    return [exe] if exe else None
+
+
+def vm_call(args, timeout=60):
+    cli = vm_cli()
+    if not cli:
+        raise RuntimeError("terminal-vm not found: put it on the PATH, or set TERMINAL_VM")
+    r = subprocess.run(cli + args, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
+                       **NO_WINDOW)
+    if r.returncode:
+        err = (r.stderr or r.stdout).strip()
+        with contextlib.suppress(ValueError, AttributeError):
+            err = json.loads(err.splitlines()[-1])["error"]
+        raise RuntimeError(err or f"terminal-vm {args[0]} failed")
+    out = r.stdout.strip()
+    try:
+        return json.loads(out) if out else {}
+    except ValueError:  # progress lines first: the reply is the last one
+        return json.loads(out.splitlines()[-1])
+
+
+_VM_CACHE = {}  # project: (time, reply): several tabs, one terminal-vm call every few seconds
+
+
+def vm_state(project=None, max_age=3):
+    hit = _VM_CACHE.get(project)
+    if hit and time.time() - hit[0] < max_age:
+        return hit[1]
+    out = _vm_state(project)
+    _VM_CACHE[project] = (time.time(), out)
+    return out
+
+
+def _vm_state(project=None):
+    """terminal-vm's VMs (ls), with the real use of the running ones (top). terminal-vm runs on the daemon's side
+    (both in WSL, or both on the host): screenshots go through a file path of that side."""
+    if not vm_cli():
+        return {"vms": [], "note": "terminal-vm not found (PATH or TERMINAL_VM)"}
+    try:
+        vms = [v for v in vm_call(["ls"]) if under(v.get("project") or DEFAULT_PROJECT, project)]
+        if any(v.get("status") not in (None, "stopped") for v in vms):
+            use = {v["name"]: v for v in vm_call(["top"]).get("vms", [])}
+            for v in vms:
+                v.update({k: use.get(v["name"], {}).get(k) for k in ("cpu_percent", "host_memory_gb")})
+        return {"vms": vms}
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+        return {"vms": [], "note": f"terminal-vm: {e}"}
+
+
+def vm_screenshot(name):
+    if not _VM_NAME.fullmatch(name or ""):
+        raise ValueError(f"invalid VM name {name!r}")
+    os.makedirs(os.path.join(STORE, "web"), exist_ok=True)
+    path = os.path.join(STORE, "web", f"vm-{name}.{threading.get_ident()}.png")  # one per request: two tabs at once
+    try:
+        vm_call(["action", name, "screenshot", "--output", path], timeout=20)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
+class NoRoute(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def on_stack_engine(stack):
+    """Run a stack call on the engine the stack was applied to (not the daemon's default one)."""
+    try:
+        engine = load_stack(stack).get("engine") if isinstance(stack, str) else None
+    except SystemExit:
+        engine = None
+    _LOCAL.node = node_for(engine)
+    try:
+        yield
+    finally:
+        _LOCAL.node = None
+
+
+def web_api(method, path, q, body=None):
+    """One dashboard call: (content type, bytes or a JSON-able value). Raises on a bad request."""
+    project = q.get("project") or None
+    if project:
+        check_project(project)
+    if method == "GET" and path == "/api/state":
+        d = dashboard_data(project, with_quota=False)  # the quota measures the disk (seconds): /api/quota
+        d["stacks"] = []
+        for n in stacks():
+            with contextlib.suppress(SystemExit):
+                s = load_stack(n)
+                if under(s.get("project") or DEFAULT_PROJECT, project):
+                    d["stacks"].append({"stack": n, "project": s.get("project") or DEFAULT_PROJECT,
+                                        "created_by": s.get("created_by", "user"),
+                                        "services": {k: {"replicas": v.get("replicas", 1), "image": v.get("image")}
+                                                     for k, v in s["services"].items()}})
+        return "application/json", d
+    if method == "GET" and path == "/api/quota":
+        infos = raw_containers()
+        names = {DEFAULT_PROJECT} | {labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT for c in infos}
+        if os.path.isdir(os.path.join(STORE, "projects")):
+            names |= {d.replace("+", "/") for d in os.listdir(os.path.join(STORE, "projects"))}
+        mine = [c for c in infos if under(labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT, project)]
+        return "application/json", {"quota": project_quota(project, mine), "projects": sorted(names)}
+    if method == "GET" and path == "/api/vms":
+        return "application/json", vm_state(project)
+    if method == "GET" and path == "/api/shot":
+        name = q.get("name", "")
+        if q.get("kind") == "vm":
+            return "image/png", vm_screenshot(name)
+        return "image/png", act(check_name(name), "screenshot", {})[0]
+    if method == "GET" and path == "/api/logs":
+        return "text/plain; charset=utf-8", logs(check_name(q.get("name", "")), int(q.get("n") or 200)).encode()
+    if method == "GET" and path == "/api/stack":
+        s = load_stack(q.get("name", ""))
+        with on_stack_engine(s["stack"]):
+            return "application/json", {"desired": {k: s[k] for k in ("stack", "project", "services") if k in s},
+                                        "status": stack_show(s["stack"])}
+    if method == "GET" and path == "/api/events":
+        return "application/json", events(q.get("stack") or None, int(q.get("n") or 50), project)
+    if method == "POST" and path == "/api/do":
+        if not isinstance(body, dict):
+            raise ValueError("a JSON object")
+        op, name = body.get("op"), body.get("name") or ""
+        if body.get("kind") == "vm":
+            if op not in ("start", "stop", "force_stop") or not _VM_NAME.fullmatch(name):
+                raise ValueError("VMs: start, stop or force_stop, and a VM name")
+            out = vm_call(["stop", name, "--force"] if op == "force_stop" else [op, name], timeout=300)
+            _VM_CACHE.clear()  # the next refresh shows the new state at once (else: a second click on start)
+            return "application/json", out
+        if op in ("start", "stop", "restart", "rm"):
+            check_name(name)
+            if op in ("stop", "restart"):
+                out = quiet(stop, name)
+            if op in ("start", "restart"):
+                out = quiet(start, name)
+            return "application/json", quiet(rm, name) if op == "rm" else out
+        if op in ("scale", "apply", "stack_rm"):
+            stack = body.get("stack")
+            with on_stack_engine(stack.get("stack") if op == "apply" and isinstance(stack, dict) else stack):
+                if op == "scale":
+                    return "application/json", scale(stack or "", body.get("service", ""), int(body.get("replicas")))
+                if op == "apply":
+                    return "application/json", apply(stack, created_by="user", project=body.get("project") or None)
+                return "application/json", stack_rm(stack or "")
+        raise ValueError(f"unknown op {op!r}")
+    raise NoRoute(path)
+
+
+class _WebServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = not WINDOWS  # on Windows it lets a second process bind the same port
+    allow_reuse_port = False  # never share the port with another store's daemon
+
+
+class _WebHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "terminal-ct"
+    timeout = 30  # a client stalling mid-request frees its thread
+
+    def log_message(self, *a):  # quiet: the daemon's log is for the reconciler
+        pass
+
+    def _send(self, code, ctype, body):
+        if not isinstance(body, bytes):
+            body = json.dumps(body).encode()
+        self.send_response(code)
+        for k, v in (("Content-Type", ctype), ("Content-Length", str(len(body))), ("Cache-Control", "no-store"),
+                     ("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"),
+                     ("Content-Security-Policy", "default-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; "
+                                                 "script-src 'unsafe-inline'; frame-ancestors 'none'")):
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle(self, method):
+        if self.headers.get("Host") not in self.server.hosts:
+            return self._send(403, "application/json", {"error": "unknown host"})
+        u = urllib.parse.urlsplit(self.path)
+        if method == "GET" and u.path == "/":
+            return self._send(200, "text/html; charset=utf-8", WEB_PAGE.encode())
+        given = self.headers.get("X-Token", "").encode("utf-8", "replace")
+        if not given or not secrets.compare_digest(given, web_token().encode()):
+            return self._send(401, "application/json", {"error": "token: open the dashboard with terminal-ct web"})
+        try:
+            body = None
+            if method == "POST":
+                if self.headers.get_content_type() != "application/json":  # no cross-site "simple" request
+                    raise ValueError("Content-Type must be application/json")
+                n = int(self.headers.get("Content-Length") or 0)
+                if not 0 <= n <= 2 ** 20:
+                    raise ValueError("body too large")
+                body = json.loads(self.rfile.read(n) or b"null")
+            ctype, out = web_api(method, u.path, dict(urllib.parse.parse_qsl(u.query)), body)
+            self._send(200, ctype, out)
+        except NoRoute:
+            self._send(404, "application/json", {"error": "not found"})
+        except (SystemExit, Exception) as e:  # a bad request or a failed action: the server goes on
+            self._send(400, "application/json", {"error": str(e) or type(e).__name__})
+
+    def do_GET(self):
+        self._handle("GET")
+
+    def do_POST(self):
+        self._handle("POST")
+
+
+def web_serve(port=None):
+    """Serve the dashboard until the process ends (a thread of the daemon); its port goes to STORE/daemon.web."""
+    try:
+        web_token()  # made now: the web command reads it once the port is up
+        try:
+            srv = _WebServer(("127.0.0.1", WEB_PORT if port is None else port), _WebHandler)
+        except OSError:  # taken: any free port (the web command reads it from the file)
+            srv = _WebServer(("127.0.0.1", 0), _WebHandler)
+        p = srv.server_address[1]
+        srv.hosts = {f"127.0.0.1:{p}", f"localhost:{p}"}
+        _write_atomic(_daemon_file("web"), json.dumps({"port": p, "pid": os.getpid()}))
+        srv.serve_forever()
+    except Exception as e:  # the dashboard down must not take the reconciler with it
+        print(f"{time.strftime('%H:%M:%S')} web: {e}", file=sys.stderr, flush=True)
+
+
+def web(open_browser=True, project=None):
+    """Start the daemon if needed, then open its dashboard in the browser; returns the URL (token included)."""
+    if project:
+        check_project(project)
+    if not daemon_alive():
+        daemon("start")
+    end = time.time() + 20
+    while True:
+        try:
+            with open(_daemon_file("web")) as f:
+                w = json.load(f)
+            with open(_daemon_file("beat")) as f:
+                if int(f.read().split()[1]) != w["pid"]:  # left by an earlier daemon
+                    raise ValueError("stale")
+            socket.create_connection(("127.0.0.1", w["port"]), 1).close()
+            break
+        except (OSError, ValueError, KeyError, IndexError):
+            if time.time() > end:
+                raise SystemExit("the daemon serves no dashboard (started by an older version?): "
+                                 "terminal-ct daemon stop, then terminal-ct web") from None
+            time.sleep(0.3)
+    url = f"http://127.0.0.1:{w['port']}/#t={web_token()}" + (f"&p={urllib.parse.quote(project)}" if project else "")
+    if open_browser:
+        with contextlib.suppress(OSError):
+            if in_wsl():  # the Windows browser: WSL forwards its 127.0.0.1 ports to Windows
+                subprocess.Popen(["rundll32.exe", "url.dll,FileProtocolHandler", url],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                webbrowser.open(url)
+    return {"url": url, "port": w["port"]}
+
+
+WEB_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>terminal-ct dashboard</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--fg:#1d2330;--mute:#6b7385;--line:#e2e5ea;--acc:#2f6fdb;--ok:#1f9d55;--warn:#c98a00;--bad:#d64545;--cpu:#2f6fdb;--mem:#8a4fd8}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--panel:#1a1f27;--fg:#e4e8ef;--mute:#8e97a8;--line:#2a313c;--acc:#6aa0ff;--ok:#3cc47c;--warn:#e0b040;--bad:#ff6b6b;--cpu:#6aa0ff;--mem:#b68cff}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+header h1{font-size:16px;margin:0}.chip{padding:2px 8px;border:1px solid var(--line);border-radius:10px;color:var(--mute);font-size:12px}
+main{padding:12px 16px;display:grid;gap:14px}section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow-x:auto}
+h2{font-size:14px;margin:0 0 8px;color:var(--mute);text-transform:uppercase;letter-spacing:.04em}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--mute);font-weight:500;font-size:12px}
+.running,.ok{color:var(--ok)}.created,.paused,.failing{color:var(--warn)}.exited,.unhealthy,.dead{color:var(--bad)}
+button{font:inherit;font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:5px;background:var(--bg);color:var(--fg);cursor:pointer;margin-right:3px}
+button:hover{border-color:var(--acc)}button.danger:hover{border-color:var(--bad);color:var(--bad)}button:disabled{opacity:.5;cursor:wait}
+.shots{display:flex;flex-wrap:wrap;gap:10px}.shot{width:240px;cursor:pointer}.shot img{width:100%;aspect-ratio:16/10;object-fit:contain;background:#000;border-radius:5px;display:block}
+.shot div{font-size:12px;color:var(--mute);margin-top:3px}canvas{vertical-align:middle;margin-right:4px}
+#msg{color:var(--mute);font-size:12px;min-height:1em}#msg.err{color:var(--bad)}
+textarea{width:100%;min-height:180px;font:12px ui-monospace,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:6px}
+.ev{font:12px ui-monospace,monospace;white-space:pre-wrap;max-height:220px;overflow:auto;margin:0}
+dialog{width:min(1100px,96vw);max-height:92vh;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--fg);padding:10px}
+dialog img{max-width:100%;max-height:78vh;display:block;margin:auto}dialog pre{max-height:76vh;overflow:auto;font:12px ui-monospace,monospace;white-space:pre-wrap}
+select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:5px}.mute{color:var(--mute)}
+</style></head><body>
+<header><h1>terminal-ct</h1><span id="engine" class="chip">…</span><span id="daemon" class="chip">daemon …</span>
+<label class="mute">project <select id="project"><option value="">all</option></select></label><span id="quota" class="mute"></span>
+<span id="msg"></span></header>
+<main>
+<section><h2>Screens</h2><div id="shots" class="shots"><span class="mute">no running desktop</span></div></section>
+<section><h2>Containers</h2><table><thead><tr><th>name</th><th>status</th><th>health</th><th>project</th><th>stack</th><th>CPU</th><th>memory</th><th>age</th><th>restarts</th><th>flags</th><th></th></tr></thead><tbody id="cts"></tbody></table></section>
+<section><h2>VMs (terminal-vm)</h2><table><thead><tr><th>name</th><th>os</th><th>status</th><th>project</th><th>CPU</th><th>memory</th><th></th></tr></thead><tbody id="vms"></tbody></table><div id="vmnote" class="mute"></div></section>
+<section><h2>Stacks</h2><table><thead><tr><th>stack</th><th>project</th><th>services (running / wanted)</th><th></th></tr></thead><tbody id="stacks"></tbody></table>
+<p><button id="new">new stack</button></p><div id="editor" hidden><textarea id="spec" spellcheck="false"></textarea><p><button id="apply">apply</button><button id="close">close</button></p></div></section>
+<section><h2>Events</h2><pre id="events" class="ev"></pre></section>
+</main>
+<dialog id="dlg"><p><b id="dlgtitle"></b> <button id="dlgclose" style="float:right">close</button></p><div id="dlgbody"></div></dialog>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const h = (tag, props, ...kids) => { const e = document.createElement(tag); Object.assign(e, props || {});
+  for (const k of kids) if (k != null) e.append(k instanceof Node ? k : String(k)); return e; };
+let token = sessionStorage.getItem("tct-token") || "";
+const frag = new URLSearchParams(location.hash.slice(1));
+if (frag.get("t")) { token = frag.get("t"); sessionStorage.setItem("tct-token", token); }
+if (frag.get("p")) sessionStorage.setItem("tct-project", frag.get("p"));
+history.replaceState(null, "", location.pathname);  // the token out of the address bar
+const hist = {}, HIST = 60; let last = null, shotTimer = 0, quotaBusy = false;
+const project = () => $("project").value;
+function msg(t, err) { $("msg").textContent = t; $("msg").className = err ? "err" : ""; }
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({headers: {"X-Token": token, "Content-Type": "application/json"}}, opts || {}));
+  if (!r.ok) { let e = r.status + ""; try { e = (await r.json()).error; } catch (_) {} throw new Error(e); }
+  return r;
+}
+const q = o => new URLSearchParams(Object.fromEntries(Object.entries(o).filter(([, v]) => v !== "" && v != null)));
+async function act(body, button, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  if (button) button.disabled = true;
+  const what = (body.op || "") + " " + (body.name || (body.stack && typeof body.stack === "object" ? body.stack.stack : body.stack) || "");
+  msg(what + " …");
+  try { const r = await (await api("/api/do", {method: "POST", body: JSON.stringify(body)})).json();
+    msg(what + ": done" + (r && r.desktop_ready != null ? " (desktop ready in " + r.desktop_ready + " s)" : "")); return r; }
+  catch (e) { msg(e.message, true); } finally { if (button) button.disabled = false; refresh(); }
+}
+function spark(values, max, colour) {
+  const c = h("canvas", {width: 70, height: 18}), x = c.getContext("2d");
+  x.strokeStyle = colour; x.lineWidth = 1.5; x.beginPath();
+  values.forEach((v, i) => { const px = i * 70 / (HIST - 1), py = 17 - Math.min(1, (v || 0) / (max || 1)) * 16;
+    i ? x.lineTo(px, py) : x.moveTo(px, py); });
+  x.stroke(); return c;
+}
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const age = s => s == null ? "-" : s < 120 ? Math.round(s) + "s" : s < 7200 ? Math.round(s / 60) + "m" : s < 172800 ? Math.round(s / 3600) + "h" : Math.round(s / 86400) + "d";
+function button(label, body, confirmText, cls) {
+  const b = h("button", {textContent: label, className: cls || ""}); b.onclick = () => act(body, b, confirmText); return b;
+}
+// the cells of buttons survive the refresh while their state is the same: rebuilt every 2 s, the button under the
+// pointer was replaced, and a click landing on the swap was lost
+function kept(tb) { const m = new Map(); for (const tr of tb.children) if (tr.cells_) m.set(tr.dataset.key, tr.cells_); return m; }
+function cell(prev, key, sig, make) {
+  const old = (prev.get(key) || {})[sig.split("|")[0]];
+  if (old && old.sig === sig) return old;
+  const td = h("td", null, ...make()); td.sig = sig; return td;
+}
+function keyed(key, cells, ...tds) { const tr = h("tr", null, ...tds); tr.dataset.key = key; tr.cells_ = cells; return tr; }
+function renderCts(d) {
+  const tb = $("cts"), prev = kept(tb); tb.replaceChildren();
+  for (const r of d.rows) {
+    const hh = hist[r.name] = hist[r.name] || {cpu: [], mem: []};
+    hh.cpu.push(r.cpu_percent); hh.mem.push(r.used_memory_gb);
+    const memMax = typeof r.memory_gb === "number" ? r.memory_gb : Math.max(1, ...hh.mem.filter(v => v != null));
+    const cpuMax = 100 * (typeof r.cpus === "number" ? r.cpus : 1);
+    if (hh.cpu.length > HIST) { hh.cpu.shift(); hh.mem.shift(); }
+    const run = r.status === "running";
+    const acts = cell(prev, r.name, "acts|" + r.status + "|" + r.flags + "|" + r.stack, () => [
+        run ? button("stop", {op: "stop", name: r.name}) : button("start", {op: "start", name: r.name}),
+        button("restart", {op: "restart", name: r.name}), logsButton(r.name),
+        r.flags.includes("D") && run ? shotButton("ct", r.name) : null,
+        button("rm", {op: "rm", name: r.name}, "Remove " + r.name + " and its /data?" + (r.stack ? " (a stack replica: the daemon makes it again, with an empty /data)" : ""), "danger")]);
+    tb.append(keyed(r.name, {acts}, h("td", null, h("b", {textContent: r.name})), h("td", {className: r.status, textContent: r.status}),
+      h("td", {className: r.health.split(" ")[0], textContent: r.health}), h("td", {textContent: r.project}), h("td", {textContent: r.stack || "-"}),
+      h("td", null, spark(hh.cpu, Math.max(100, cpuMax), css("--cpu")), r.cpu_percent == null ? "-" : r.cpu_percent + "%"),
+      h("td", null, spark(hh.mem, memMax, css("--mem")), (r.used_memory_gb == null ? "-" : r.used_memory_gb) + " / " + (r.memory_gb || "-") + " GiB"),
+      h("td", {textContent: age(r.age)}), h("td", {textContent: r.restarts}), h("td", {textContent: r.flags, title: "D desktop, S sandbox, I internet, A agent's"}),
+      acts));
+  }
+  for (const k of Object.keys(hist)) if (!d.rows.some(r => r.name === k)) delete hist[k];
+  if (!d.rows.length) tb.append(h("tr", null, h("td", {colSpan: 11, className: "mute", textContent: "no container"})));
+}
+function logsButton(name) {
+  const b = h("button", {textContent: "logs"});
+  b.onclick = async () => { const pre = h("pre"); openDlg("logs " + name, pre);
+    try { pre.textContent = await (await api("/api/logs?" + q({name, n: 300}))).text(); pre.scrollTop = 1e9; } catch (e) { pre.textContent = e.message; } };
+  return b;
+}
+function shotButton(kind, name) { const b = h("button", {textContent: "screen"}); b.onclick = () => bigShot(kind, name); return b; }
+let dlgTimer = 0, dlgGen = 0;  // dlgGen: a refresh loop of an earlier view stops by itself
+function openDlg(title, body) { dlgGen++; clearTimeout(dlgTimer); $("dlgtitle").textContent = title; $("dlgbody").replaceChildren(body); $("dlg").showModal(); }
+$("dlgclose").onclick = () => $("dlg").close();
+$("dlg").onclose = () => { dlgGen++; clearTimeout(dlgTimer);
+  $("dlgbody").querySelectorAll("img").forEach(i => { if (i.src.startsWith("blob:")) URL.revokeObjectURL(i.src); }); };
+async function loadShot(img, kind, name) {
+  if (img.busy) return; img.busy = true;  // a slow capture (a VM: seconds): never two at once for one image
+  try { const r = await api("/api/shot?" + q({kind, name})), url = URL.createObjectURL(await r.blob());
+    const old = img.src; img.src = url; if (old.startsWith("blob:")) URL.revokeObjectURL(old); }
+  finally { img.busy = false; }
+}
+function bigShot(kind, name) {
+  const img = h("img", {alt: name}); openDlg((kind === "vm" ? "VM " : "") + name, img);
+  const gen = dlgGen;
+  const tick = async () => { try { if (!document.hidden) await loadShot(img, kind, name); } catch (e) { msg(e.message, true); }
+    if ($("dlg").open && gen === dlgGen) dlgTimer = setTimeout(tick, kind === "vm" ? 2000 : 1000); };
+  tick();
+}
+const shotEls = {};
+async function renderShots(d, vms) {
+  const want = d.rows.filter(r => r.flags.includes("D") && r.status === "running").map(r => ["ct", r.name])
+    .concat(vms.filter(v => v.status && v.status !== "stopped").map(v => ["vm", v.name]));
+  const box = $("shots"), keys = want.map(w => w.join(":"));
+  for (const k of Object.keys(shotEls)) if (!keys.includes(k)) { const s = shotEls[k].img.src;
+    if (s.startsWith("blob:")) URL.revokeObjectURL(s); shotEls[k].remove(); delete shotEls[k]; }
+  for (const [kind, name] of want) {
+    const k = kind + ":" + name;
+    if (!shotEls[k]) { const img = h("img", {alt: name}); shotEls[k] = h("div", {className: "shot", onclick: () => bigShot(kind, name)}, img,
+        h("div", {textContent: (kind === "vm" ? "VM " : "") + name})); shotEls[k].img = img; box.append(shotEls[k]); }
+  }
+  if (!want.length) box.replaceChildren(h("span", {className: "mute", textContent: "no running desktop"}));
+  else box.querySelectorAll(":scope > span").forEach(e => e.remove());
+  if (Date.now() - shotTimer > 5000 && !document.hidden) { shotTimer = Date.now();
+    for (const [kind, name] of want) loadShot(shotEls[kind + ":" + name].img, kind, name).catch(() => {}); }
+}
+function renderVms(v) {
+  const tb = $("vms"), prev = kept(tb); tb.replaceChildren(); $("vmnote").textContent = v.note || "";
+  for (const m of v.vms) {
+    const run = m.status && m.status !== "stopped";
+    const acts = cell(prev, m.name, "acts|" + run + "|" + (m.engine || ""), () => [
+      m.engine ? null : run ? button("stop", {kind: "vm", op: "stop", name: m.name}, "Stop VM " + m.name + "?")
+        : button("start", {kind: "vm", op: "start", name: m.name}), run ? shotButton("vm", m.name) : null,
+      run && !m.engine ? button("force stop", {kind: "vm", op: "force_stop", name: m.name}, "Power off VM " + m.name + " at once (like pulling the plug)?", "danger") : null]);
+    tb.append(keyed(m.name, {acts}, h("td", null, h("b", {textContent: m.name})), h("td", {textContent: m.os || "-"}),
+      h("td", {className: run ? "running" : "exited", textContent: m.status || "-"}), h("td", {textContent: m.project || "-"}),
+      h("td", {textContent: m.cpu_percent == null ? "-" : m.cpu_percent + "%"}),
+      h("td", {textContent: (m.host_memory_gb == null ? "-" : m.host_memory_gb) + " / " + (m.memory_gb || "-") + " GiB"}),
+      acts));
+  }
+  if (!v.vms.length) tb.append(h("tr", null, h("td", {colSpan: 7, className: "mute", textContent: "no VM"})));
+}
+function renderStacks(d) {
+  const tb = $("stacks"), prev = kept(tb); tb.replaceChildren();
+  for (const s of d.stacks) {
+    const counts = Object.entries(s.services).map(([svc, c]) => [svc, c.replicas,
+      d.rows.filter(r => r.stack.startsWith(s.stack + "/" + svc + "/") && r.status === "running").length]);
+    const svcs = cell(prev, s.stack, "svcs|" + JSON.stringify(counts), () => counts.flatMap(([svc, want, runningN]) => {
+      const sc = n => button(n > want ? "+" : "−", {op: "scale", stack: s.stack, service: svc, replicas: n});
+      return [h("span", {textContent: svc + " " + runningN + "/" + want + " "}), want > 0 ? sc(want - 1) : null, sc(want + 1), " "];
+    }));
+    const acts = cell(prev, s.stack, "acts|", () => { const edit = h("button", {textContent: "edit"}); edit.onclick = () => editStack(s.stack);
+      return [edit, button("rm", {op: "stack_rm", stack: s.stack}, "Remove stack " + s.stack + ", its containers and their /data?", "danger")]; });
+    tb.append(keyed(s.stack, {svcs, acts}, h("td", null, h("b", {textContent: s.stack})), h("td", {textContent: s.project}), svcs, acts));
+  }
+  if (!d.stacks.length) tb.append(h("tr", null, h("td", {colSpan: 4, className: "mute", textContent: "no stack"})));
+}
+async function editStack(name) {
+  try { const r = await (await api("/api/stack?" + q({name}))).json(); $("spec").value = JSON.stringify(r.desired, null, 1); $("editor").hidden = false; }
+  catch (e) { msg(e.message, true); }
+}
+$("new").onclick = () => { $("spec").value = JSON.stringify({stack: "web", project: project() || undefined,
+  services: {app: {image: "nginx", replicas: 2, cpus: 0.5, memory_gb: 0.5, restart: "always"}}}, null, 1); $("editor").hidden = false; };
+$("close").onclick = () => { $("editor").hidden = true; };
+$("apply").onclick = async () => { let s; try { s = JSON.parse($("spec").value); } catch (e) { return msg("JSON: " + e.message, true); }
+  if (await act({op: "apply", stack: s}, $("apply"))) $("editor").hidden = true; };
+function renderTop(d) {
+  if (d.engine) {
+  $("engine").textContent = d.engine; $("daemon").textContent = "daemon " + (d.daemon ? "running" : "stopped");
+  $("daemon").style.color = d.daemon ? css("--ok") : css("--bad");
+  $("events").textContent = (d.events || []).slice().reverse().map(e => [e.time, e.event, e.stack, e.service, e.container, e.detail].filter(Boolean).join("  ")).join("\n") || "no event";
+  }
+  if (d.quota) last = d.quota;
+  if (last) $("quota").textContent = Object.entries(last).map(([k, v]) => k.replace("_gb", "") + " " + (v.used ?? "?") + "/" + (v.limit ?? "∞")).join(" · ");
+  const sel = $("project"), cur = sel.value, names = [...new Set((d.projects || []).concat(cur ? [cur] : []))].sort();
+  if (d.projects && names.join("\n") !== [...sel.options].slice(1).map(o => o.value).join("\n")) {  // rebuilt only when it changed: an open list stays open
+    sel.replaceChildren(h("option", {value: "", textContent: "all"}), ...names.map(p => h("option", {value: p, textContent: p})));
+    sel.value = cur; }
+}
+let busy = false, again = false;
+async function refresh() {
+  if (busy) { again = true; return; }  // asked meanwhile (an action, another project): once this pass ends
+  if (document.hidden) return; busy = true;  // a forgotten tab costs the engine nothing
+  try {
+    const p = project();
+    const [d, v] = await Promise.all([api("/api/state?" + q({project: p})).then(r => r.json()),
+      api("/api/vms?" + q({project: p})).then(r => r.json()).catch(e => ({vms: [], note: e.message}))]);
+    if (p !== project()) return;  // the project changed meanwhile: the next pass shows it
+    renderTop(d); renderCts(d); renderVms(v); renderStacks(d); renderShots(d, v.vms);
+    if ($("msg").className === "err" && $("msg").textContent.startsWith("dashboard:")) msg("");
+  } catch (e) { msg("dashboard: " + e.message, true); }
+  finally { busy = false; if (again) { again = false; refresh(); } }
+}
+async function refreshQuota() {  // apart: measuring the disk takes seconds, the table must not wait for it
+  if (quotaBusy || document.hidden) return; quotaBusy = true;
+  try { const p = project(), r = await (await api("/api/quota?" + q({project: p}))).json();
+    if (p === project()) renderTop({quota: r.quota, projects: r.projects}); }
+  catch (e) { msg("quota: " + e.message, true); } finally { quotaBusy = false; }
+}
+$("project").onchange = () => { sessionStorage.setItem("tct-project", project()); last = null; $("quota").textContent = ""; refresh(); refreshQuota(); };
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { refresh(); refreshQuota(); } });
+const saved = sessionStorage.getItem("tct-project");
+if (saved) $("project").append(h("option", {value: saved, textContent: saved})), $("project").value = saved;
+if (!token) msg("no token: open the dashboard with  terminal-ct web", true); else { refresh(); refreshQuota(); setInterval(refresh, 2000); setInterval(refreshQuota, 15000); }
+</script></body></html>
+"""
 
 
 # ---------- snapshots, clones, files ----------
@@ -2561,7 +3114,7 @@ def view(name, fps=30, read_only=False):
                     cell = e[1:]
                 elif e[0] == "show":
                     try:
-                        with contextlib.redirect_stdout(io.StringIO()):
+                        with captured(io.StringIO()):
                             show(name)
                     except SystemExit as err:
                         out.write(f"\x1b[{rows};1H\x1b[2K\x1b[33m {err}\x1b[0m".encode()); out.flush()
@@ -2714,10 +3267,41 @@ def _image(data):
     return {"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"}
 
 
+class _Capture(threading.local):
+    buf = None
+
+
+_CAPTURE = _Capture()
+
+
+class _Stdout:
+    """sys.stdout once a thread captures: each thread's prints go to its own buffer, the others' to the real one
+    (contextlib.redirect_stdout swaps it for every thread: the daemon's reconciler and the web's actions mixed)."""
+    def __init__(self, real):
+        self.real = real
+
+    def write(self, s):
+        return (_CAPTURE.buf or self.real).write(s)
+
+    def __getattr__(self, k):
+        return getattr(_CAPTURE.buf or self.real, k)
+
+
+@contextlib.contextmanager
+def captured(buf):
+    if not isinstance(sys.stdout, _Stdout):
+        sys.stdout = _Stdout(sys.stdout)
+    old, _CAPTURE.buf = _CAPTURE.buf, buf
+    try:
+        yield buf
+    finally:
+        _CAPTURE.buf = old
+
+
 def quiet(f, *a, **k):
     """Call a CLI function that prints its JSON result (stdout is the MCP channel) and return that result."""
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    with captured(buf):
         r = f(*a, **k)
     if r is not None:
         return r
@@ -3025,7 +3609,7 @@ def mcp(name=None, project=None):
             target = a.get("name") if tool in AGENT_NAMES else a.pop("container", None) or name
             try:
                 if tool in AGENT_NAMES:
-                    with contextlib.redirect_stdout(io.StringIO()):  # engine output must not reach the MCP channel
+                    with captured(io.StringIO()):  # engine output must not reach the MCP channel
                         r = agent_call(tool, a, approve, project)
                         content = [{"type": "text", "text": r if isinstance(r, str) else json.dumps(r)}]
                 else:
@@ -3103,6 +3687,7 @@ def main(argv=None):
     sub.add_parser("daemon").add_argument("daemon_cmd", choices=["run", "start", "stop", "status"])
     sub.add_parser("prune")
     da = sub.add_parser("dash"); da.add_argument("--project")
+    wb = sub.add_parser("web"); wb.add_argument("--project"); wb.add_argument("--no-open", action="store_true")
     lg = sub.add_parser("logs"); lg.add_argument("name"); lg.add_argument("-n", type=int, default=100)
     sn = sub.add_parser("snapshot"); sn.add_argument("name"); sn.add_argument("snap_cmd", choices=["save", "load", "rm", "ls"])
     sn.add_argument("tag", nargs="?")
@@ -3177,6 +3762,7 @@ def main(argv=None):
         return None if o.daemon_cmd == "run" else show_json(r if isinstance(r, dict) else {"daemon": r})
     if o.cmd == "prune": return show_json(prune())
     if o.cmd == "dash": return dash(o.project)
+    if o.cmd == "web": return show_json(web(not o.no_open, o.project))
     if o.cmd == "logs": return print(logs(o.name, o.n), end="")
     if o.cmd == "snapshot": return show_json(snapshot(o.name, o.snap_cmd, o.tag))
     if o.cmd == "clone": return show_json(clone(o.src, o.new, project=o.project))
