@@ -481,6 +481,49 @@ class ProjectsAndResume(unittest.TestCase):
         self.assertIn("Environment='TERMINAL_CT_HOME=/s t'", unit)
         self.assertEqual(calls[-1], ["systemctl", "--user", "enable", "terminal-ct-resume.service"])
 
+    def test_sub_projects(self):
+        approve = lambda m, c: None
+        ct.agent_call("ct_create", {"name": "web", "project": "lab/web"}, approve, project="lab")
+        quiet(ct.create, "top", project="lab"); quiet(ct.create, "near", project="labx")  # labx is not under lab
+        listed = sorted(c["name"] for c in ct.agent_call("ct_list", {}, approve, project="lab"))
+        self.assertEqual(listed, ["top", "web"])
+        with self.assertRaisesRegex(SystemExit, "not this agent's project"):
+            ct.agent_call("ct_create", {"name": "x", "project": "other"}, approve, project="lab")
+        with self.assertRaisesRegex(SystemExit, "not in this agent's project"):
+            ct.agent_call("ct_start", {"name": "web"}, approve, project="lab/other")
+        st = ct.project_status("lab")
+        self.assertEqual((sorted(c["name"] for c in st["containers"]), st["sub_projects"]), (["top", "web"], ["lab/web"]))
+        ct.notes_write("lab/web", "n")
+        self.assertTrue(os.path.isfile(os.path.join(ct.STORE, "projects", "lab+web", "notes.md")))
+        for bad in ("Lab", "lab/", "../x", "a/b/c/d/e"):
+            with self.assertRaises(SystemExit):
+                ct.check_project(bad)
+
+    def test_small_leaks_closed(self):
+        approve = lambda m, c: None
+        quiet(ct.create, "theirs", project="other", cpus=2); quiet(ct.start, "theirs")
+        for tool, a in (("ct_create", {"name": "theirs"}), ("net_create", {"net": "n"})):
+            if tool == "net_create":
+                ct.net_create("n", project="other")
+            with self.assertRaisesRegex(SystemExit, "is not available: choose another"):   # no project, no detail
+                ct.agent_call(tool, a, approve, project="mine")
+        q = ct.agent_call("quota", {}, approve, project="mine")
+        self.assertEqual(q["cpus"]["used_by_project"], 0)
+        self.assertNotIn("used", q["cpus"])
+        self.assertEqual(q["cpus"]["free"], q["cpus"]["limit"] - 2)                       # the room left, all told
+
+    def test_kept_image_counts_its_commit_layer_only(self):
+        quiet(ct.create, "w")
+        self.n.objects["tct-w"]["SizeRw"] = 5 * 2 ** 20
+        ct.project_move("w", "p")
+        self.assertEqual(ct.keep_bytes("w"), 5 * 2 ** 20)
+        self.n.objects["tct-w"]["SizeRw"] = 0
+        self.assertAlmostEqual(ct.disk_bytes(ct.raw_containers()), 2e9 + 1e9 + 5 * 2 ** 20)
+
+    def test_autostart_tool_needs_approval(self):
+        with self.assertRaisesRegex(RuntimeError, "terminal-ct autostart on"):
+            ct.agent_call("autostart", {"on": True}, self.refuse)
+
     def test_autostart_commands(self):
         calls = []
         def run(args, **k):

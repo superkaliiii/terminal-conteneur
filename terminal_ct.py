@@ -241,7 +241,22 @@ def ct_dir(name):
     return d
 
 
-DEFAULT_PROJECT = "default"
+# where new containers go without --project: TERMINAL_CT_PROJECT lets a VM put its containers under its own
+# project (e.g. lab/vm1, a sub-project of the VM's project lab)
+DEFAULT_PROJECT = os.environ.get("TERMINAL_CT_PROJECT") or "default"
+_PROJECT = re.compile(r"[a-z0-9][a-z0-9_.-]{0,47}(/[a-z0-9][a-z0-9_.-]{0,47}){0,3}")
+
+
+def check_project(p):
+    """A project name, or a sub-project path: lab, lab/web (an agent given lab also reaches lab/web)."""
+    if not isinstance(p, str) or not _PROJECT.fullmatch(p):
+        raise SystemExit(f"invalid project: {p!r} (lowercase names, sub-projects as lab/web)")
+    return p
+
+
+def under(p, project):
+    """p is project itself or one of its sub-projects; no project means everything."""
+    return not project or p == project or p.startswith(project + "/")
 DEFAULT_CPUS, DEFAULT_MEMORY = 1, 1  # each container gets a ceiling, so the quota can count it
 SANDBOX_PIDS = 256
 
@@ -250,7 +265,7 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
            desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=(), project=None):
     """Internet: on by default for the user's containers; sandboxes and agents' containers start offline."""
     check_name(name)
-    project = check_name(project or DEFAULT_PROJECT)
+    project = check_project(project or DEFAULT_PROJECT)
     recover(name)  # an interrupted remake's container is still NAME's: never create over it
     if node().run(["inspect", "--type", "container", PREFIX + name], check=False).returncode == 0:
         raise SystemExit(f"{name!r} already exists (engine name {PREFIX}{name})")
@@ -385,7 +400,11 @@ def remake(name, info, keep=False, **change):
     spec.update(change)
     if keep:
         ref = f"{KEEP}{name}:latest"
+        layer = (node().json(["inspect", "--type", "container", "--size", PREFIX + name]) or [{}])[0].get("SizeRw") or 0
         node().run(["commit", PREFIX + name, ref])
+        # what the commit added: its lower layers are the base image's (counted on their own, or not terminal-ct's)
+        with open(os.path.join(ct_dir(name), "keep_bytes"), "w") as f:
+            f.write(str(int(keep_bytes(name) + layer)))
         spec.update(image=ref, prebuilt=bool(spec.get("desktop")))  # a desktop's layer is in the committed image
     ensure_image(spec)  # before touching the container: a missing image must not leave the user with none
     cpus, mem = allotted(info, None)
@@ -574,9 +593,19 @@ def disk_bytes(infos):
         total += sum(v for n, v in volume_sizes().items() if n.startswith(PREFIX))
     for line in node().run(["image", "ls", "--format", "{{.Repository}} {{.Size}}"]).stdout.splitlines():
         repo, _, size = line.partition(" ")
-        if repo.split("/")[-1] == "tct-desktop" or repo.split("/")[-1].startswith(KEEP):
+        if repo.split("/")[-1] == "tct-desktop":
             total += parse_size(size)
+    # a kept image counts only the layers its commits added (its Size includes the base image's, already counted)
+    total += sum(keep_bytes(labels_of(c).get(f"{LABEL}.name")) for c in infos)
     return total
+
+
+def keep_bytes(name):
+    try:
+        with open(os.path.join(STORE, name, "keep_bytes")) as f:
+            return int(f.read())
+    except (OSError, ValueError, TypeError):
+        return 0
 
 
 def volume_sizes():
@@ -739,7 +768,7 @@ def networks():
 
 def net_create(net, created_by="user", project=None):
     check_name(net)
-    project = check_name(project or DEFAULT_PROJECT)
+    project = check_project(project or DEFAULT_PROJECT)
     if net in networks():
         raise SystemExit(f"network {net!r} already exists")
     node().run(["network", "create", "--internal", "--label", f"{LABEL}.net={net}",
@@ -915,7 +944,8 @@ def autostart(on=None):
 # --project sees and manages only that project, so each agent works on its own and not on the others'.
 
 def project_dir(project):
-    d = os.path.join(STORE, "projects", check_name(project or DEFAULT_PROJECT))
+    # one flat folder per project ("+" for "/"): a sub-project's folder never lands among its parent's files
+    d = os.path.join(STORE, "projects", check_project(project or DEFAULT_PROJECT).replace("/", "+"))
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -923,7 +953,7 @@ def project_dir(project):
 def projects():
     names = {DEFAULT_PROJECT} | {labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT for c in raw_containers()}
     if os.path.isdir(os.path.join(STORE, "projects")):
-        names |= set(os.listdir(os.path.join(STORE, "projects")))
+        names |= {d.replace("+", "/") for d in os.listdir(os.path.join(STORE, "projects"))}
     cs, ns = containers(), networks()
     return [{"project": p, "containers": sum(c["project"] == p for c in cs),
              "running": sum(c["project"] == p and c["status"] == "running" for c in cs),
@@ -943,8 +973,9 @@ def project_status(project=None, log_lines=30):
         with open(os.path.join(d, AGENT_LOG), encoding="utf-8") as f:
             log = [json.loads(l) for l in collections.deque(f, log_lines) if l.strip()]
     return {"project": project,
-            "containers": [dict(c, want=wanted(c["name"])) for c in containers() if c["project"] == project],
-            "networks": {k: v for k, v in networks().items() if v["project"] == project},
+            "containers": [dict(c, want=wanted(c["name"])) for c in containers() if under(c["project"], project)],
+            "networks": {k: v for k, v in networks().items() if under(v["project"], project)},
+            "sub_projects": sorted(p["project"] for p in projects() if p["project"].startswith(project + "/")),
             "notes": notes, "recent_actions": log}
 
 
@@ -959,7 +990,7 @@ def project_move(name, project):
     """Move a stopped container to another project, keeping its file system and /data."""
     info = find(name)
     # a sandbox starts from its image anyway: committing would make whatever is in it now its new image
-    remake(name, info, keep=labels_of(info).get(f"{LABEL}.sandbox") != "1", project=check_name(project))
+    remake(name, info, keep=labels_of(info).get(f"{LABEL}.sandbox") != "1", project=check_project(project))
     return {"name": name, "project": project}
 
 
@@ -1621,6 +1652,9 @@ AGENT_TOOLS = [
      _schema({})),
     ("quota", "The host quota (CPUs, memory, disk, running containers) and its use; only the user changes it.",
      _schema({})),
+    ("autostart", "Show (without on) or change whether containers that were running start again by themselves "
+                  "after the PC restarts (a task at the user's logon). Changing it needs the user's approval.",
+     _schema({"on": {"type": "boolean"}})),
     ("project_status", "Start here: the project's containers and networks as they are now (want: what each should "
                        "be doing), the notes left by earlier sessions, and the latest actions with their errors.",
      _schema({"project": {"type": "string", "description": "Only when this server has no project of its own"}})),
@@ -1669,7 +1703,7 @@ def managed(info):
 def in_scope(info, project, name=None):
     """An MCP server with a project reaches nothing outside it, approval or not."""
     p = labels_of(info).get(f"{LABEL}.project") or DEFAULT_PROJECT
-    if project and p != project:
+    if not under(p, project):
         raise SystemExit(f"{name or labels_of(info).get(LABEL + '.name')} is not in this agent's project {project!r}")
     return info
 
@@ -1688,9 +1722,14 @@ def local_image(ref):
 def agent_call(tool, a, approve, project=None):
     """project: the server's own (--project); then nothing outside it is visible or reachable."""
     name, net = a.get("name"), a.get("net")
-    mine = lambda p: not project or p == project
+    mine = lambda p: under(p, project)
     nets = {k: v for k, v in networks().items() if mine(v["project"])} if tool.startswith("net_") or tool == "ct_create" else {}
     guard_ = lambda what, cli, destructive=False: guard(name, approve, what, cli, destructive, project)
+    # the project a creation or a note goes to: the one named if it is this server's or below it, else the server's
+    asked = a.get("project")
+    if asked is not None and not under(check_project(asked), project):
+        raise SystemExit(f"project {asked!r} is not this agent's project {project!r} or below it")
+    where = asked or project
     if name and project and tool != "ct_create":  # reads too: another project's containers are not this agent's business
         in_scope(find(name), project, name)
     if tool == "ct_list":
@@ -1701,15 +1740,33 @@ def agent_call(tool, a, approve, project=None):
         keep = {c["name"] for c in containers() if mine(c["project"])}
         return dict(t, containers=[r for r in t["containers"] if r["name"] in keep])
     if tool == "quota":
-        return quota()
+        q = quota()
+        if not project:
+            return q
+        # an agent with a project sees the room left and its own use, not what the other projects take
+        use = {"cpus": 0, "memory_gb": 0, "containers": 0}
+        for c in raw_containers():
+            if running(c) and under(labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT, project):
+                cpus, mem = allotted(c)
+                use["cpus"] += cpus; use["memory_gb"] += mem; use["containers"] += 1
+        return {k: {"limit": v["limit"], "free": v["free"], **({"used_by_project": round(use[k], 2)} if k in use else {})}
+                for k, v in q.items()}
+    if tool == "autostart":
+        if a.get("on") is not None:
+            approve(("Start the containers that were running again by themselves after each restart of the PC "
+                     "(a task at your logon)?") if a["on"] else "Stop restarting containers after a restart of the PC?",
+                    f"terminal-ct autostart {'on' if a['on'] else 'off'}")
+        return autostart(a.get("on"))
     if tool == "project_status":
-        return project_status(project or a.get("project"))
+        return project_status(where)
     if tool == "notes_write":
-        return notes_write(project or a.get("project"), a["text"], a.get("mode", "append"))
+        return notes_write(where, a["text"], a.get("mode", "append"))
     if tool == "net_list":
         return nets
     if tool == "net_create":
-        return net_create(net, "agent", project or a.get("project"))
+        if check_name(net) in networks():
+            raise SystemExit(f"the network name {net!r} is not available: choose another")
+        return net_create(net, "agent", where)
     if tool in ("net_remove", "net_attach") and check_name(net) not in nets and net in networks():
         raise SystemExit(f"network {net!r} is not in this agent's project {project!r}")
     if tool == "net_remove":
@@ -1717,6 +1774,8 @@ def agent_call(tool, a, approve, project=None):
             raise SystemExit(f"network {net!r} is not one this agent created")
         return net_rm(net)
     if tool == "ct_create":
+        if node().run(["inspect", "--type", "container", PREFIX + check_name(name)], check=False).returncode == 0:
+            raise SystemExit(f"the name {name!r} is not available: choose another")  # same answer, any project
         img, desk = a.get("image") or DEFAULT_IMAGE, bool(a.get("desktop"))
         if not (desk and local_image(desktop_tag(img))):
             if not local_image(img):
@@ -1735,7 +1794,7 @@ def agent_call(tool, a, approve, project=None):
         return quiet(create, name, img, a.get("cpus"), a.get("memory_gb"), created_by="agent", desktop=desk,
                      width=int(a.get("width", 1280)), height=int(a.get("height", 800)),
                      sandbox=a.get("sandbox", True), internet=bool(a.get("internet")), nets=a.get("networks") or (),
-                     project=project or a.get("project"))
+                     project=where)
     if tool == "ct_start":
         guard_("start", f"terminal-ct start {name}")
         return quiet(start, name)
@@ -1769,7 +1828,7 @@ def mcp(name=None, project=None):
     plus managing containers and networks under the agent-authority rules. project: the agent sees and reaches
     only that project's containers and networks, and its notes and log are that project's."""
     if project:
-        check_name(project)
+        check_project(project)
     if name:
         check_name(name)
         if project:
@@ -1790,8 +1849,8 @@ def mcp(name=None, project=None):
             # the log of the project the action belongs to: this server's, else the one a creation names, else the
             # container's own; never one an agent merely names (it would forge another project's history)
             p = project or (a.get("project") if tool in PROJECT_ARG_TOOLS else None) or lab.get(f"{LABEL}.project")
-            p = p if isinstance(p, str) and re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,47}", p) else DEFAULT_PROJECT
-            mine = not project or (lab.get(f"{LABEL}.project") or DEFAULT_PROJECT) == project
+            p = p if isinstance(p, str) and _PROJECT.fullmatch(p) and under(p, project) else project or DEFAULT_PROJECT
+            mine = under(lab.get(f"{LABEL}.project") or DEFAULT_PROJECT, project)
             path = os.path.join(project_dir(p), AGENT_LOG) if tool in AGENT_NAMES else \
                 os.path.join(ct_dir(target), "actions.log") if lab.get(f"{LABEL}.sandbox") == "1" and mine else None
             if path:

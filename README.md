@@ -95,6 +95,7 @@ those labels are never listed or touched. An image whose default command is a ba
   input tools take `screenshot: true`) on NAME, or on another container with `container`;
 - `ct_list`, `ct_create`, `ct_start`, `ct_stop`, `ct_remove`, `ct_resources`, `ct_internet`, `net_list`,
   `net_create`, `net_remove`, `net_attach`, `net_detach`, `top`, `quota`;
+- `autostart` (restart after a PC restart; changing it asks the user);
 - `project_status` (where things stand: containers and networks with what each should be doing, notes, latest
   actions and errors) and `notes_write`; the server tells the agent at connection to start with `project_status`
   and to leave notes, so the next session picks up from there.
@@ -107,11 +108,15 @@ quota. Management actions are logged to the project's `agent.log`, a sandbox's s
 
 ## Projects
 
-- A project groups containers and networks (`create --project P`, `net create NET --project P`; `default`
-  otherwise) with their notes and agent log (`STORE/projects/P/`). `project ls`, `project show P` (the same view
+- A project groups containers and networks (`create --project P`, `net create NET --project P`; otherwise
+  `TERMINAL_CT_PROJECT`, else `default`). Sub-projects are paths: `lab/web`, up to 4 levels; whoever has `lab`
+  also has `lab/web`. Inside a VM of terminal-vm's project `lab`, set `TERMINAL_CT_PROJECT=lab/<vm>` so its
+  containers sit under that project with their notes and agent log (`STORE/projects/P/`). `project ls`, `project show P` (the same view
   as `project_status`), `project notes P [TEXT]`, `project move NAME P` (stopped container, kept as is).
-- `mcp --project P`: the agent sees and reaches only P's containers and networks, and creates in P. Outside P
-  nothing is listed and nothing can be approved: give each agent its own project to keep them apart.
+- `mcp --project P`: the agent sees and reaches only P's containers and networks (and its sub-projects'), and
+  creates in P or below. Outside P nothing is listed and nothing can be approved: give each agent its own project
+  to keep them apart. Its `quota` shows the room left and its project's own use, not the other projects'; a name
+  taken elsewhere is just "not available".
 
 ## Restarts
 
@@ -120,7 +125,16 @@ quota. Management actions are logged to the project's `agent.log`, a sandbox's s
   stopped on purpose.
 - `autostart on` runs it at each logon: on Windows (also from WSL) a scheduled task `terminal-ct-resume`
   (from WSL: `conhost --headless wsl.exe ... resume --stay`, which keeps WSL up while containers run); on Linux a
-  systemd user service (at login; `loginctl enable-linger` for boot without login). `autostart off` removes it.
+  systemd user service (at login; `loginctl enable-linger` for boot without login). `autostart off` removes it,
+  `autostart` alone tells whether it is on. To turn it on:
+
+  ```sh
+  # from Windows, terminal-ct in WSL (Claude Code: prefix with ! to run it in the session)
+  wsl -d Debian -- python3 /path/to/terminal_ct.py autostart on
+  # Linux, or inside WSL
+  python3 terminal_ct.py autostart on
+  ```
+- Agents: the MCP tool `autostart` shows the setting, and turns it on or off only with the user's approval.
 
 ## Tests
 
