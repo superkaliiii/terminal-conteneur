@@ -812,6 +812,7 @@ class Nodes(unittest.TestCase):
         ct.STORE = tempfile.mkdtemp()
         self.engines, self.vm_calls, self.vms = {}, [], {}
         self.shell, self.files, self.deployed, self.acts = [], {}, {}, []
+        self.vmnets, self.netscripts, self.tables = {}, [], {}
         ct._DEPLOYED.clear()
 
         def vm_call(args, timeout=60, **k):
@@ -825,8 +826,22 @@ class Nodes(unittest.TestCase):
                 if argv[0] == "docker":
                     r = self.engines.setdefault(name, FakeNode("docker")).run(argv[1:], check=False)
                     return {"exit": r.returncode, "stdout": r.stdout, "stderr": "no such object" if r.returncode else ""}
+                if argv[0] == "sh" and "link_for()" in argv[2]:                    # the node's networks made so
+                    lines = []
+                    for net in re.findall(r"^echo (\S+) \"\$GW\"", argv[2], re.M):
+                        self.engines.setdefault(name, FakeNode("docker")).nets[ct.NET_PREFIX + net] = {
+                            "terminal-ct.net": net}
+                        lines.append(f"{net} 172.20.0.1 br-0123456789ab 172.20.0.0/16")
+                    self.netscripts.append((name, argv[2]))
+                    return {"exit": 0, "stdout": "\n".join(lines) + "\n", "stderr": ""}
+                if argv[0] == "sh" and "base64 -d" in argv[2]:                     # a DNS table written
+                    b64, path = re.match(r"echo (\S+) \| base64 -d > (\S+)\.new", argv[2]).groups()
+                    self.tables[(name, path)] = json.loads(base64.b64decode(b64))
+                    return {"exit": 0, "stdout": "", "stderr": ""}
                 if argv[0] == "sh":
                     self.shell.append(argv[2])
+                    if argv[2].endswith("&& echo up"):                                  # back after a restart
+                        return {"exit": 0, "stdout": "up\n", "stderr": ""}
                     if "sha256sum" in argv[2]:
                         return {"exit": 0, "stdout": self.deployed.get(name, ""), "stderr": ""}
                     for out in re.findall(r"> (/tmp/tct-\w+/out)", argv[2]):
@@ -847,6 +862,17 @@ class Nodes(unittest.TestCase):
                 if argv[0] == "df":
                     return {"exit": 0, "stdout": "Filesystem 1K-blocks Used Available\n/dev/vda1 20000000 1 10485760 1% /\n"}
                 return {"exit": 0, "stdout": "", "stderr": ""}                   # test -f ready
+            if args[:2] == ["net", "ls"]:
+                return [dict(v, vms=list(v["vms"])) for v in self.vmnets.values()]
+            if args[:2] == ["net", "create"]:
+                self.vmnets[args[2]] = {"name": args[2], "index": len(self.vmnets) + 1, "vms": [],
+                                        "subnet": f"10.77.{len(self.vmnets) + 1}.0/24"}
+                return self.vmnets[args[2]]
+            if args[:2] == ["net", "attach"]:
+                n = self.vmnets[args[3]]
+                ip = f"10.77.{n['index']}.{10 + len(n['vms'])}"
+                n["vms"].append({"vm": args[2], "ip": ip, "mac": f"52:54:00:00:00:{len(n['vms']):02x}"})
+                return {}
             if args[0] == "push":
                 with open(args[2], "rb") as f:
                     self.files[args[3]] = f.read()
@@ -1014,6 +1040,67 @@ class Nodes(unittest.TestCase):
                 quiet(ct.rm, "db-pg-1")                                             # as the web or MCP would
             self.assertEqual(ct._nodes()["placement"], {})
 
+    def test_networks_between_nodes(self):
+        """10.1/10.2/10.4: nodes on a network; ports on the node's address only; one replica per node; DNS tables."""
+        with unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"):
+            for n in ("n1", "n2"):
+                self.cli("node", "add", n)
+            r = self.cli("node", "join", "n1", "back")
+            self.assertEqual((r["ip"], r["gateway"]), ("10.77.1.10", "172.20.0.1"))
+            steps = [c[:3] for c in self.vm_calls if c[:2] in (["net", "create"], ["net", "attach"]) or c[0] in ("stop", "start")]
+            self.assertEqual(steps[-4:], [["net", "create", "tct-back"], ["stop", "n1"], ["net", "attach", "n1"],
+                                          ["start", "n1"]])                       # its cards change while it is off
+            script = self.netscripts[-1][1]
+            self.assertIn("|| ip addr add 10.77.1.10/24", script)
+            self.assertIn("iptables -I DOCKER-USER -i \"$BR\" ! -o \"$BR\" -m conntrack --ctstate NEW ! --ctorigdst 10.77.1.0/24 -j DROP",
+                          script)                                              # the address first asked, before DNAT
+            self.assertIn("-i docker0 -m conntrack --ctstate NEW --ctorigdst 10.77.0.0/16 -j DROP", script)  # nor via the internet bridge
+            self.assertIn('_dns "$GW/${SUB#*/}" "$BR" /var/lib/terminal-ct/dns/back.json', script)
+            with self.assertRaisesRegex(SystemExit, "not on back"):
+                self.cli("--node", "n2", "create", "x", "--net", "back")
+            with self.assertRaisesRegex(SystemExit, "ports"):
+                ct.create("y", ports=[80])                                           # not on a node's network
+            self.cli("node", "join", "n2", "back")
+            with ct.on_node("n1"):
+                quiet(ct.create, "solo", nets=["back"], ports=[8080])
+            args = next(c for c in self.engines["n1"].calls if c[0] == "create" and "tct-solo" in c)
+            self.assertIn("--dns", args); self.assertEqual(args[args.index("--dns") + 1], "172.20.0.1")
+            self.assertEqual(args[args.index("-p") + 1], "10.77.1.10:8080:8080")   # the node's address, never 0.0.0.0
+            ct.apply({"stack": "lab", "services": {"web": {"image": "alpine:3.20", "replicas": 3, "spread": "nodes",
+                                                             "networks": ["back"], "ports": [80]}}})
+            where = {r["name"]: r.get("node") for r in ct.all_containers() if r["name"].startswith("lab-")}
+            self.assertEqual(sorted(where.values()), ["n1", "n2"])                  # one per node; the third waits
+            self.assertIn("no free node on its networks", json.dumps(ct.events("lab", 20)))
+            tables = {k[0]: v for k, v in self.tables.items() if k[1].endswith("/back.json")}
+            self.assertEqual(tables["n1"], tables["n2"])                             # the same names on every node
+            self.assertEqual(tables["n1"]["web"], ["10.77.1.10", "10.77.1.11"])
+            self.assertEqual(tables["n1"]["web.lab"], tables["n1"]["web"])
+            self.vms["n2"] = "stopped"                                                # n2 falls: its address goes
+            ct.reconcile("lab")
+            self.assertEqual(self.tables[("n1", "/var/lib/terminal-ct/dns/back.json")]["web"], ["10.77.1.10"])
+
+    def test_network_security(self):
+        """Review of phase 10: terminal-vm's values checked before a root script; names not shared; agents kept off
+        the user's networks between nodes; a boolean is not a port."""
+        good = {"name": "tct-back", "subnet": "10.77.4.0/24"}, {"ip": "10.77.4.10", "mac": "52:54:00:aa:bb:cc"}
+        self.assertEqual(ct._clean_net(*good)["bridge"], "tctn4")
+        for net, vm in ((dict(good[0], name="tct-x;reboot"), good[1]), (dict(good[0], subnet="192.168.1.0/24"), good[1]),
+                        (good[0], dict(good[1], ip="10.77.5.10")), (good[0], dict(good[1], mac="52:54:00:aa:bb:cc; id")),
+                        (dict(good[0], subnet="10.77.0.0/16"), good[1]), ({"name": "tct-y"}, good[1])):
+            self.assertIsNone(ct._clean_net(net, vm), (net, vm))
+        with self.assertRaises(SystemExit):
+            ct.check_stack({"stack": "x", "services": {"a": {"spread": "nodes", "networks": ["b"], "ports": [True]}}})
+        with unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"):
+            self.cli("node", "add", "n1"); self.cli("node", "join", "n1", "back")
+            ct.apply({"stack": "one", "services": {"db": {"image": "alpine:3.20", "node": "n1", "networks": ["back"]}}})
+            with self.assertRaisesRegex(SystemExit, "already a service of stack one"):
+                ct.apply({"stack": "two", "services": {"db": {"image": "alpine:3.20", "spread": "nodes",
+                                                               "networks": ["back"]}}})
+            ct.apply({"stack": "ag", "services": {"web": {"image": "alpine:3.20", "node": "n1", "networks": ["back"]}}},
+                     created_by="agent")
+            self.assertIn("is the user's", json.dumps(ct.events("ag", 10)))
+            self.assertNotIn("tct-ag-web-1", self.engines["n1"].objects)          # never made there
+
     def test_pinned_node_down_waits(self):
         with unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"):
             self.cli("node", "add", "n1")
@@ -1025,7 +1112,9 @@ class Nodes(unittest.TestCase):
             self.assertEqual([e["event"] for e in out], ["pending"])                                # never moved
             self.assertEqual(self.local.objects, {})
         for bad in ({"node": "n1", "spread": "nodes"},
-                    {"spread": "nodes", "networks": ["back"]}, {"spread": "all"}):
+                    {"spread": "all"}, {"ports": [80], "spread": "nodes"}, {"ports": [80], "networks": ["b"]},
+                    {"node": "n1", "networks": ["b"], "ports": [80], "replicas": 2},
+                    {"spread": "nodes", "networks": ["b"], "ports": ["80"]}):
             with self.assertRaises(SystemExit, msg=bad):
                 ct.check_stack({"stack": "x", "services": {"a": bad}})
 

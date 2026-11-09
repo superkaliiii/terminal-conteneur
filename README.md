@@ -103,6 +103,26 @@ of a VM, the lightness of containers inside it.
 - `push`/`pull`, image builds, snapshots: files and folders cross by the guest agent through a temporary folder of
   the node (folders as tar archives), removed after.
 
+### Networks between nodes
+
+- `node join NODE NET` plugs a node into network NET: a terminal-vm network `tct-NET` (a local switch: no LAN, no
+  internet) with a fixed address per node (10.77.N.x); the node restarts once (network cards change while it is
+  off). In the node: a Docker network for NET, its firewall rules, NET's DNS.
+- A service on NET with `"ports": [80]` (`spread` or `node`) publishes them on its node's NET address only, one
+  replica per node (same port everywhere; extra replicas wait for a free node). Containers of NET find it by name:
+  `web` or `web.lab` (SERVICE.STACK) answers the addresses of the nodes running it, kept by the daemon (a failover
+  shows within seconds). `--node N create NAME --net NET --ports 80` publishes a single container the same way
+  (reached at the node's address; names are for stack services).
+- Each network's DNS is authoritative only (never forwards: not an open resolver), answers its own network's
+  containers only (bound to that bridge, other sources ignored), REFUSED for any other name, runs as `nobody`, reads
+  a table only terminal-ct writes, rate-limits each source, ignores malformed queries. Containers with internet also
+  get the node's own resolver after it.
+- Firewall in each node (made again by the daemon within 30 s of a restart): containers of NET reach their bridge
+  and NET's 10.77.N.0/24 only; nothing else on the node but their DNS and the node's NET address; containers with
+  internet never reach the networks between nodes through the internet bridge. Real run (WSL, two Alpine nodes):
+  a client on n1 reaches `web` on both nodes by name; a container of another network gets neither the name nor the
+  port; with n2 down, `web` answers from n1 at once.
+
 ## Desktops
 
 - The desktop listens only on a **unix socket** in a private host folder (`~/.local/share/terminal-ct/NAME/run/`):

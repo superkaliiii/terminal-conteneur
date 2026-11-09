@@ -261,7 +261,9 @@ class NodeVM(Node):
         if mine not in self.sh(f"sha256sum {NODE_CT} 2>/dev/null || true", timeout=30):
             self.sh(f"mkdir -p {os.path.dirname(NODE_CT)}", timeout=30)
             self.copy("push", os.path.abspath(__file__), NODE_CT + ".new")  # run as root there: never half written
-            self.sh(f"echo '{mine}  {NODE_CT}.new' | sha256sum -c - >/dev/null && mv {NODE_CT}.new {NODE_CT}", timeout=30)
+            # root's alone (the agent made it 0666): nobody else may change code root runs
+            self.sh(f"echo '{mine}  {NODE_CT}.new' | sha256sum -c - >/dev/null && chmod 644 {NODE_CT}.new && "
+                    f"chmod 755 {os.path.dirname(NODE_CT)} && mv {NODE_CT}.new {NODE_CT}", timeout=30)
         _DEPLOYED.add(self.name)
 
     def act(self, name, tool, a):
@@ -411,6 +413,159 @@ def node_add(name, image="debian", cpus=2, memory=2, disk=20, project=None, wait
                      f"terminal-vm status {name}; remove it with terminal-ct node rm {name}")
 
 
+# ---------- networks across nodes (phase 10) ----------
+# terminal-ct network NET used by nodes = terminal-vm network "tct-NET" (its local switch: no LAN, no internet) that
+# those nodes are plugged into, one fixed address each (10.77.N.x). In each node: a Docker network for NET (a plain
+# bridge, so ports can be published), its containers allowed to reach their own bridge and NET's 10.77.N.0/24 only
+# (DOCKER-USER rule: no internet, no other network), and NET's DNS on that bridge's gateway (see dns_serve).
+NODE_NET = "tct-"  # terminal-vm network of terminal-ct network NET
+NODE_DNS_DIR = "/var/lib/terminal-ct/dns"
+
+
+def node_vm_nets(node):
+    """{NET: {"ip", "mac", "subnet"}}: the terminal-vm networks of terminal-ct networks this node is plugged into."""
+    out = {}
+    for n in _vm(["net", "ls"]):
+        if n.get("name", "").startswith(NODE_NET):
+            for v in n.get("vms", []):
+                if v.get("vm") == node:
+                    a = _clean_net(n, v)
+                    if a:
+                        out[n["name"][len(NODE_NET):]] = a
+    return out
+
+
+def _clean_net(n, v):
+    """One network of a node from terminal-vm's reply, only if every value is what it should be (they go into a
+    script run as root in the node): a valid name, an IPv4 address inside a 10.77.N.0/24, a MAC."""
+    try:
+        net = check_name(n["name"][len(NODE_NET):])
+        sub, ip = ipaddress.IPv4Network(n["subnet"]), ipaddress.IPv4Address(v["ip"])
+        if ip not in sub or not sub.subnet_of(ipaddress.IPv4Network("10.77.0.0/16")) or sub.prefixlen != 24 or \
+                not re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", str(v["mac"])):
+            return None
+    except (SystemExit, KeyError, TypeError, ValueError):
+        return None
+    return {"ip": str(ip), "mac": v["mac"], "subnet": str(sub), "bridge": f"tctn{str(sub).split('.')[2]}"}
+
+
+def node_join(node, net, wait=180):
+    """Plug a node into network NET (its VM restarts: network cards change on a stopped VM)."""
+    node_named(node)
+    check_name(net)
+    if net in node_vm_nets(node):
+        return {"node": node, "network": net, "already": True}
+    if not any(n.get("name") == NODE_NET + net for n in _vm(["net", "ls"])):
+        _vm(["net", "create", NODE_NET + net])
+    _vm(["stop", node], timeout=120)
+    _vm(["net", "attach", node, NODE_NET + net])
+    _vm(["start", node], timeout=120)
+    end = time.monotonic() + wait
+    while True:  # its agent back
+        with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired, SystemExit):
+            if NodeVM(node, 10).sh("docker info >/dev/null && echo up", timeout=10).strip() == "up":
+                break
+        if time.monotonic() > end:
+            raise SystemExit(f"node {node} did not come back within {wait} s after joining {net}")
+        time.sleep(3)
+    got = ensure_node_nets(node)
+    event("node_joined", None, detail=f"{node} on {net} ({got[net]['ip']})")
+    return {"node": node, "network": net, **got[net]}
+
+
+def _node_nets_script(nets):
+    """The shell lines that make a node's networks so (idempotent: run at each check, after any restart)."""
+    q = shlex.quote
+    lines = ["set -e", "umask 022", f"mkdir -p {NODE_DNS_DIR}",
+             # the DNS runs as nobody: it reads its table through these; the code stays root's alone
+             f"chmod 755 {os.path.dirname(NODE_CT)} {NODE_DNS_DIR}", f"chmod 644 {NODE_CT}",
+             'link_for() { for d in /sys/class/net/*; do [ "$(cat "$d/address")" = "$1" ] && basename "$d" && return; '
+             "done; return 1; }",
+             # first, for every node network at once (tctn*): never out of the networks between nodes, even if a
+             # step below fails; and nothing reaches the host through slirp's gateway (the host's loopback)
+             "iptables -C DOCKER-USER -i tctn+ ! -o tctn+ -m conntrack --ctstate NEW ! --ctorigdst 10.77.0.0/16 -j DROP "
+             "2>/dev/null || iptables -I DOCKER-USER -i tctn+ ! -o tctn+ -m conntrack --ctstate NEW ! --ctorigdst "
+             "10.77.0.0/16 -j DROP",
+             "iptables -C DOCKER-USER -d 10.0.2.2 -j DROP 2>/dev/null || iptables -I DOCKER-USER -d 10.0.2.2 -j DROP",
+             "iptables -C INPUT -i tctn+ -m conntrack --ctstate NEW -j DROP 2>/dev/null || "
+             "iptables -A INPUT -i tctn+ -m conntrack --ctstate NEW -j DROP",
+             "mkdir -p /run/terminal-ct",
+             # containers with internet sit on docker0 too: never through it to the networks between nodes (their
+             # addresses here, or a published port behind them: matched on the address first asked, before DNAT)
+             "iptables -C DOCKER-USER -i docker0 -m conntrack --ctstate NEW --ctorigdst 10.77.0.0/16 -j DROP 2>/dev/null || "
+             "iptables -I DOCKER-USER -i docker0 -m conntrack --ctstate NEW --ctorigdst 10.77.0.0/16 -j DROP",
+             "iptables -C INPUT -i docker0 -d 10.77.0.0/16 -m conntrack --ctstate NEW -j DROP 2>/dev/null || "
+             "iptables -I INPUT -i docker0 -d 10.77.0.0/16 -m conntrack --ctstate NEW -j DROP",
+             "echo resolver $(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)"]
+    for net, a in sorted(nets.items()):
+        name, table, pid = NET_PREFIX + net, q(f"{NODE_DNS_DIR}/{net}.json"), q(f"/run/terminal-ct/dns-{net}.pid")
+        lines += ["(", "set -e"]  # each network in its own shell: one failing (a card not found) never stops the others
+        lines += [
+            f"IF=$(link_for {q(a['mac'])})", "ip link set \"$IF\" up",  # busybox ip has no "addr replace"
+            f"ip -4 addr show dev \"$IF\" | grep -qF {q(' ' + a['ip'] + '/')} || ip addr add {q(a['ip'])}/24 dev \"$IF\"",
+            # no new connection from the network to the node itself (sshd...): published ports are DNAT'd, not here
+            "iptables -C INPUT -i \"$IF\" -m conntrack --ctstate NEW -j DROP 2>/dev/null || "
+            "iptables -A INPUT -i \"$IF\" -m conntrack --ctstate NEW -j DROP",
+            f"docker network inspect {q(name)} >/dev/null 2>&1 || docker network create --label {q(LABEL + '.net=' + net)} "
+            f"--label {q(LABEL + '.node_network=1')} -o com.docker.network.bridge.name={a['bridge']} {q(name)} >/dev/null",
+            f"BR={a['bridge']}",
+            f"set -- $(docker network inspect -f '{{{{(index .IPAM.Config 0).Gateway}}}} {{{{(index .IPAM.Config 0).Subnet}}}}' "
+            f"{q(name)}); GW=$1; SUB=$2",
+            # its containers: their own bridge and this network's subnet between nodes, nothing else
+            f"iptables -C DOCKER-USER -i \"$BR\" ! -o \"$BR\" -m conntrack --ctstate NEW ! --ctorigdst {q(a['subnet'])} -j DROP "
+            f"2>/dev/null || iptables -I DOCKER-USER -i \"$BR\" ! -o \"$BR\" -m conntrack --ctstate NEW ! --ctorigdst "
+            f"{q(a['subnet'])} -j DROP",
+            # and of the node itself (INPUT: its published ports are served here): this network's DNS and the
+            # node's address on this network only, never another network's address or the node's own services
+            "iptables -C INPUT -i \"$BR\" -m conntrack --ctstate NEW -j DROP 2>/dev/null || iptables -I INPUT -i \"$BR\" -m conntrack --ctstate NEW -j DROP",
+            "iptables -C INPUT -i \"$BR\" -d \"$GW\" -p udp --dport 53 -j ACCEPT 2>/dev/null || "
+            "iptables -I INPUT -i \"$BR\" -d \"$GW\" -p udp --dport 53 -j ACCEPT",
+            f"[ -f {table} ] || echo '{{}}' > {table}", f"chmod 644 {table}",
+            # the pid in /run (gone at a reboot), and that pid must still be this network's DNS
+            # running only if that pid is still this DNS (pids are reused after a restart)
+            f"if ! {{ [ -f {pid} ] && tr '\\0' ' ' < \"/proc/$(cat {pid})/cmdline\" 2>/dev/null | "
+            f"grep -qF {q('_dns ')} && tr '\\0' ' ' < \"/proc/$(cat {pid})/cmdline\" | grep -qF {table}; }}; then "
+            f"nohup python3 {NODE_CT} _dns \"$GW/${{SUB#*/}}\" \"$BR\" {table} >/dev/null 2>&1 & echo $! > {pid}; fi",
+            f"echo {q(net)} \"$GW\" \"$BR\" \"$SUB\"", f") || echo failed {q(net)}"]
+    return "\n".join(lines)
+
+
+def ensure_node_nets(node):
+    """Make the node's networks so and return {NET: {ip, gateway, bridge, subnet (Docker's)}}."""
+    nets = node_vm_nets(node)
+    if not nets:
+        return {}
+    n = NodeVM(node)
+    n.deploy()  # its DNS runs from this terminal_ct.py
+    out, resolver = {}, None
+    for line in n.sh(_node_nets_script(nets), timeout=120).splitlines():
+        parts = line.split()
+        if parts[:1] == ["resolver"] and len(parts) == 2:
+            resolver = parts[1]  # the node's own DNS: names of the internet, for containers that have it
+        elif len(parts) == 4 and parts[0] in nets:
+            out[parts[0]] = dict(ip=nets[parts[0]]["ip"], gateway=parts[1], bridge=parts[2], subnet=parts[3])
+    for v in out.values():
+        v["resolver"] = resolver
+    return out
+
+
+def node_routes(name, info):
+    """A container of a node on networks between nodes AND on the internet bridge: its default route goes to the
+    internet bridge, which may not reach those networks; so a route to each network's 10.77.N.0/24 through that
+    network's own bridge, set from the node in its namespace (it gets no capability for it). Again at each start."""
+    if not isinstance(node(), NodeVM):
+        return
+    on = [k[len(NET_PREFIX):] for k in networks_of(info) if k.startswith(NET_PREFIX)]
+    if not on or (len(on) == 1 and BRIDGE["docker"] not in networks_of(info)):
+        return  # one network and offline: its default route is that network's bridge already
+    joined, subnets = ensure_node_nets(node().name), node_vm_nets(node().name)
+    q = shlex.quote
+    node().sh(f"PID=$(docker inspect -f '{{{{.State.Pid}}}}' {q(PREFIX + name)}) && " + " && ".join(
+        f"nsenter -t \"$PID\" -n ip route add {q(subnets[n]['subnet'])} via {q(joined[n]['gateway'])} 2>/dev/null"
+        f" || nsenter -t \"$PID\" -n ip route change {q(subnets[n]['subnet'])} via {q(joined[n]['gateway'])}"
+        for n in on if n in joined and n in subnets), timeout=60)
+
+
 def node_ls():
     d, vms = _nodes(), {}
     with contextlib.suppress(RuntimeError, ValueError, subprocess.TimeoutExpired):
@@ -447,7 +602,10 @@ def node_rm(name, force=False):
         d["nodes"].pop(name, None)
         d["placement"] = {c: n for c, n in d["placement"].items() if n != name}
         _save_nodes(d)
-    _DEPLOYED.discard(name)  # a new node of that name has no terminal-ct yet
+    _DEPLOYED.discard(name)  # a new node of that name has no terminal-ct yet, nor these
+    _NET_CHECKED.pop(name, None)
+    for k in [k for k in _DNS_SENT if k[0] == name]:
+        _DNS_SENT.pop(k)
     event("node_removed", None, detail=name)
     return {"removed": name, "containers": on}
 
@@ -604,7 +762,7 @@ SANDBOX_PIDS = 256
 
 def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_by="user",
            desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=(), project=None, labels=None,
-           own_volume=False):
+           own_volume=False, ports=()):
     """Internet: on by default for the user's containers; sandboxes and agents' containers start offline.
     labels: more terminal-ct.* labels (a stack's service and replica)."""
     check_name(name)
@@ -627,6 +785,15 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     cpus, memory = cpus or DEFAULT_CPUS, memory or DEFAULT_MEMORY
     if cpus <= 0 or memory < 0.0625:
         raise SystemExit("--cpus must be > 0 and --memory at least 0.0625 GiB (64 MiB)")
+    ports = [int(p) for p in ports or ()]
+    if ports and (not isinstance(node(), NodeVM) or not nets or not all(1 <= p <= 65535 for p in ports)):
+        raise SystemExit("ports (1-65535) are for a container on a network of nodes: published on that node's "
+                         "address of the network (--node N --net NET)")
+    if nets and isinstance(node(), NodeVM):  # the node's networks made so (address, firewall, DNS) first
+        joined = ensure_node_nets(node().name)
+        missing = [n for n in nets if n not in joined]
+        if missing:
+            raise SystemExit(f"node {node().name} is not on {', '.join(missing)}: terminal-ct node join {node().name} NET")
     known = networks()
     for n in nets:
         if n not in known:
@@ -638,7 +805,8 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
                          f"or remove it: {node().engine} volume rm {PREFIX}{name}-data")
     quota_check({"disk_gb": 0})  # what a container will write is unknown: refuse once the disk quota is reached
     internet = not sandbox and created_by == "user" if internet is None else internet
-    spec = {"image": image, "cmd": cmd, "desktop": desktop, "width": width, "height": height, "sandbox": sandbox}
+    spec = {"image": image, "cmd": cmd, "desktop": desktop, "width": width, "height": height, "sandbox": sandbox,
+            **({"ports": ports} if ports else {})}
     out = _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=True, labels=labels)
     want(name, "stopped")
     print(json.dumps(out))
@@ -666,7 +834,7 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
             run = shlex.quote(os.path.join(ct_dir(name), "run"))
             node().sh(f"mkdir -p {run} && chown {uid}:{gid} {run} && chmod 700 {run}", timeout=30)
         cmd = ["sh", "-c", DESKTOP_RUN]
-    else:
+    else:  # (below) a container on networks of nodes: their DNS, and its ports on the node's address of each
         entry, default = image_cmd(image)
         # a bare shell as the main process exits at once without a terminal: keep such containers alive instead
         if not cmd and not entry and (not default or default[0] in SHELLS):
@@ -691,6 +859,13 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
             node().run(["run", "--rm", "--network", "none", "--user", "0", "--entrypoint", "chown",
                         "-v", f"{volume}:/data", image, f"{uid}:{gid}", "/data"])
         data = ["-v", f"{volume}:/data"]
+    if nets and isinstance(node(), NodeVM):
+        joined = ensure_node_nets(node().name)
+        for n in nets:
+            extra += ["--dns", joined[n]["gateway"], *(x for p in spec.get("ports") or () for x in
+                                                     ("-p", f"{joined[n]['ip']}:{p}:{p}"))]
+        if internet and joined[nets[0]].get("resolver"):  # after the networks' names: the internet's
+            extra += ["--dns", joined[nets[0]]["resolver"]]
     args = ["create", "--name", PREFIX + name, "--hostname", name, "--init", "--network", BRIDGE[node().engine],
             # every label set, 0 included: a committed image carries the old container's labels into the new one
             "--label", f"{LABEL}.name={name}", "--label", f"{LABEL}.created_by={created_by}",
@@ -854,7 +1029,10 @@ def start(name):
             if labels_of(info).get(f"{LABEL}.sandbox") == "1" and (info.get("State") or {}).get("Status") != "created":
                 info = remake(name, info)  # a sandbox starts from its image every time
                 out["fresh"] = True
+            if isinstance(node(), NodeVM) and any(k.startswith(NET_PREFIX) for k in networks_of(info)):
+                ensure_node_nets(node().name)  # after a node restart its rules are gone: back before it runs
             node().run(["start", PREFIX + name])
+            node_routes(name, info)
     want(name, "running")
     if labels_of(info).get(f"{LABEL}.desktop") == "1":
         with contextlib.suppress(RuntimeError):
@@ -1417,8 +1595,8 @@ def project_move(name, project):
 # few seconds and runs the health probes. Everything it does goes to the event log.
 STACK_LABELS = ("stack", "service", "replica", "hash")
 SERVICE_KEYS = {"image", "cmd", "replicas", "cpus", "memory_gb", "desktop", "width", "height", "sandbox", "internet",
-                "networks", "restart", "health", "ttl", "node", "spread"}
-RECREATE_KEYS = ("image", "cmd", "desktop", "width", "height", "sandbox", "internet", "networks")  # cpus, memory: live
+                "networks", "restart", "health", "ttl", "node", "spread", "ports"}
+RECREATE_KEYS = ("image", "cmd", "desktop", "width", "height", "sandbox", "internet", "networks", "ports")  # cpus, memory: live
 RESTARTS = ("always", "on-failure", "never")
 TICK = 3  # seconds between the daemon's passes
 BACKOFF_MAX = 300
@@ -1491,8 +1669,15 @@ def check_stack(s):
             raise SystemExit(f'service {svc}: spread is "nodes" (its replicas across the nodes)')
         if c.get("node") and c.get("spread"):
             raise SystemExit(f"service {svc}: node (all replicas there) or spread, not both")
-        if (c.get("node") or c.get("spread")) and c.get("networks"):
-            raise SystemExit(f"service {svc}: isolated networks on nodes come later; leave node/spread out")
+        if c.get("ports") is not None:
+            if not (isinstance(c["ports"], list) and c["ports"] and
+                    all(isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535 for p in c["ports"])):
+                raise SystemExit(f"service {svc}: ports is a list of port numbers")
+            if not ((c.get("node") or c.get("spread")) and c.get("networks")):
+                raise SystemExit(f"service {svc}: ports are for a service on networks of nodes (node or spread, "
+                                 "and networks)")
+            if c.get("node") and c["replicas"] > 1:
+                raise SystemExit(f"service {svc}: with ports, one replica per node: spread it, or 1 replica")
         h = c.get("health")
         if h is not None:
             if not isinstance(h, dict) or not isinstance(h.get("exec"), str):
@@ -1633,16 +1818,21 @@ def nodes_up():
     return dict(_UP["up"])
 
 
-def _target(cname, c, up, placement, load):
+def _target(cname, c, up, placement, load, on_nets=None):
     """Where a replica should live: None (this host), a node, or False (nowhere now: its pinned node is down,
-    or no node runs). spread keeps a replica where it is while that node runs, else the least loaded node."""
+    or no node runs). spread keeps a replica where it is while that node runs, else the least loaded node.
+    on_nets: {node: its networks}; a service on networks only goes to nodes on all of them, and a service with
+    ports has one replica per node (same port everywhere)."""
     if c.get("node"):
         return c["node"] if up.get(c["node"]) is not False and c["node"] in up else False
     if not c.get("spread"):
         return None
     if placement.get(cname) in up and up[placement[cname]] is not False:  # running, or not answering this pass
         return placement[cname]
-    alive = sorted(n for n, ok in up.items() if ok)
+    siblings = cname.rsplit("-", 1)[0] + "-"  # STACK-SERVICE-: the other replicas
+    taken = {n for k, n in placement.items() if k != cname and k.startswith(siblings) and k[len(siblings):].isdigit()}
+    alive = sorted(n for n, ok in up.items() if ok and set(c.get("networks") or ()) <= set((on_nets or {}).get(n, ()))
+                   and not (c.get("ports") and n in taken))
     if not alive:
         return False
     best = min(alive, key=lambda n: (load.get(n, 0), n))
@@ -1650,15 +1840,81 @@ def _target(cname, c, up, placement, load):
     return best
 
 
+def nodes_on_nets():
+    """{node: [its networks]} from one terminal-vm net ls."""
+    out = collections.defaultdict(list)
+    with contextlib.suppress(SystemExit):
+        for n in _vm(["net", "ls"]):
+            if n.get("name", "").startswith(NODE_NET):
+                for v in n.get("vms", []):
+                    out[v.get("vm")].append(n["name"][len(NODE_NET):])
+    return dict(out)
+
+
+_DNS_SENT = {}  # (node, network): the table last written there
+_NET_CHECKED = {}  # node: when its networks were last made so (ensure_node_nets)
+
+
+def dns_tables():
+    """{network: {name: [node addresses]}}: each service of a stack on networks of nodes, as SERVICE and
+    SERVICE.STACK, at the addresses (on that network) of the running nodes that hold its replicas."""
+    placement, up = _nodes()["placement"], nodes_up()
+    addr = {}  # (node, network): its address there
+    with contextlib.suppress(SystemExit):
+        for n in _vm(["net", "ls"]):
+            for v in n.get("vms", []) if n.get("name", "").startswith(NODE_NET) else ():
+                addr[(v.get("vm"), n["name"][len(NODE_NET):])] = v["ip"]
+    tables = collections.defaultdict(dict)
+    for stack in stacks():
+        with contextlib.suppress(SystemExit):
+            for svc, c in load_stack(stack)["services"].items():
+                if not (c.get("node") or c.get("spread")):
+                    continue
+                for net in c.get("networks") or ():
+                    ips = sorted({addr[(n, net)] for k, n in placement.items()
+                                  if k.startswith(f"{stack}-{svc}-") and k[len(stack) + len(svc) + 2:].isdigit()
+                                  and up.get(n) and (n, net) in addr})
+                    tables[net][svc] = tables[net][f"{svc}.{stack}"] = ips
+    return dict(tables)
+
+
+def update_dns():
+    """Write each node's DNS tables where they changed (atomic replace; the server re-reads it)."""
+    if not _nodes()["nodes"]:
+        return []
+    written, tables, up = [], dns_tables(), nodes_up()
+    for node, nets in nodes_on_nets().items():
+        if not up.get(node):
+            continue
+        if time.time() - _NET_CHECKED.get(node, 0) > 30:  # after a restart its firewall rules and DNS are gone
+            with contextlib.suppress(SystemExit):
+                ensure_node_nets(node)
+                _NET_CHECKED[node] = time.time()
+        for net in nets:
+            text = json.dumps(tables.get(net, {}), sort_keys=True)
+            if _DNS_SENT.get((node, net)) == text:
+                continue
+            path = f"{NODE_DNS_DIR}/{net}.json"
+            b64 = base64.b64encode(text.encode()).decode()
+            with contextlib.suppress(SystemExit):
+                NodeVM(node, LOOK_TIMEOUT).sh(f"echo {b64} | base64 -d > {path}.new && chmod 644 {path}.new && "
+                                              f"mv {path}.new {path}", timeout=30)
+                _DNS_SENT[(node, net)] = text
+                written.append((node, net))
+    return written
+
+
 def reconcile(name, now=None):
-    """One pass over a stack; returns the events it caused."""
+    """One pass over a stack; returns the events it caused. The nodes' DNS tables follow."""
     with quota_lock("reconcile"):
         st, now = _state(), now or time.time()
         try:
             out = _reconcile(load_stack(name), st, now)
         finally:
             _save_state(st)
-        return out
+    with contextlib.suppress(Exception):  # names follow the replicas; a failure here never stops the pass
+        update_dns()
+    return out
 
 
 def _rm_copy(name):
@@ -1701,11 +1957,14 @@ def _reconcile(s, st, now):
                 fails[n] = fails.get(n, 0) + 1
                 up[n] = False if fails[n] >= 3 else None  # None: left as it is this pass; down from the third
     load = collections.Counter(placement.values())
+    on_nets = nodes_on_nets() if any(c.get("networks") for c in s["services"].values()) and up else {}
     known = networks()
     for svc, c in s["services"].items():
         h = service_hash(c)
         blocked = None
-        for n in c.get("networks") or []:
+        if (c.get("node") or c.get("spread")) and c.get("networks") and owner == "agent":
+            blocked = c["networks"][0]  # networks between nodes are the user's (node join): not an agent's to use
+        for n in [] if c.get("node") or c.get("spread") else c.get("networks") or []:
             if n not in known:
                 net_create(n, owner, project)
                 known[n] = {"created_by": owner, "project": project, "members": []}
@@ -1719,11 +1978,12 @@ def _reconcile(s, st, now):
                 copies, mem = have.pop(cname, []), st.setdefault(cname, {})
                 if mem.get("expired") and not copies:
                     continue  # its ttl is over and nothing is left of it: nowhere to place it
-                target = _target(cname, c, up, placement, load)
+                target = _target(cname, c, up, placement, load, on_nets)
                 if target is False:
                     if not copies:
                         if not mem.get("pending"):  # said once, not every pass while the node is down
-                            ev("pending", svc, cname, f"node {c['node']} is down" if c.get("node") else "no node runs")
+                            ev("pending", svc, cname, f"node {c['node']} is down" if c.get("node") else
+                       "no free node on its networks" if c.get("networks") else "no node runs")
                         mem["pending"] = True
                         continue
                     target = copies[0][1]  # keep it where it still runs
@@ -1767,7 +2027,8 @@ def _reconcile(s, st, now):
                                        created_by=owner, desktop=bool(c.get("desktop")), width=int(c.get("width", 1280)),
                                        height=int(c.get("height", 800)), sandbox=bool(c.get("sandbox")),
                                        internet=c.get("internet"), nets=c.get("networks") or (), project=project,
-                                       labels={"stack": name, "service": svc, "replica": i, "hash": h}, own_volume=True)
+                                       labels={"stack": name, "service": svc, "replica": i, "hash": h}, own_volume=True,
+                                       ports=c.get("ports") or ())
                         except SystemExit as e:
                             mem["fails"] = mem.get("fails", 0) + 1
                             mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["fails"])
@@ -1895,6 +2156,17 @@ def apply(s, created_by="user", project=None, approved_networks=()):
     s = check_stack(s)
     if project:
         s["project"] = check_project(project)
+    for svc, c in s["services"].items():  # one name per network between nodes: a stack never takes another's
+        if (c.get("node") or c.get("spread")) and c.get("networks"):
+            for other in stacks():
+                try:
+                    o = load_stack(other)["services"].get(svc) if other != s["stack"] else None
+                except SystemExit:
+                    continue
+                if o and (o.get("node") or o.get("spread")) and set(o.get("networks") or ()) & set(c["networks"]):
+                    raise SystemExit(f"service {svc!r} is already a service of stack {other} on the same network: "
+                                     "its name there would answer for both; rename one")
+    
     with quota_lock("stacks"):
         path = os.path.join(stacks_dir(), s["stack"] + ".json")
         if os.path.isfile(path):
@@ -4497,7 +4769,8 @@ def main(argv=None):
     p.add_argument("--engine", choices=["docker", "podman"])
     p.add_argument("--node", help="run in this node (a Linux VM of terminal-vm with Docker; see node add)")
     sub = p.add_subparsers(dest="cmd", required=True)
-    nd = sub.add_parser("node"); nd.add_argument("node_cmd", choices=["add", "ls", "rm"]); nd.add_argument("node_name", nargs="?")
+    nd = sub.add_parser("node"); nd.add_argument("node_cmd", choices=["add", "ls", "rm", "join"])
+    nd.add_argument("node_name", nargs="?"); nd.add_argument("node_net", nargs="?", help="join: the network")
     nd.add_argument("--image", dest="node_image", choices=["debian", "alpine"], default="debian")
     nd.add_argument("--cpus", dest="node_cpus", type=int, default=2)
     nd.add_argument("--memory", dest="node_memory", type=int, default=2, help="GiB")
@@ -4509,6 +4782,8 @@ def main(argv=None):
     c.add_argument("--width", type=int, default=1280); c.add_argument("--height", type=int, default=800)
     c.add_argument("--sandbox", action="store_true"); c.add_argument("--offline", action="store_true")
     c.add_argument("--net", action="append", default=[], help="an isolated network (repeatable)")
+    c.add_argument("--ports", type=int, action="append", default=[],
+                   help="with --node and --net: publish it on that node's address of the network (repeatable)")
     c.add_argument("--project")
     rs = sub.add_parser("resume"); rs.add_argument("--stay", action="store_true")
     ap = sub.add_parser("apply"); ap.add_argument("file"); ap.add_argument("--project")
@@ -4571,9 +4846,12 @@ def main(argv=None):
     if o.cmd == "node":
         if o.node_cmd != "ls" and not o.node_name:
             raise SystemExit(f"node {o.node_cmd} NAME")
+        if o.node_cmd == "join" and not o.node_net:
+            raise SystemExit("node join NODE NET")
         out = (node_ls() if o.node_cmd == "ls" else
                node_add(o.node_name, o.node_image, o.node_cpus, o.node_memory, o.node_disk, o.node_project)
-               if o.node_cmd == "add" else node_rm(o.node_name, o.force))
+               if o.node_cmd == "add" else node_join(o.node_name, o.node_net) if o.node_cmd == "join"
+               else node_rm(o.node_name, o.force))
         return print(json.dumps(out, indent=1))
     if o.cmd == "help": return p.print_help()
     if o.cmd == "version": return print(VERSION)
@@ -4582,7 +4860,7 @@ def main(argv=None):
     if o.cmd == "create":
         r = create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width,
                    height=o.height, sandbox=o.sandbox, internet=False if o.offline else None, nets=o.net,
-                   project=o.project)
+                   project=o.project, ports=o.ports)
         if isinstance(NODE, NodeVM):
             place(o.name, NODE.name)
         return r
