@@ -1172,7 +1172,7 @@ class Nodes(unittest.TestCase):
         with tarfile.open(fileobj=buf, mode="w") as tar:
             for name, kind in (("out/ok.txt", tarfile.REGTYPE), ("out/../../evil", tarfile.REGTYPE)):
                 ti = tarfile.TarInfo(name); ti.type = kind; tar.addfile(ti, io.BytesIO(b""))
-        for has_filter in (True, False):
+        for has_filter in (True, False) if hasattr(tarfile, "data_filter") else (False,):  # 3.9: no filter
             buf.seek(0)
             with tarfile.open(fileobj=buf) as tar, tempfile.TemporaryDirectory() as d:
                 with unittest.mock.patch.object(tarfile, "data_filter", tarfile.data_filter, create=True) if has_filter \
