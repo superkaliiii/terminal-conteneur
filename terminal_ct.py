@@ -536,8 +536,8 @@ def agent(listen="127.0.0.1", port=None, rotate=False):
     host = f"[{listen}]" if ":" in listen else listen
     url = f"https://{host}:{srv.server_address[1]}"
     print(json.dumps({"url": url, "fingerprint": srv.fingerprint, "token": srv.token,
-                      "on the central PC": f"terminal-ct host add NAME {url} --fingerprint {srv.fingerprint} "
-                                           f"--token {srv.token}"}, indent=1), flush=True)
+                      "on the central PC": f"terminal-ct host add NAME {url} --fingerprint {srv.fingerprint}  "
+                                           "(then type or paste the token)"}, indent=1), flush=True)
     srv.serve_forever()
 
 
@@ -612,6 +612,12 @@ class NodeRemote(NodeVM):
     shortcut: Docker there (its command is docker); a PC with Podman alone needs podman-docker."""
     def __init__(self, name, remote, timeout=None):
         self.name, self.remote, self.engine, self.timeout = name, remote, "docker", timeout
+
+    def free_bytes(self, root):
+        try:
+            return super().free_bytes(root)
+        except SystemExit:  # shortcut: Docker Desktop (a Mac) keeps its store in its own VM, not on that PC: the
+            return super().free_bytes("/")  # PC's own disk then; upgrade: read that VM's space (docker system df)
 
     def _ssh(self, scp=False):
         u, port = ssh_target(self.remote["url"])
@@ -695,8 +701,119 @@ def _save_nodes(d):
 
 def node_named(name):
     if name not in _nodes()["nodes"]:
-        raise SystemExit(f"no node named {name!r} (terminal-ct node ls; node add NAME)")
-    return NodeVM(name)
+        raise SystemExit(f"no node named {name!r} (terminal-ct node ls; node add NAME, or host add NAME URL)")
+    return node_obj(name)
+
+
+def is_host(name):
+    return _nodes()["nodes"].get(name, {}).get("kind") == "host"
+
+
+def node_obj(name, timeout=None):
+    """Node NAME: a terminal-vm VM, or another PC (host add)."""
+    if not is_host(name):
+        return NodeVM(name, timeout)
+    h = _hosts().get(name)
+    if not h:
+        raise SystemExit(f"host {name}: its address and token are gone from {os.path.join(STORE, 'hosts.json')}: "
+                         f"terminal-ct host rm {name}, then host add again")
+    return NodeRemote(name, h, timeout)
+
+
+def _hosts():
+    """{name: {url, fingerprint, token}}: in its own file, owner only (the tokens)."""
+    try:
+        with open(os.path.join(STORE, "hosts.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_hosts(h):
+    os.makedirs(STORE, exist_ok=True)
+    _web_write(os.path.join(STORE, "hosts.json"), json.dumps(h, indent=1), 0o600)
+
+
+def _read_token():
+    """The agent's token: TERMINAL_CT_AGENT_TOKEN, else typed or piped in (never an argument: ps and history)."""
+    t = os.environ.pop("TERMINAL_CT_AGENT_TOKEN", None)  # not handed down to ssh, docker, terminal-vm
+    if t is None:
+        if sys.stdin is not None and sys.stdin.isatty():
+            import getpass
+            t = getpass.getpass("agent token (shown by terminal-ct agent on that PC): ")
+        else:
+            t = sys.stdin.readline() if sys.stdin is not None else ""
+    return t.strip()
+
+
+def host_add(name, url, fingerprint=None, token=None):
+    """Another PC as a node: reached by its agent (https://IP:PORT, pinned fingerprint, token) or over SSH
+    (ssh://[user@]host[:port]). It must answer, run Linux or macOS, and have Docker."""
+    check_name(name)  # as stacks name it (node: NAME)
+    if "." in name:
+        raise SystemExit(f"invalid host name {name!r} (lowercase letters, digits, _ and -)")
+    if name in _nodes()["nodes"]:
+        raise SystemExit(f"node {name!r} already exists")
+    try:
+        if (url or "").startswith("https://"):
+            u = urllib.parse.urlsplit(url)
+            u.port  # ValueError when not a number
+            if not u.hostname or "@" in u.netloc or u.path not in ("", "/") or u.query or u.fragment:
+                raise ValueError
+            fp = (fingerprint or "").lower().replace(":", "")
+            if not re.fullmatch(r"[0-9a-f]{64}", fp):
+                raise SystemExit("--fingerprint: the SHA-256 shown by terminal-ct agent on that PC (64 hex digits)")
+            token = token if token is not None else _read_token()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):  # as the agent makes it (never a control character)
+                raise SystemExit("token: the one shown by terminal-ct agent on that PC (TERMINAL_CT_AGENT_TOKEN, or "
+                                 "typed / piped in)")
+            h = {"url": f"https://{u.netloc}", "fingerprint": fp, "token": token}
+        elif (url or "").startswith("ssh://"):
+            ssh_target(url)
+            h = {"url": url}
+        else:
+            raise ValueError
+    except ValueError:
+        raise SystemExit(f"host address: https://IP:PORT (terminal-ct agent there) or ssh://[user@]host[:port], "
+                         f"not {url!r}") from None
+    n = NodeRemote(name, h, 30)
+    try:
+        r = n._exec(["uname", "-s"], 30)
+        kind = r["stdout"].strip()
+        if r["exit"] or kind not in ("Linux", "Darwin"):  # its commands are POSIX: sh, tar, /tmp
+            raise SystemExit(f"host {name}: Linux or macOS only (found {kind or r['stderr'].strip()[:100]}); on "
+                             "Windows run the agent inside WSL")
+        v = n._exec(["docker", "version", "--format", "{{.Server.Version}}"], 60)
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        raise SystemExit(f"host {name}: {e}") from None
+    if v["exit"]:
+        raise SystemExit(f"host {name}: Docker does not answer there ({v['stderr'].strip()[:200]})")
+    with quota_lock("nodes"):
+        d = _nodes()
+        if name in d["nodes"]:  # added meanwhile by another command
+            raise SystemExit(f"node {name!r} already exists")
+        hosts = _hosts()
+        hosts[name] = h
+        _save_hosts(hosts)  # first: nodes.json never names a host whose token is not there
+        d["nodes"][name] = {"kind": "host", "url": h["url"], "added": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        _save_nodes(d)
+    _UP.clear()
+    event("host_added", None, detail=f"{name} ({h['url']})")
+    return {"host": name, "url": h["url"], "os": kind, "docker": v["stdout"].strip()}
+
+
+def host_alive(name):
+    """Whether another PC answers (its agent's ping, or ssh), within a few seconds."""
+    try:
+        n = node_obj(name, 5)
+        if n.remote["url"].startswith("https://"):
+            return agent_request(n.remote, "GET", "/ping", timeout=5).get("tool") == TOOL
+        cmd, target = n._ssh()
+        cmd = [x if x != "ConnectTimeout=10" else "ConnectTimeout=4" for x in cmd]
+        return subprocess.run([*cmd, "--", target, "true"], capture_output=True, timeout=6,
+                              stdin=subprocess.DEVNULL, **NO_WINDOW).returncode == 0
+    except (RuntimeError, SystemExit, subprocess.TimeoutExpired, OSError, ValueError, KeyError):
+        return False
 
 
 def place(container, node_name):
@@ -789,6 +906,8 @@ def _clean_net(n, v):
 def node_join(node, net, wait=180):
     """Plug a node into network NET (its VM restarts: network cards change on a stopped VM)."""
     node_named(node)
+    if is_host(node):
+        raise SystemExit(f"{node} is another PC: networks across PCs come in phase 11 bis")
     check_name(net)
     if net in node_vm_nets(node):
         return {"node": node, "network": net, "already": True}
@@ -905,10 +1024,15 @@ def node_routes(name, info):
 
 def node_ls():
     d, vms = _nodes(), {}
-    with contextlib.suppress(RuntimeError, ValueError, subprocess.TimeoutExpired):
-        vms = {v["name"]: v for v in vm_call(["ls"])}
-    return [{"node": n, "image": info.get("image"), "status": vms.get(n, {}).get("status", "missing"),
-             "containers": sorted(c for c, where in d["placement"].items() if where == n)}
+    up = nodes_up() if any(i.get("kind") == "host" for i in d["nodes"].values()) else {}
+    if any(i.get("kind") != "host" for i in d["nodes"].values()):
+        with contextlib.suppress(RuntimeError, ValueError, subprocess.TimeoutExpired):
+            vms = {v["name"]: v for v in vm_call(["ls"])}
+    return [dict({"node": n, "kind": "host", "url": info.get("url"),
+                  "status": "running" if up.get(n) else "unreachable"} if info.get("kind") == "host" else
+                 {"node": n, "kind": "vm", "image": info.get("image"),
+                  "status": vms.get(n, {}).get("status", "missing")},
+                 containers=sorted(c for c, where in d["placement"].items() if where == n))
             for n, info in sorted(d["nodes"].items())]
 
 
@@ -918,9 +1042,13 @@ def node_rm(name, force=False):
     on = sorted(c for c, where in _nodes()["placement"].items() if where == name)
     if on and not force:
         raise SystemExit(f"node {name} still has containers ({', '.join(on)}): rm them, or node rm {name} --force")
-    status = {v["name"]: v for v in _vm(["ls"])}.get(name, {}).get("status", "missing")
+    host = is_host(name)
+    if host:  # another PC: nothing of it to remove but its containers here and its entry
+        status = "running" if host_alive(name) else "unreachable"
+    else:
+        status = {v["name"]: v for v in _vm(["ls"])}.get(name, {}).get("status", "missing")
     if on and status == "running":
-        before, _LOCAL.node = getattr(_LOCAL, "node", None), NodeVM(name)
+        before, _LOCAL.node = getattr(_LOCAL, "node", None), node_obj(name)
         try:
             for c in on:
                 with contextlib.suppress(SystemExit):
@@ -929,16 +1057,20 @@ def node_rm(name, force=False):
             _LOCAL.node = before
     for c in on:  # their state on this host, whether rm reached the node or not: never inherited by a new one
         shutil.rmtree(os.path.join(STORE, c), ignore_errors=True)
-    if status not in ("stopped", "missing"):
+    if not host and status not in ("stopped", "missing"):
         _vm(["stop", name, "--force"])
         time.sleep(1)
-    if status != "missing":  # its VM already removed by hand: only the registry is left to clean
+    if not host and status != "missing":  # its VM already removed by hand: only the registry is left to clean
         _vm(["rm", name], timeout=120)
     with quota_lock("nodes"):
         d = _nodes()
         d["nodes"].pop(name, None)
         d["placement"] = {c: n for c, n in d["placement"].items() if n != name}
         _save_nodes(d)
+        if host:  # after: a reader never finds the host without its token (a token left alone is overwritten)
+            hosts = _hosts()
+            hosts.pop(name, None)
+            _save_hosts(hosts)
     _DEPLOYED.discard(name)  # a new node of that name has no terminal-ct yet, nor these
     _NET_CHECKED.pop(name, None)
     for k in [k for k in _DNS_SENT if k[0] == name]:
@@ -1110,6 +1242,9 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     recover(name)  # an interrupted remake's container is still NAME's: never create over it
     if node().run(["inspect", "--type", "container", PREFIX + name], check=False).returncode == 0:
         raise SystemExit(f"{name!r} already exists (engine name {PREFIX}{name})")
+    if isinstance(node(), NodeRemote) and (desktop or nets or ports):
+        raise SystemExit(f"a container on another PC ({node().name}): no desktop, networks or ports yet "
+                         "(phase 11 bis)")
     if desktop:
         # shortcut: the VNC unix socket does not cross into Windows, and a node's paths would be Windows ones;
         # run terminal-ct inside WSL there
@@ -1547,8 +1682,8 @@ def quota_limits(use):
     size, and never the host's quota file (terminal-vm's quota already fences its VM)."""
     cpus, mem, root = node().host()
     free = node().free_bytes(root)
-    own = isinstance(node(), NodeVM)
-    set_ = {} if own else _quota_file()
+    own = type(node()) is NodeVM  # a VM node is all theirs; another PC is someone's computer, as this one is
+    set_ = {} if isinstance(node(), NodeVM) else _quota_file()  # this PC's quota is for this PC
     default = {"cpus": cpus if own else max(1, cpus - 1),
                "memory_gb": max(1, round(mem)) if own else max(1, int(mem * 3 // 4)),  # a 1 GiB VM shows ~0.95
                "disk_gb": int((free / 2 ** 30 + use.get("disk_gb", 0)) // 2), "containers": 16}
@@ -2002,6 +2137,9 @@ def check_stack(s):
             check_name(n)
         if c.get("node") is not None:
             check_name(c["node"])
+            if is_host(c["node"]) and (c.get("desktop") or c.get("networks")):
+                raise SystemExit(f"service {svc}: {c['node']} is another PC: no desktop or networks there yet "
+                                 "(phase 11 bis)")
         if c.get("spread") not in (None, "nodes"):
             raise SystemExit(f'service {svc}: spread is "nodes" (its replicas across the nodes)')
         if c.get("node") and c.get("spread"):
@@ -2129,7 +2267,7 @@ def on_node(name, timeout=None):
     timeout: per call, for listings (a frozen node answers nothing: give up quickly)."""
     before = getattr(_LOCAL, "node", None)
     if name:
-        _LOCAL.node = NodeVM(name, timeout)
+        _LOCAL.node = node_obj(name, timeout)
     try:
         yield
     finally:
@@ -2142,16 +2280,29 @@ _UP = {}
 
 
 def nodes_up():
-    """Registered nodes and whether each one's VM runs (one terminal-vm ls, reused for UP_MAX_AGE seconds)."""
+    """Registered nodes and whether each one runs: a VM by one terminal-vm ls, another PC by its answer (all at
+    once, a few seconds at most); reused for UP_MAX_AGE seconds."""
     names = _nodes()["nodes"]
     if not names:
         return {}
     if time.time() - _UP.get("t", 0) > UP_MAX_AGE or set(_UP.get("up", ())) != set(names):
-        try:
-            vms = {v["name"]: v.get("status") for v in vm_call(["ls"], timeout=30)}
-        except (RuntimeError, ValueError, subprocess.TimeoutExpired):
-            vms = {}
-        _UP.update(t=time.time(), up={n: vms.get(n) == "running" for n in names})
+        hosts = [n for n, i in names.items() if i.get("kind") == "host"]
+        alive = {}
+        threads = [threading.Thread(target=lambda h=h: alive.__setitem__(h, host_alive(h)), daemon=True)
+                   for h in hosts]
+        for t in threads:
+            t.start()
+        vms = {}
+        if len(hosts) < len(names):
+            try:
+                vms = {v["name"]: v.get("status") for v in vm_call(["ls"], timeout=30)}
+            except (RuntimeError, ValueError, subprocess.TimeoutExpired):
+                pass
+        end = time.monotonic() + 8  # all together: a silent PC costs one wait, not one each
+        for t in threads:
+            t.join(max(0, end - time.monotonic()))
+        _UP.update(t=time.time(), up={n: alive.get(n, False) if n in hosts else vms.get(n) == "running"
+                                      for n in names})
     return dict(_UP["up"])
 
 
@@ -2169,7 +2320,7 @@ def _target(cname, c, up, placement, load, on_nets=None):
     siblings = cname.rsplit("-", 1)[0] + "-"  # STACK-SERVICE-: the other replicas
     taken = {n for k, n in placement.items() if k != cname and k.startswith(siblings) and k[len(siblings):].isdigit()}
     alive = sorted(n for n, ok in up.items() if ok and set(c.get("networks") or ()) <= set((on_nets or {}).get(n, ()))
-                   and not (c.get("ports") and n in taken))
+                   and not (c.get("ports") and n in taken) and not (c.get("desktop") and is_host(n)))
     if not alive:
         return False
     best = min(alive, key=lambda n: (load.get(n, 0), n))
@@ -2293,6 +2444,9 @@ def _reconcile(s, st, now):
             except SystemExit:  # VM running, its agent or Docker not answering: a hiccup, or frozen
                 fails[n] = fails.get(n, 0) + 1
                 up[n] = False if fails[n] >= 3 else None  # None: left as it is this pass; down from the third
+        elif ok is False and is_host(n):  # another PC not answering: Wi-Fi, sleep, an agent restarting, until the
+            fails[n] = fails.get(n, 0) + 1  # third pass in a row (moving a replica starts it with an empty /data)
+            up[n] = False if fails[n] >= 3 else None
     load = collections.Counter(placement.values())
     on_nets = nodes_on_nets() if any(c.get("networks") for c in s["services"].values()) and up else {}
     known = networks()
@@ -3980,6 +4134,8 @@ def desktop(name):
 
 def act(name, tool, a):
     """Shared by the CLI and MCP. Coordinates are pixels of the latest screenshot."""
+    if isinstance(node(), NodeRemote):  # never terminal-ct copied onto someone's PC
+        raise RuntimeError(f"{name} is on another PC ({node().name}): no desktop there yet (phase 11 bis)")
     if isinstance(node(), NodeVM):  # the desktop's socket is in the node: terminal-ct there does it
         return node().act(name, tool, a)
     if tool == "ready":
@@ -4054,7 +4210,7 @@ def settled_screenshot(name, before=None, timeout=1.5):
 def _pixels(name):
     """The screen's content, to see it change: the raw frame here; in a node, its screenshot (same use)."""
     if isinstance(node(), NodeVM):
-        return node().act(name, "screenshot", {})[0]
+        return act(name, "screenshot", {})[0]
     r = desktop(name)
     try:
         return bytes(r.refresh().fb)
@@ -4844,8 +5000,9 @@ def mcp(name=None, project=None):
             tool, a = p.get("name"), dict(p.get("arguments") or {})
             target = a.get("name") if tool in AGENT_NAMES else a.pop("container", None) or name
             where = _nodes()["placement"].get(target) if isinstance(target, str) else None
-            _LOCAL.node = NodeVM(where) if where else None  # a container in a node: every engine call goes there
+            _LOCAL.node = None
             try:
+                _LOCAL.node = node_obj(where) if where else None  # a container in a node: every engine call goes there
                 if tool in AGENT_NAMES:
                     with captured(io.StringIO()):  # engine output must not reach the MCP channel
                         r = agent_call(tool, a, approve, project)
@@ -5128,8 +5285,12 @@ def main(argv=None):
         argv, cmd_args = argv[:i], argv[i + 1:]
     p = argparse.ArgumentParser(prog="terminal-ct", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--engine", choices=["docker", "podman"])
-    p.add_argument("--node", help="run in this node (a Linux VM of terminal-vm with Docker; see node add)")
+    p.add_argument("--node", "--host", help="run in this node: a Linux VM of terminal-vm with Docker (node add), or "
+                                            "another PC (host add)")
     sub = p.add_subparsers(dest="cmd", required=True)
+    hs = sub.add_parser("host", help="other PCs as nodes (their agent, or SSH)")
+    hs.add_argument("host_cmd", choices=["add", "ls", "rm"]); hs.add_argument("host_name", nargs="?")
+    hs.add_argument("url", nargs="?"); hs.add_argument("--fingerprint"); hs.add_argument("--force", action="store_true")
     nd = sub.add_parser("node"); nd.add_argument("node_cmd", choices=["add", "ls", "rm", "join"])
     nd.add_argument("node_name", nargs="?"); nd.add_argument("node_net", nargs="?", help="join: the network")
     nd.add_argument("--image", dest="node_image", choices=["debian", "alpine"], default="debian")
@@ -5202,10 +5363,20 @@ def main(argv=None):
         raise SystemExit("--engine or --node, not both (a node runs Docker)")
     if o.engine:
         NODE = Node(pick_engine(o.engine))
-    elif o.node:
+    elif o.node and o.cmd != "host":
         NODE = node_named(o.node)
     elif o.cmd != "node" and isinstance(getattr(o, "name", None), str) and o.name in _nodes()["placement"]:
-        NODE = NodeVM(_nodes()["placement"][o.name])  # that container lives in a node
+        NODE = node_obj(_nodes()["placement"][o.name])  # that container lives in a node
+    if o.cmd == "host":
+        if o.host_cmd != "ls" and not o.host_name or o.host_cmd == "add" and not o.url:
+            raise SystemExit({"add": "host add NAME https://IP:PORT --fingerprint SHA256 (token: typed, piped, or "
+                                     "TERMINAL_CT_AGENT_TOKEN) | host add NAME ssh://[user@]host[:port]",
+                              "rm": "host rm NAME [--force]"}[o.host_cmd])
+        if o.host_cmd in ("rm",) and not is_host(o.host_name):
+            raise SystemExit(f"no host named {o.host_name!r} (terminal-ct host ls)")
+        out = ([n for n in node_ls() if n["kind"] == "host"] if o.host_cmd == "ls" else
+               host_add(o.host_name, o.url, o.fingerprint) if o.host_cmd == "add" else node_rm(o.host_name, o.force))
+        return print(json.dumps(out, indent=1))
     if o.cmd == "node":
         if o.node_cmd != "ls" and not o.node_name:
             raise SystemExit(f"node {o.node_cmd} NAME")

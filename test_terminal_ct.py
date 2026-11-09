@@ -1657,6 +1657,177 @@ class FakeVnc(unittest.TestCase):
         self.assertEqual(got["key"], struct.pack(">BBxxI", 4, 1, 0xFF0D))
 
 
+class Hosts(unittest.TestCase):
+    """Phase 11.2: other PCs as nodes (host add|ls|rm, --host); their calls go through NodeRemote._exec."""
+    FP = "ab" * 32
+
+    def setUp(self):
+        self.local = ct.NODE = FakeNode("podman")
+        ct.STORE = tempfile.mkdtemp()
+        self.engines, self.down, self.uname, self.execs = {}, set(), {}, []
+
+        def _exec(node, argv, timeout):
+            self.execs.append((node.name, argv))
+            if node.name in self.down:
+                raise RuntimeError("agent https://pc: connection refused")
+            if argv == ["uname", "-s"]:
+                return {"exit": 0, "stdout": self.uname.get(node.name, "Linux") + "\n", "stderr": ""}
+            if argv == ["true"]:
+                return {"exit": 0, "stdout": "", "stderr": ""}
+            if argv[0] == "df":
+                if argv[-1] != "/" and node.name in getattr(self, "mac", ()):  # Docker Desktop: store in its VM
+                    return {"exit": 1, "stdout": "Filesystem 1K-blocks Used Available\n", "stderr": "no such file"}
+                return {"exit": 0, "stdout": "Filesystem 1K-blocks Used Available\n/dev/sda1 9 1 10485760 1% /\n"}
+            if argv[0] == "docker":
+                if argv[1] == "version":
+                    return {"exit": 0, "stdout": "27.0\n", "stderr": ""}
+                r = self.engines.setdefault(node.name, FakeNode("docker")).run(argv[1:], check=False)
+                return {"exit": r.returncode, "stdout": r.stdout, "stderr": "no such object" if r.returncode else ""}
+            return {"exit": 0, "stdout": "", "stderr": ""}
+        alive = lambda name: name not in self.down
+        self.patches = [unittest.mock.patch.object(ct.NodeRemote, "_exec", _exec),
+                        unittest.mock.patch.object(ct, "host_alive", alive),
+                        unittest.mock.patch.object(ct, "UP_MAX_AGE", -1),
+                        unittest.mock.patch.object(ct, "vm_call", lambda *a, **k: [])]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        ct.NODE = None
+
+    def cli(self, *argv):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                ct.main(list(argv))
+        finally:
+            ct.NODE = self.local  # main sets it for its own command, refused or not
+        text = out.getvalue().strip()
+        return json.loads(text) if text else None
+
+    def add(self, name="pc1", url="https://192.168.1.20:7173"):
+        with unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_AGENT_TOKEN": "t" * 43}):
+            return self.cli("host", "add", name, url, "--fingerprint", self.FP.upper())
+
+    def test_add_checks_everything_first(self):
+        with unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_AGENT_TOKEN": "t" * 43}):
+            for argv, msg in ((["Bad", "https://1.2.3.4:7173"], "invalid"),
+                              (["pc1", "http://1.2.3.4"], "host address"),
+                              (["pc1", "https://u@1.2.3.4:7173"], "host address"),
+                              (["pc1", "https://1.2.3.4:x"], "host address"),
+                              (["pc1", "https://1.2.3.4/p"], "host address"),
+                              (["pc1", "https://:pw@1.2.3.4:7173"], "host address"),
+                              (["pc-", "https://1.2.3.4:7173"], "invalid"),
+                              (["pc.1", "https://1.2.3.4:7173"], "invalid"),
+                              (["pc1", "ssh://-oProxyCommand=x@pc"], "host address"),
+                              (["pc1", "https://1.2.3.4:7173", "--fingerprint", "12"], "fingerprint")):
+                with self.assertRaisesRegex(SystemExit, msg):
+                    self.cli("host", "add", *argv)
+        for bad in ("short", "t" * 40 + "\r\nX: y"):  # a header injection never reaches http.client
+            with unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_AGENT_TOKEN": bad}), \
+                    self.assertRaisesRegex(SystemExit, "token"):
+                self.cli("host", "add", "pc1", "https://1.2.3.4:7173", "--fingerprint", self.FP)
+        with unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_AGENT_TOKEN": "t" * 43}):
+            self.cli("host", "add", "v6", "https://[fd00::5]:7173", "--fingerprint", self.FP)
+            self.assertNotIn("TERMINAL_CT_AGENT_TOKEN", os.environ)  # not handed down to child processes
+        self.assertEqual(ct._hosts()["v6"]["url"], "https://[fd00::5]:7173")
+        self.cli("host", "rm", "v6")
+        self.uname["win"] = "MINGW64_NT"
+        with self.assertRaisesRegex(SystemExit, "Linux or macOS only"):
+            self.add("win")
+        self.down.add("off")
+        with self.assertRaisesRegex(SystemExit, "connection refused"):
+            self.add("off")
+        self.assertIn(("win", ["uname", "-s"]), self.execs)
+        self.assertEqual(ct._nodes()["nodes"], {})  # nothing registered by a failed add
+        with self.assertRaisesRegex(SystemExit, "host add NAME"):
+            self.cli("host", "add", "pc1")
+
+    def test_add_keeps_the_token_private(self):
+        r = self.add()
+        self.assertEqual((r["host"], r["os"], r["docker"]), ("pc1", "Linux", "27.0"))
+        h = ct._hosts()["pc1"]
+        self.assertEqual((h["fingerprint"], h["token"]), (self.FP, "t" * 43))  # lower-case, as compared
+        with open(os.path.join(ct.STORE, "nodes.json")) as f:
+            self.assertNotIn("t" * 43, f.read())                       # the shared registry never holds it
+        if not ct.WINDOWS:
+            self.assertEqual(os.stat(os.path.join(ct.STORE, "hosts.json")).st_mode & 0o777, 0o600)
+        with self.assertRaisesRegex(SystemExit, "already exists"):
+            self.add()
+        self.assertEqual(self.cli("host", "add", "pc2", "ssh://me@pc2")["host"], "pc2")  # nothing to type
+        self.assertEqual([(n["node"], n["status"]) for n in self.cli("host", "ls")],
+                         [("pc1", "running"), ("pc2", "running")])
+        with unittest.mock.patch.object(ct.sys, "stdin", io.StringIO("p" * 43 + "\n")), \
+                unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TERMINAL_CT_AGENT_TOKEN", None)
+            self.cli("host", "add", "pc3", "https://10.0.0.3:7173", "--fingerprint", self.FP)  # piped in
+        self.assertEqual(ct._hosts()["pc3"]["token"], "p" * 43)
+
+    def test_containers_on_another_pc(self):
+        self.add()
+        self.cli("--host", "pc1", "create", "web")
+        self.assertIn("tct-web", self.engines["pc1"].objects)                 # made there, not here
+        self.assertNotIn("tct-web", self.local.objects)
+        self.assertEqual(ct._nodes()["placement"], {"web": "pc1"})
+        self.cli("start", "web")                                               # routed by its placement
+        self.assertEqual(self.engines["pc1"].objects["tct-web"]["State"]["Status"], "running")
+        rows = {c["name"]: c.get("node") for c in self.cli("ls")}
+        self.assertEqual(rows, {"web": "pc1"})
+        for argv in (["--host", "pc1", "create", "d", "--desktop"], ["--host", "pc1", "create", "n", "--net", "lab"]):
+            with self.assertRaisesRegex(SystemExit, "phase 11 bis"):
+                self.cli(*argv)
+        with self.assertRaisesRegex(SystemExit, "phase 11 bis"):
+            self.cli("node", "join", "pc1", "lab")
+        ct.NODE = None
+        with ct.on_node("pc1"), self.assertRaisesRegex(RuntimeError, "another PC"):  # no terminal-ct copied there
+            ct.act("web", "screenshot", {})
+        ct.NODE = self.local
+        self.assertFalse([a for _, a in self.execs if "_act" in a or "mkdir" in " ".join(a)])
+        with self.assertRaisesRegex(SystemExit, "phase 11 bis"):
+            ct.apply({"stack": "d", "services": {"s": {"image": "alpine:3.20", "node": "pc1",
+                                                                             "desktop": True}}})
+        self.down.add("pc1")                                                   # that PC gone: left out of ls
+        self.assertEqual(self.cli("ls"), [])
+        self.assertEqual(self.cli("host", "ls")[0]["status"], "unreachable")
+        self.down.discard("pc1")
+        with self.assertRaisesRegex(SystemExit, "still has containers"):
+            self.cli("host", "rm", "pc1")
+        r = self.cli("host", "rm", "pc1", "--force")
+        self.assertEqual(r, {"removed": "pc1", "containers": ["web"]})
+        self.assertNotIn("tct-web", self.engines["pc1"].objects)
+        self.assertEqual((ct._hosts(), ct._nodes()["nodes"]), ({}, {}))
+        with self.assertRaisesRegex(SystemExit, "no host named"):
+            self.cli("host", "rm", "pc1")
+
+    def test_spread_counts_other_pcs(self):
+        self.add("pc1"); self.add("pc2", "https://192.168.1.21:7173")
+        ct.apply({"stack": "lab", "services": {"web": {"image": "alpine:3.20", "replicas": 2, "spread": "nodes"}}})
+        ct.reconcile("lab")
+        self.assertEqual(sorted(ct._nodes()["placement"].values()), ["pc1", "pc2"])  # one on each PC
+        self.down.add("pc2")
+        for _ in range(2):  # a missed ping or two (Wi-Fi, sleep): nothing moves, /data stays where it is
+            ct.reconcile("lab")
+            self.assertEqual(sorted(ct._nodes()["placement"].values()), ["pc1", "pc2"])
+        ct.reconcile("lab")
+        self.assertEqual(sorted(ct._nodes()["placement"].values()), ["pc1", "pc1"])  # third: moved to the PC still up
+        ct.apply({"stack": "desk", "services": {"d": {"image": "alpine:3.20", "spread": "nodes", "desktop": True}}})
+        self.assertNotIn("desk-d-1", ct._nodes()["placement"])  # never sent to another PC
+
+    def test_mac_with_docker_desktop(self):
+        self.uname["mac"], self.mac = "Darwin", {"mac"}
+        self.add("mac")
+        self.cli("--host", "mac", "create", "web")  # its quota: the Mac's own disk
+        self.assertIn("tct-web", self.engines["mac"].objects)
+        self.assertIn(("mac", ["df", "-Pk", "/"]), self.execs)
+
+    def test_quota_on_another_pc_is_not_all_of_it(self):
+        self.add()
+        with ct.on_node("pc1"):
+            limits, _ = ct.quota_limits({})
+        self.assertEqual((limits["cpus"], limits["memory_gb"]), (7, 12))  # 8 cores - 1, 75% of 16 GiB
+
+
 @unittest.skipUnless(shutil.which("openssl"), "the agent makes its certificate with openssl")
 class RemoteAgent(unittest.TestCase):
     """Phase 11.1: another PC's agent: pinned certificate, then token; exec, push, pull; SSH as the other way."""
