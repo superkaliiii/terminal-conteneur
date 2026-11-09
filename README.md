@@ -61,12 +61,31 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 | `bench [--runs 10] [--desktop]` | measure terminal-ct's operations on this engine, see [Measurements](#measurements) |
 | `skills get\|path\|install [--dir D]` | the agent's skill, see [Agent skill](#agent-skill) |
 | `doctor`, `version`, `help` | checks |
+| `node add NAME [--image debian\|alpine] [--cpus 2] [--memory 2] [--disk 20]`, `node ls`, `node rm NAME [--force]` | nodes: Linux VMs of terminal-vm running Docker, see [Nodes](#nodes) |
 
 `--engine docker|podman` (or `TERMINAL_CT_ENGINE`) picks the engine; by default Podman if installed, else Docker.
+`--node NAME` runs the command in a node instead.
 
 Safety: every container terminal-ct makes is named `tct-NAME` and labelled `terminal-ct.*`; containers without
 those labels are never listed or touched. An image whose default command is a bare shell is kept running with
 `tail -f /dev/null` (under `--init`) so it can be used through `exec`.
+
+## Nodes
+
+A node is a Linux VM made by [terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm)
+(installed alongside: on the PATH, or `TERMINAL_VM="python3 /path/terminal_vm.py"`) that runs Docker: the isolation
+of a VM, the lightness of containers inside it.
+- `node add NAME [--image debian|alpine]` creates it from an official cloud image (`terminal-vm create --image
+  --node`), starts it, has terminal-vm restart it if it falls, and waits for its setup (WSL with KVM: Alpine ready
+  in about 60 s, Debian in about 120 s; it needs the internet the first time).
+- `--node NAME create ...` puts a container there; terminal-ct remembers it (`STORE/nodes.json`), so `start`,
+  `stop`, `exec`, `logs`, `status`, `rm` of that container go to its node without `--node`. `--node NAME ls`, `top`,
+  `quota` show the node's own containers and capacity.
+- terminal-ct stays on the host and decides: each engine call is `docker ...` run in the node by its guest agent
+  (`terminal-vm exec`), no network port opened, nothing listening (about 0.15 s per call; a command takes about 1 s).
+- `node rm NAME` refuses while containers live there; `--force` removes them first (their `/data` with them).
+- Not yet in a node: desktops, file copies, snapshots and clones (later steps of phase 9), and the
+  host's `ls`/dashboard listing nodes' containers.
 
 ## Desktops
 

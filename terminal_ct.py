@@ -125,6 +125,12 @@ class Node:
         out = self.run(args).stdout.strip()
         return json.loads(out) if out else []
 
+    def free_bytes(self, root):
+        try:
+            return host_free_bytes(root)
+        except OSError:  # the engine's store is in another machine (Docker Desktop's VM): use ours
+            return host_free_bytes(STORE if os.path.isdir(STORE) else os.path.dirname(STORE))
+
     def pipe(self, args, stdin=None, stdout=None):
         """An engine call with binary files as stdin/stdout (tar streams)."""
         with open(stdin, "rb") if stdin else contextlib.nullcontext() as i, \
@@ -147,6 +153,157 @@ def node_for(engine):
     if engine not in _NODES:
         _NODES[engine] = Node(engine)
     return _NODES[engine]
+
+
+# ---------- nodes: Linux VMs of terminal-vm running Docker (phase 9) ----------
+# terminal-ct stays on the host and decides (state, quota, stacks); a node only runs `docker` commands, sent through
+# its guest agent by terminal-vm's `exec`: no network, no port, nothing to install on the host.
+
+
+class NodeVM(Node):
+    """Where containers run when they run in a node VM: each engine call is `docker ...` in that VM."""
+    def __init__(self, name):
+        self.name, self.engine = name, "docker"
+
+    def run(self, args, check=True, timeout=None, capture=True):
+        t = timeout or (600 if capture else 3600)  # uncaptured: a pull or a build, minutes on a slow link
+        try:
+            r = vm_call(["exec", self.name, "--timeout", str(t), "--", "docker", *args], timeout=t + 30)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            raise SystemExit(f"node {self.name}: {e}") from None
+        if not capture and r.get("stdout"):
+            sys.stderr.write(r["stdout"])  # progress (pull, build): stdout is the JSON reply
+        cp = subprocess.CompletedProcess(["docker", *args], r.get("exit", 1), r.get("stdout", ""), r.get("stderr", ""))
+        if check and cp.returncode:
+            raise SystemExit((cp.stderr or cp.stdout or f"docker {args[0]} failed on node {self.name}").strip())
+        return cp
+
+    def host(self):
+        if not hasattr(self, "_host"):
+            c, m, root = self.run(["info", "--format", "{{.NCPU}} {{.MemTotal}} {{.DockerRootDir}}"]).stdout.split(None, 2)
+            self._host = int(c), int(m) / 2 ** 30, root.strip()
+        return self._host
+
+    def free_bytes(self, root):
+        try:
+            r = vm_call(["exec", self.name, "--timeout", "30", "--", "df", "-Pk", root], timeout=60)
+            return int(r["stdout"].splitlines()[-1].split()[3]) * 1024
+        except (RuntimeError, subprocess.TimeoutExpired, KeyError, IndexError, ValueError) as e:
+            raise SystemExit(f"node {self.name}: cannot read its free disk space ({e})") from None
+
+    def pipe(self, args, stdin=None, stdout=None):
+        # shortcut: no binary streams through the guest agent yet; file copies and snapshots on a node come in 9.5
+        raise SystemExit(f"file copies and snapshots of a container on a node come later (node {self.name})")
+
+
+def _nodes():
+    try:
+        with open(os.path.join(STORE, "nodes.json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    return {"nodes": d.get("nodes", {}), "placement": d.get("placement", {})}
+
+
+def _save_nodes(d):
+    os.makedirs(STORE, exist_ok=True)
+    _write_atomic(os.path.join(STORE, "nodes.json"), json.dumps(d, indent=1))
+
+
+def node_named(name):
+    if name not in _nodes()["nodes"]:
+        raise SystemExit(f"no node named {name!r} (terminal-ct node ls; node add NAME)")
+    return NodeVM(name)
+
+
+def place(container, node_name):
+    """Remember where a container lives, so later commands on it go to its node."""
+    with quota_lock("nodes"):
+        d = _nodes()
+        if node_name:
+            d["placement"][container] = node_name
+        else:
+            d["placement"].pop(container, None)
+        _save_nodes(d)
+
+
+def _vm(args, timeout=60):
+    """terminal-vm's command line for the node commands: its failures as terminal-ct's own (no traceback)."""
+    try:
+        return vm_call(args, timeout=timeout)
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        raise SystemExit(f"terminal-vm {args[0]}: {e}") from None
+
+
+def node_add(name, image="debian", cpus=2, memory=2, disk=20, project=None, wait=900):
+    """A node: a terminal-vm VM from a cloud image with Docker, supervised (restarted if it falls). Registered as
+    soon as its VM exists, so a failure after that is cleaned up by node rm."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", name or ""):  # a container name terminal-vm also takes as a VM
+        raise SystemExit(f"invalid node name {name!r} (lowercase letters, digits, _ and -)")
+    if name in _nodes()["nodes"]:
+        raise SystemExit(f"node {name!r} already exists")
+    t0 = time.monotonic()
+    made = _vm(["create", name, "--image", image, "--node", "--cpus", str(cpus), "--memory", str(memory),
+                "--disk", str(disk), *(["--project", check_project(project)] if project else [])], timeout=1800)
+    ready = made.get("ready_file") or "/var/lib/terminal-vm/ready"  # left by cloud-init once Docker answers
+    with quota_lock("nodes"):
+        d = _nodes()
+        d["nodes"][name] = {"image": image, "added": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        _save_nodes(d)
+    event("node_added", None, detail=f"{name} ({image})")
+    _vm(["start", name], timeout=120)
+    _vm(["supervise", name, "--restart", "always"])
+    end, said = time.monotonic() + wait, 0
+    while time.monotonic() < end:
+        with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
+            if vm_call(["exec", name, "--timeout", "10", "--", "test", "-f", ready], timeout=40)["exit"] == 0:
+                return {"node": name, "image": image, "ready_s": round(time.monotonic() - t0, 1)}
+        if time.monotonic() - t0 > said + 30:
+            said = time.monotonic() - t0
+            print(f"node {name}: setting up ({int(said)} s)", file=sys.stderr)
+        time.sleep(3)
+    raise SystemExit(f"node {name} is not ready after {wait} s (its setup needs the internet): "
+                     f"terminal-vm status {name}; remove it with terminal-ct node rm {name}")
+
+
+def node_ls():
+    d, vms = _nodes(), {}
+    with contextlib.suppress(RuntimeError, ValueError, subprocess.TimeoutExpired):
+        vms = {v["name"]: v for v in vm_call(["ls"])}
+    return [{"node": n, "image": info.get("image"), "status": vms.get(n, {}).get("status", "missing"),
+             "containers": sorted(c for c, where in d["placement"].items() if where == n)}
+            for n, info in sorted(d["nodes"].items())]
+
+
+def node_rm(name, force=False):
+    """Remove a node and its VM. Its containers: refused, or with force removed first (their data goes too)."""
+    node_named(name)
+    on = sorted(c for c, where in _nodes()["placement"].items() if where == name)
+    if on and not force:
+        raise SystemExit(f"node {name} still has containers ({', '.join(on)}): rm them, or node rm {name} --force")
+    status = {v["name"]: v for v in _vm(["ls"])}.get(name, {}).get("status", "missing")
+    if on and status == "running":
+        before, _LOCAL.node = getattr(_LOCAL, "node", None), NodeVM(name)
+        try:
+            for c in on:
+                with contextlib.suppress(SystemExit):
+                    quiet(rm, c)
+        finally:
+            _LOCAL.node = before
+    for c in on:  # their state on this host, whether rm reached the node or not: never inherited by a new one
+        shutil.rmtree(os.path.join(STORE, c), ignore_errors=True)
+    if status not in ("stopped", "missing"):
+        _vm(["stop", name, "--force"])
+        time.sleep(1)
+    if status != "missing":  # its VM already removed by hand: only the registry is left to clean
+        _vm(["rm", name], timeout=120)
+    with quota_lock("nodes"):
+        d = _nodes()
+        d["nodes"].pop(name, None)
+        d["placement"] = {c: n for c, n in d["placement"].items() if n != name}
+        _save_nodes(d)
+    event("node_removed", None, detail=name)
+    return {"removed": name, "containers": on}
 
 
 def node():
@@ -306,9 +463,14 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     labels: more terminal-ct.* labels (a stack's service and replica)."""
     check_name(name)
     project = check_project(project or DEFAULT_PROJECT)
+    where = _nodes()["placement"].get(name)  # one NAME across host and nodes: they share STORE/NAME
+    if where and not (isinstance(node(), NodeVM) and node().name == where):
+        raise SystemExit(f"{name!r} already exists (in node {where})")
     recover(name)  # an interrupted remake's container is still NAME's: never create over it
     if node().run(["inspect", "--type", "container", PREFIX + name], check=False).returncode == 0:
         raise SystemExit(f"{name!r} already exists (engine name {PREFIX}{name})")
+    if desktop and isinstance(node(), NodeVM):
+        raise SystemExit("desktop containers on a node come later (phase 9.5): create it on this host")
     if desktop:
         if WINDOWS:  # shortcut: the VNC unix socket does not cross into Windows; run terminal-ct inside WSL there
             raise SystemExit("desktop containers need a Linux host or WSL (the screen is reached through a unix socket)")
@@ -695,10 +857,7 @@ def quota_limits(use):
     of the space containers can have (free now plus what they hold), 16 running containers."""
     set_ = _quota_file()
     cpus, mem, root = node().host()
-    try:
-        free = host_free_bytes(root)
-    except OSError:  # the engine's store is in another machine (Docker Desktop's VM): use ours
-        free = host_free_bytes(STORE if os.path.isdir(STORE) else os.path.dirname(STORE))
+    free = node().free_bytes(root)
     default = {"cpus": max(1, cpus - 1), "memory_gb": max(1, int(mem * 3 // 4)),
                "disk_gb": int((free / 2 ** 30 + use.get("disk_gb", 0)) // 2), "containers": 16}
     return {k: set_.get(k, default[k]) for k in QUOTA_KEYS}, {k: k in set_ for k in QUOTA_KEYS}
@@ -3804,7 +3963,14 @@ def main(argv=None):
         argv, cmd_args = argv[:i], argv[i + 1:]
     p = argparse.ArgumentParser(prog="terminal-ct", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--engine", choices=["docker", "podman"])
+    p.add_argument("--node", help="run in this node (a Linux VM of terminal-vm with Docker; see node add)")
     sub = p.add_subparsers(dest="cmd", required=True)
+    nd = sub.add_parser("node"); nd.add_argument("node_cmd", choices=["add", "ls", "rm"]); nd.add_argument("node_name", nargs="?")
+    nd.add_argument("--image", dest="node_image", choices=["debian", "alpine"], default="debian")
+    nd.add_argument("--cpus", dest="node_cpus", type=int, default=2)
+    nd.add_argument("--memory", dest="node_memory", type=int, default=2, help="GiB")
+    nd.add_argument("--disk", dest="node_disk", type=int, default=20, help="GiB")
+    nd.add_argument("--project", dest="node_project"); nd.add_argument("--force", action="store_true")
     c = sub.add_parser("create"); c.add_argument("name"); c.add_argument("--image", default=DEFAULT_IMAGE)
     c.add_argument("--cpus", type=float); c.add_argument("--memory", type=float, help="GiB")
     c.add_argument("--desktop", action="store_true", help="Xvnc + Openbox on top of the image")
@@ -3862,16 +4028,32 @@ def main(argv=None):
         sub.add_parser(n)
     o = p.parse_args(argv)
     global NODE
+    if o.engine and o.node:
+        raise SystemExit("--engine or --node, not both (a node runs Docker)")
     if o.engine:
         NODE = Node(pick_engine(o.engine))
+    elif o.node:
+        NODE = node_named(o.node)
+    elif o.cmd != "node" and isinstance(getattr(o, "name", None), str) and o.name in _nodes()["placement"]:
+        NODE = NodeVM(_nodes()["placement"][o.name])  # that container lives in a node
+    if o.cmd == "node":
+        if o.node_cmd != "ls" and not o.node_name:
+            raise SystemExit(f"node {o.node_cmd} NAME")
+        out = (node_ls() if o.node_cmd == "ls" else
+               node_add(o.node_name, o.node_image, o.node_cpus, o.node_memory, o.node_disk, o.node_project)
+               if o.node_cmd == "add" else node_rm(o.node_name, o.force))
+        return print(json.dumps(out, indent=1))
     if o.cmd == "help": return p.print_help()
     if o.cmd == "version": return print(VERSION)
     if o.cmd == "doctor": return doctor()
     if o.cmd == "ls": return ls()
     if o.cmd == "create":
-        return create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width,
-                      height=o.height, sandbox=o.sandbox, internet=False if o.offline else None, nets=o.net,
-                      project=o.project)
+        r = create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width,
+                   height=o.height, sandbox=o.sandbox, internet=False if o.offline else None, nets=o.net,
+                   project=o.project)
+        if isinstance(NODE, NodeVM):
+            place(o.name, NODE.name)
+        return r
     show_json = lambda r: print(json.dumps(r, indent=1))
     if o.cmd == "resume": return resume(o.stay)
     if o.cmd == "apply":
@@ -3965,7 +4147,11 @@ def main(argv=None):
         return
     if o.cmd == "start": return start(o.name)
     if o.cmd == "stop": return stop(o.name, o.timeout)
-    if o.cmd == "rm": return rm(o.name)
+    if o.cmd == "rm":
+        r = rm(o.name)
+        if isinstance(NODE, NodeVM):  # removed from its node; a same-named local one (--engine) leaves it placed
+            place(o.name, None)
+        return r
     if o.cmd == "status": return status(o.name)
     if o.cmd == "exec":
         out = exec_(o.name, o.command or cmd_args, o.timeout)

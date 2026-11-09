@@ -804,6 +804,131 @@ class SharedDashboard(unittest.TestCase):
             self.assertEqual(mine, self.block(other))
 
 
+class Nodes(unittest.TestCase):
+    """Phase 9.2: nodes are terminal-vm VMs with Docker; engine calls go there through `terminal-vm exec`."""
+
+    def setUp(self):
+        self.local = ct.NODE = FakeNode("podman")
+        ct.STORE = tempfile.mkdtemp()
+        self.engines, self.vm_calls, self.vms = {}, [], {}
+
+        def vm_call(args, timeout=60, **k):
+            self.vm_calls.append(args)
+            if args[0] == "exec":
+                name, argv = args[1], args[args.index("--") + 1:]
+                if argv[0] == "docker":
+                    r = self.engines.setdefault(name, FakeNode("docker")).run(argv[1:], check=False)
+                    return {"exit": r.returncode, "stdout": r.stdout, "stderr": "no such object" if r.returncode else ""}
+                if argv[0] == "df":
+                    return {"exit": 0, "stdout": "Filesystem 1K-blocks Used Available\n/dev/vda1 20000000 1 10485760 1% /\n"}
+                return {"exit": 0, "stdout": "", "stderr": ""}                   # test -f ready
+            if args[0] == "create":
+                self.vms[args[1]] = "stopped"
+            elif args[0] == "start":
+                if getattr(self, "fail_start", False):
+                    raise RuntimeError("quota exceeded")
+                self.vms[args[1]] = "running"
+            elif args[0] == "stop":
+                self.vms[args[1]] = "stopped"
+            elif args[0] == "rm":
+                self.vms.pop(args[1])
+            elif args[0] == "ls":
+                return [{"name": n, "status": s} for n, s in self.vms.items()]
+            return {}
+        self.patch = unittest.mock.patch.object(ct, "vm_call", vm_call)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        ct.NODE = None
+
+    def cli(self, *argv):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ct.main(list(argv))
+        ct.NODE = self.local                                                   # main sets it for its own command
+        text = out.getvalue().strip()
+        return json.loads(text) if text else None
+
+    def test_add_create_follow_and_remove(self):
+        r = self.cli("node", "add", "n1", "--image", "alpine", "--memory", "1")
+        self.assertEqual(r["node"], "n1")
+        self.assertIn(["create", "n1", "--image", "alpine", "--node", "--cpus", "2", "--memory", "1", "--disk", "20"],
+                      self.vm_calls)
+        self.assertIn(["supervise", "n1", "--restart", "always"], self.vm_calls)          # restarted if it falls
+        self.cli("--node", "n1", "create", "web")
+        node = self.engines["n1"]
+        self.assertIn("tct-web", node.objects)                                       # created in the node...
+        self.assertNotIn("tct-web", self.local.objects)                              # ...not on this host
+        self.cli("start", "web")                                                     # no --node: it is remembered
+        self.assertEqual(node.objects["tct-web"]["State"]["Status"], "running")
+        self.assertEqual(self.cli("node", "ls")[0]["containers"], ["web"])
+        with self.assertRaisesRegex(SystemExit, "still has containers"):
+            self.cli("node", "rm", "n1")
+        self.cli("rm", "web")
+        self.assertNotIn("tct-web", node.objects)
+        self.assertEqual(self.cli("node", "ls")[0]["containers"], [])
+        self.assertEqual(self.cli("node", "rm", "n1")["removed"], "n1")
+        self.assertEqual((self.cli("node", "ls"), self.vms), ([], {}))
+
+    def test_force_removes_its_containers_first(self):
+        self.cli("node", "add", "n1")
+        self.cli("--node", "n1", "create", "a")
+        self.assertEqual(self.cli("node", "rm", "n1", "--force")["containers"], ["a"])
+        self.assertNotIn("tct-a", self.engines["n1"].objects)
+
+    def test_refused(self):
+        with self.assertRaisesRegex(SystemExit, "no node named"):
+            self.cli("--node", "nope", "ls")
+        self.cli("node", "add", "n1")
+        with self.assertRaisesRegex(SystemExit, "not both"):
+            self.cli("--engine", "docker", "--node", "n1", "ls")
+        with self.assertRaisesRegex(SystemExit, "desktop containers on a node"):
+            self.cli("--node", "n1", "create", "d", "--desktop")
+        with self.assertRaisesRegex(SystemExit, "already exists"):
+            self.cli("node", "add", "n1")
+
+    def test_failures_leave_nothing_stuck(self):
+        self.fail_start = True                                                   # VM made, start refused
+        with self.assertRaisesRegex(SystemExit, "terminal-vm start: quota exceeded"):
+            self.cli("node", "add", "n1")
+        self.assertEqual(self.cli("node", "ls")[0]["node"], "n1")                # registered: node rm can clean it
+        self.assertEqual(self.cli("node", "rm", "n1")["removed"], "n1")
+        self.assertEqual(self.vms, {})
+        self.fail_start = False
+        self.cli("node", "add", "n2")
+        del self.vms["n2"]                                                       # its VM removed by hand
+        self.assertEqual(self.cli("node", "ls")[0]["status"], "missing")
+        self.assertEqual(self.cli("node", "rm", "n2")["removed"], "n2")          # only the registry to clean
+        with self.assertRaisesRegex(SystemExit, "invalid node name"):
+            self.cli("node", "add", "a.b")
+
+    def test_one_name_across_host_and_nodes(self):
+        self.cli("node", "add", "n1")
+        self.cli("--node", "n1", "create", "web")
+        with self.assertRaisesRegex(SystemExit, "in node n1"):
+            quiet(ct.create, "web")                                              # MCP, web: never a local twin
+        self.local.objects["tct-web"] = dict(self.engines["n1"].objects["tct-web"])  # one made before this rule
+        with unittest.mock.patch.object(ct, "pick_engine", lambda e: e), \
+                unittest.mock.patch.object(ct, "Node", lambda e: self.local):
+            self.cli("--engine", "podman", "rm", "web")                          # removes the local one...
+        self.assertNotIn("tct-web", self.local.objects)
+        self.assertEqual(self.cli("node", "ls")[0]["containers"], ["web"])       # ...the node's stays placed
+        os.makedirs(os.path.join(ct.STORE, "web"), exist_ok=True)
+        self.vms["n1"] = "stopped"                                               # node down: force still cleans up
+        self.cli("node", "rm", "n1", "--force")
+        self.assertFalse(os.path.exists(os.path.join(ct.STORE, "web")))
+
+    def test_engine_errors_and_free_space(self):
+        n = ct.NodeVM("n1")
+        with self.assertRaisesRegex(SystemExit, "no such object"):
+            n.run(["inspect", "--type", "container", "tct-x"])
+        self.assertEqual(n.run(["inspect", "--type", "container", "tct-x"], check=False).returncode, 1)
+        self.assertEqual(n.free_bytes("/var/lib/docker"), 10485760 * 1024)
+        self.assertEqual(n.host(), (8, 16.0, ct.STORE))
+        with self.assertRaisesRegex(SystemExit, "come later"):
+            n.pipe(["cp"])
+
+
 class SnapshotsAndClones(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
