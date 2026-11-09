@@ -1071,6 +1071,16 @@ def node_rm(name, force=False):
             hosts = _hosts()
             hosts.pop(name, None)
             _save_hosts(hosts)
+    if host:  # another machine added later under this name is approved for nothing, and has no quota of this one
+        with quota_lock("stacks"):
+            for sn in stacks():
+                with contextlib.suppress(SystemExit, OSError, ValueError):
+                    st_ = load_stack(sn)
+                    if name in st_.get("approved_hosts", ()):
+                        st_["approved_hosts"] = [h for h in st_["approved_hosts"] if h != name]
+                        _save_stack(st_)
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(STORE, f"quota-{name}.json"))
     _DEPLOYED.discard(name)  # a new node of that name has no terminal-ct yet, nor these
     _NET_CHECKED.pop(name, None)
     for k in [k for k in _DNS_SENT if k[0] == name]:
@@ -1601,9 +1611,14 @@ def parse_size(s):
     return float(m.group(1)) * _UNITS[m.group(2).lower()] if m else 0
 
 
+def _quota_path():
+    """This PC's quota.json; another PC's quota-NAME.json (terminal-ct --host NAME quota ...)."""
+    return os.path.join(STORE, f"quota-{node().name}.json" if isinstance(node(), NodeRemote) else "quota.json")
+
+
 def _quota_file():
     try:
-        with open(os.path.join(STORE, "quota.json")) as f:
+        with open(_quota_path()) as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -1683,7 +1698,7 @@ def quota_limits(use):
     cpus, mem, root = node().host()
     free = node().free_bytes(root)
     own = type(node()) is NodeVM  # a VM node is all theirs; another PC is someone's computer, as this one is
-    set_ = {} if isinstance(node(), NodeVM) else _quota_file()  # this PC's quota is for this PC
+    set_ = {} if own else _quota_file()  # another PC: its own quota (quota-NAME.json), never this PC's
     default = {"cpus": cpus if own else max(1, cpus - 1),
                "memory_gb": max(1, round(mem)) if own else max(1, int(mem * 3 // 4)),  # a 1 GiB VM shows ~0.95
                "disk_gb": int((free / 2 ** 30 + use.get("disk_gb", 0)) // 2), "containers": 16}
@@ -1745,12 +1760,15 @@ def quota_check(add):
 def quota(set_=None):
     """Show the quota and its use, or (user only) change it."""
     if set_ and any(v is not None for v in set_.values()):
+        if type(node()) is NodeVM:
+            raise SystemExit("a VM node's quota is its size (terminal-vm); set the quota of this PC, or of another "
+                             "PC with --host")
         if any(v is not None and v < 1 for v in set_.values()):
             raise SystemExit("quota values must be at least 1")
         with quota_lock():
             stored = _quota_file()
             stored.update({k: v for k, v in set_.items() if v is not None})
-            with open(os.path.join(STORE, "quota.json"), "w") as f:
+            with open(_quota_path(), "w") as f:
                 json.dump(stored, f)
     use = quota_usage()
     lim, chosen = quota_limits(use)
@@ -2447,6 +2465,9 @@ def _reconcile(s, st, now):
         elif ok is False and is_host(n):  # another PC not answering: Wi-Fi, sleep, an agent restarting, until the
             fails[n] = fails.get(n, 0) + 1  # third pass in a row (moving a replica starts it with an empty /data)
             up[n] = False if fails[n] >= 3 else None
+    hosts = {n for n, i in _nodes()["nodes"].items() if i.get("kind") == "host"}
+    may = up if owner != "agent" else {n: v for n, v in up.items()  # an agent: other PCs the user approved only
+                                       if n not in hosts or n in s.get("approved_hosts", ())}
     load = collections.Counter(placement.values())
     on_nets = nodes_on_nets() if any(c.get("networks") for c in s["services"].values()) and up else {}
     known = networks()
@@ -2469,15 +2490,22 @@ def _reconcile(s, st, now):
                 copies, mem = have.pop(cname, []), st.setdefault(cname, {})
                 if mem.get("expired") and not copies:
                     continue  # its ttl is over and nothing is left of it: nowhere to place it
-                target = _target(cname, c, up, placement, load, on_nets)
+                target = _target(cname, c, may, placement, load, on_nets)
+                keep = [w for _, w in copies if w is None or w in may]  # never kept on a PC the agent may not use
                 if target is False:
-                    if not copies:
+                    if not keep:
                         if not mem.get("pending"):  # said once, not every pass while the node is down
-                            ev("pending", svc, cname, f"node {c['node']} is down" if c.get("node") else
-                       "no free node on its networks" if c.get("networks") else "no node runs")
+                            ev("pending", svc, cname,
+                               f"{c['node']} is another PC not approved for the agent: apply the stack again"
+                               if c.get("node") in hosts and c["node"] not in may else
+                               f"node {c['node']} is down" if c.get("node") else
+                               "no free node on its networks" if c.get("networks") else "no node runs")
                         mem["pending"] = True
+                        for _, w in copies:  # a copy where the agent may not be: gone
+                            with on_node(w):
+                                _rm_copy(cname)
                         continue
-                    target = copies[0][1]  # keep it where it still runs
+                    target = keep[0]  # keep it where it still runs
                 mem.pop("pending", None)
                 if target and up.get(target) is None:
                     continue  # its node did not answer this pass: left as it is
@@ -2641,7 +2669,7 @@ def _probe(s, st, now, where):
     return results
 
 
-def apply(s, created_by="user", project=None, approved_networks=()):
+def apply(s, created_by="user", project=None, approved_networks=(), approved_hosts=()):
     """Store a desired state and reconcile it once now; the daemon keeps it so (started if it does not run).
     Applying again also runs again the replicas whose ttl had expired."""
     s = check_stack(s)
@@ -2668,6 +2696,8 @@ def apply(s, created_by="user", project=None, approved_networks=()):
         s.update(created_by=created_by, engine=node().engine)
         if approved_networks:
             s["approved_networks"] = sorted(set(approved_networks))
+        if approved_hosts:
+            s["approved_hosts"] = sorted(set(approved_hosts))
         if not s.get("project"):
             s.pop("project", None)
         _save_stack(s)
@@ -2692,7 +2722,7 @@ def scale(stack, service, replicas):
         if service not in s["services"]:
             raise SystemExit(f"stack {stack} has no service {service!r} ({', '.join(s['services'])})")
         s["services"][service]["replicas"] = replicas
-        keep = {k: s[k] for k in ("created_by", "engine", "approved_networks") if k in s}
+        keep = {k: s[k] for k in ("created_by", "engine", "approved_networks", "approved_hosts") if k in s}
         s = dict(check_stack(s), **keep)
         _save_stack(s)
     event("scaled", stack, service, detail=f"{replicas} replicas")
@@ -4765,7 +4795,10 @@ def stack_in_scope(stack, project, approve=None):
     if s.get("created_by") != "agent":
         if approve is None:
             raise SystemExit(f"stack {stack!r} belongs to the user")
-        approve(f"Let the agent change your stack {stack}?", f"terminal-ct stack ... {stack}")
+        pcs = sorted(n for n, i in _nodes()["nodes"].items() if i.get("kind") == "host"
+                     and any(c.get("spread") or c.get("node") == n for c in s["services"].values()))
+        approve(f"Let the agent change your stack {stack}?" + (f" It runs on your other PCs too ({', '.join(pcs)})."
+                                                                if pcs else ""), f"terminal-ct stack ... {stack}")
     return s
 
 
@@ -4833,6 +4866,8 @@ def agent_call(tool, a, approve, project=None):
             raise SystemExit(f"network {net!r} is not one this agent created")
         return net_rm(net)
     if tool == "ct_create":
+        if name in _nodes()["placement"]:  # an agent's new container starts on this PC, never through a name's node
+            raise SystemExit(f"the name {name!r} is not available: choose another")
         if node().run(["inspect", "--type", "container", PREFIX + check_name(name)], check=False).returncode == 0:
             raise SystemExit(f"the name {name!r} is not available: choose another")  # same answer, any project
         img, desk = a.get("image") or DEFAULT_IMAGE, bool(a.get("desktop"))
@@ -4854,7 +4889,16 @@ def agent_call(tool, a, approve, project=None):
                                            c.get("internet"), c.get("networks") or [], approve, nets, project)
         if st["stack"] in stacks():
             stack_in_scope(st["stack"], project)
-        return apply(st, created_by="agent", project=where, approved_networks=approved)
+        hosts = [n for n, i in _nodes()["nodes"].items() if i.get("kind") == "host"]
+        before = load_stack(st["stack"]).get("approved_hosts", []) if st["stack"] in stacks() else []
+        allowed = [h for h in before if h in hosts]
+        for h in sorted({c["node"] for c in st["services"].values() if c.get("node") in hosts} |
+                        (set(hosts) if any(c.get("spread") for c in st["services"].values()) else set())):
+            if h not in allowed:  # someone's PC: the user says so, once per PC for this stack
+                approve(f"Let the agent run containers of its stack {st['stack']} on your other PC {h}?",
+                        f"terminal-ct apply STACK.json (yourself), or keep the agent's stack on this PC")
+                allowed.append(h)
+        return apply(st, created_by="agent", project=where, approved_networks=approved, approved_hosts=allowed)
     if tool == "ct_scale":
         stack_in_scope(a["stack"], project, approve)
         return scale(a["stack"], a["service"], int(a["replicas"]))
@@ -4883,6 +4927,8 @@ def agent_call(tool, a, approve, project=None):
                     f"terminal-ct clone {name} {a['new']}")
         if node().run(["inspect", "--type", "container", PREFIX + check_name(a["new"])], check=False).returncode == 0:
             raise SystemExit(f"the name {a['new']!r} is not available: choose another")
+        if isinstance(node(), NodeRemote):  # a new container on someone's PC: through an approved stack only
+            raise SystemExit(f"{name} is on another PC ({node().name}): an agent clones only on this PC")
         return clone(name, a["new"], created_by="agent", project=where or labels_of(info).get(f"{LABEL}.project"),
                      internet=False if users else None)
     if tool == "ct_start":

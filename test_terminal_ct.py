@@ -1826,6 +1826,65 @@ class Hosts(unittest.TestCase):
         with ct.on_node("pc1"):
             limits, _ = ct.quota_limits({})
         self.assertEqual((limits["cpus"], limits["memory_gb"]), (7, 12))  # 8 cores - 1, 75% of 16 GiB
+        self.cli("--host", "pc1", "quota", "--cpus", "3", "--memory", "4")       # set for that PC alone
+        self.assertTrue(os.path.isfile(os.path.join(ct.STORE, "quota-pc1.json")))
+        with ct.on_node("pc1"):
+            limits, chosen = ct.quota_limits({})
+        self.assertEqual((limits["cpus"], limits["memory_gb"], chosen["cpus"]), (3, 4, True))
+        limits, chosen = ct.quota_limits({})                                    # this PC: untouched
+        self.assertFalse(chosen["cpus"])
+
+    def test_agent_needs_approval_per_pc(self):
+        self.add("pc1")
+        asked = []
+
+        def no(msg, cli):
+            asked.append(msg)
+            raise RuntimeError("the user said no")
+        st = {"stack": "ag", "services": {"w": {"image": "alpine:3.20", "spread": "nodes", "replicas": 2}}}
+        with self.assertRaisesRegex(RuntimeError, "said no"):
+            ct.agent_call("ct_apply", {"stack": dict(st, approved_hosts=["pc1"])}, no, None)  # its own say: dropped
+        self.assertIn("other PC pc1", asked[0])
+        self.assertNotIn("ag", ct.stacks())
+        r = ct.agent_call("ct_apply", {"stack": st}, lambda m, c: asked.append(m), None)
+        self.assertEqual(ct.load_stack("ag")["approved_hosts"], ["pc1"])
+        self.assertEqual(sorted(ct._nodes()["placement"].values()), ["pc1", "pc1"])
+        n = len(asked)
+        ct.agent_call("ct_apply", {"stack": st}, no, None)                      # asked once per PC, not again
+        self.assertEqual(len(asked), n)
+        self.add("pc2", "https://192.168.1.21:7173")                            # added later: not approved
+        self.down.add("pc1")
+        for _ in range(3):
+            ct.reconcile("ag")
+        self.assertNotIn("pc2", ct._nodes()["placement"].values())              # never placed there unasked
+        self.assertIsNotNone(r)
+
+    def test_agent_paths_around_the_approval(self):
+        self.add("pc1")
+        yes = lambda m, c: None
+        ct.place("ghost", "pc1")                                               # a placement left without a container
+        with self.assertRaisesRegex(SystemExit, "not available"):
+            ct.agent_call("ct_create", {"name": "ghost"}, yes, None)
+        self.assertNotIn("tct-ghost", self.engines.get("pc1", FakeNode()).objects)
+        # an agent stack pinned to pc1 from before approvals existed: its replica leaves pc1, it is not kept there
+        ct.apply({"stack": "old", "services": {"w": {"image": "alpine:3.20", "node": "pc1"}}}, created_by="agent")
+        self.assertNotIn("old-w-1", ct._nodes()["placement"])
+        evs = [e for e in ct.events("old", 20) if e["event"] == "pending"]
+        self.assertIn("not approved", evs[-1]["detail"])
+        # approved, then the PC removed and another machine added under its name: asked again
+        ct.agent_call("ct_apply", {"stack": {"stack": "ag", "services": {"w": {"image": "alpine:3.20", "node": "pc1"}}}},
+                      yes, None)
+        self.assertEqual(ct.load_stack("ag")["approved_hosts"], ["pc1"])
+        self.cli("--host", "pc1", "quota", "--cpus", "2")
+        self.cli("host", "rm", "pc1", "--force")
+        self.assertEqual(ct.load_stack("ag").get("approved_hosts"), [])
+        self.assertFalse(os.path.exists(os.path.join(ct.STORE, "quota-pc1.json")))
+
+    def test_quota_of_a_vm_node_is_its_size(self):
+        d = ct._nodes(); d["nodes"]["vm1"] = {"image": "alpine"}; ct._save_nodes(d)
+        with ct.on_node("vm1"), self.assertRaisesRegex(SystemExit, "its size"):
+            ct.quota({"cpus": 2})
+        self.assertFalse(os.path.exists(os.path.join(ct.STORE, "quota.json")))
 
 
 @unittest.skipUnless(shutil.which("openssl"), "the agent makes its certificate with openssl")
