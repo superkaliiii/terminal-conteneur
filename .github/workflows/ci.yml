@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests (stdlib only, simulated engine)
+        run: python -m unittest -v test_terminal_ct
+  real-engines:
+    # Ubuntu runners ship Docker and Podman: the same real tests as in WSL (create, exec, snapshots, clones...)
+    runs-on: ubuntu-latest
+    env:
+      TERMINAL_CT_REAL: "1"
+      TERMINAL_CT_HOME: ${{ github.workspace }}/.tct-store
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Engines
+        run: |
+          docker version
+          podman version
+          # rootless Podman without a systemd user session may lack the cpu/memory cgroup controllers that
+          # terminal-ct's ceilings need: test it only where it can set them
+          if podman run --rm --cpus 1 --memory 64m alpine:3.20 true; then
+            echo "TERMINAL_CT_REAL_ENGINES=podman docker" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Podman cannot set CPU/memory limits on this runner: real tests on Docker only"
+            echo "TERMINAL_CT_REAL_ENGINES=docker" >> "$GITHUB_ENV"
+          fi
+      - name: Real tests
+        run: python -m unittest -v test_terminal_ct.RealEngines
+      - name: Bench (Docker)
+        run: |
+          python terminal_ct.py --engine docker quota --cpus 8 --memory 8 --containers 16
+          python terminal_ct.py --engine docker bench --runs 5
+      - name: Install script
+        run: sh install.sh --prefix "$RUNNER_TEMP/tct" && "$RUNNER_TEMP/tct/bin/terminal-ct" skills path

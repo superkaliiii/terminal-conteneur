@@ -4,16 +4,35 @@ Containers with a desktop and a shell, for people and computer-use agents. The c
 [terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm): same command and
 MCP shape, independent of it (each installs and works alone), and able to show its VMs when both are installed.
 
-Status: **phase 7** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
-screen tools, terminal viewer, quota and live resources, isolated networks, sandboxes, and an MCP server that
-manages containers under agent-authority rules; snapshots, clones and file copies; stacks kept in their desired
-state by a daemon (replicas, restarts, health probes, ttl, events); a terminal dashboard and its text for agents;
-a web dashboard (containers and terminal-vm's VMs). Documentation, CI and measurements come next.
+Status: **phase 8** of the plan: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch
+image), screen tools, terminal viewer, quota and live resources, isolated networks, sandboxes, an MCP server that
+manages containers under agent-authority rules, snapshots, clones and file copies, stacks kept in their desired
+state by a daemon (replicas, restarts, health probes, ttl, events), a terminal dashboard, a web dashboard
+(containers and terminal-vm's VMs), an agent skill, measurements and CI.
 
-## Requirements
+## Install
 
-- Python >= 3.9, standard library only.
-- Podman (preferred: rootless, no daemon) or Docker. Debian/Ubuntu: `sudo apt install podman`.
+Python >= 3.9 (standard library only) and Podman (preferred: rootless, no daemon) or Docker.
+Debian/Ubuntu: `sudo apt install podman`.
+
+```sh
+sh install.sh                      # ~/.local/bin/terminal-ct (--prefix DIR elsewhere), then runs doctor
+terminal-ct skills install         # the agent's skill into ~/.claude/skills/terminal-ct
+claude mcp add terminal-ct -- ~/.local/bin/terminal-ct mcp   # MCP server for Claude Code (absolute path: the
+                                                               # client may not have ~/.local/bin on its PATH)
+```
+
+`mcp NAME` gives the screen tools and `exec` a default container; `--project P` fences the server to a project.
+
+On a Windows host, put this folder on the PATH (`terminal-ct.cmd`) with Docker Desktop or Podman for Windows, or
+install it inside WSL as above (desktops need Linux or WSL). A one-command, all-in-one installer comes in a later
+phase.
+
+## Agent skill
+
+[`skills/terminal-ct/SKILL.md`](skills/terminal-ct/SKILL.md) tells an agent how to work with terminal-ct: start
+with `project_status`, prefer `exec` to the screen, the observe → act → verify loop on desktops, what it may run
+without asking, building sandboxes, stacks and networks, cleaning up. `terminal-ct skills get|path|install`.
 
 ## Commands
 
@@ -39,6 +58,8 @@ a web dashboard (containers and terminal-vm's VMs). Documentation, CI and measur
 | `push NAME LOCAL PATH`, `pull NAME PATH LOCAL` | copy files in or out (`/data` included), running or stopped |
 | `sandbox NAME on\|off` | make a stopped container a sandbox, or a normal one again (recreated from its image) |
 | `image ls`, `image pull REF`, `image build NAME DIR`, `image rm NAME` | images (Docker Hub short names are completed for Podman) |
+| `bench [--runs 10] [--desktop]` | measure terminal-ct's operations on this engine, see [Measurements](#measurements) |
+| `skills get\|path\|install [--dir D]` | the agent's skill, see [Agent skill](#agent-skill) |
 | `doctor`, `version`, `help` | checks |
 
 `--engine docker|podman` (or `TERMINAL_CT_ENGINE`) picks the engine; by default Podman if installed, else Docker.
@@ -223,9 +244,37 @@ quota. Management actions are logged to the project's `agent.log`, a sandbox's s
   ```
 - Agents: the MCP tool `autostart` shows the setting, and turns it on or off only with the user's approval.
 
+## Measurements
+
+`terminal-ct bench [--runs 10] [--desktop]`: median, min and max of terminal-ct's own operations on the current
+engine (containers named `bench-*`, removed after). Results kept in [`bench/results.json`](bench/results.json).
+WSL 2 Debian on Windows 11, 10 runs (3 for desktops), `alpine:3.20`, 2026-11-09:
+
+| Operation (median) | Podman 5.4 | Docker 26.1 |
+|---|---:|---:|
+| create | 3.16 s | 0.94 s |
+| start | 1.61 s | 0.75 s |
+| exec `true` | 0.87 s | 0.27 s |
+| stop | 1.33 s | 0.47 s |
+| rm (with its volume) | 1.78 s | 0.50 s |
+| ls | 0.69 s | 0.19 s |
+| dashboard data | 1.03 s | 1.81 s |
+| desktop ready after start | 0.4 s | 0.5 s |
+| screenshot (1280x800 PNG) | 0.37 s | 0.11 s |
+| desktop container memory | 19 MiB | 22 MiB |
+
+Most of this is the cost of starting the engine's command-line tool, several times per operation: listing the
+containers takes 458 ms through `podman` (126 ms through `docker`) and 1.4 ms (0.4 ms) through the same engine's
+API on its unix socket. Talking to that API instead is planned for the optimisation phase. Docker's dashboard data
+is slower because `docker stats` samples for about a second.
+
 ## Tests
 
 ```sh
 python3 -m unittest test_terminal_ct                     # simulated engine
 TERMINAL_CT_REAL=1 python3 -m unittest test_terminal_ct  # also against the installed Podman and Docker
 ```
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): unit tests on Linux, Windows and macOS with Python 3.9
+and 3.12; the real tests, a short bench and the install script on Ubuntu with its Docker and Podman. WSL is not
+available on hosted runners: the WSL runs are made by hand (results above).

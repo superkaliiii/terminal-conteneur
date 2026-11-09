@@ -2,6 +2,9 @@ import contextlib, io, json, os, shutil, socket, struct, subprocess, sys, tempfi
 
 import terminal_ct as ct
 
+# the real tests' engines (TERMINAL_CT_REAL_ENGINES="docker" where Podman cannot set limits, e.g. a CI runner)
+REAL_ENGINES = tuple(os.environ.get("TERMINAL_CT_REAL_ENGINES", "podman docker").split())
+
 
 class FakeNode(ct.Node):
     """Records engine calls; answers inspect from a small in-memory engine."""
@@ -750,6 +753,34 @@ class Web(unittest.TestCase):
         self.assertEqual((seen, ct.node().engine), (["podman"], "docker"))
 
 
+class Phase8(unittest.TestCase):
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
+
+    def test_bench(self):
+        r = ct.bench(runs=3)
+        self.assertEqual(set(r["results"]), {"create", "start", "exec_true", "ls", "dashboard_data", "stop", "rm"})
+        self.assertEqual(r["results"]["start"]["runs"], 3)
+        self.assertLessEqual(r["results"]["rm"]["min_ms"], r["results"]["rm"]["median_ms"])
+        self.assertEqual(self.n.objects, {})                                               # nothing left behind
+        self.assertEqual(ct._summary([4, 1, 3, 2])["median_ms"], 2.5)
+        quiet(ct.create, "bench-ct")                                                       # the user's own
+        ct.bench(runs=1)
+        self.assertEqual(list(self.n.objects), ["tct-bench-ct"])                           # left alone
+
+    def test_skill(self):
+        with open(ct.SKILL, encoding="utf-8") as f:
+            text = f.read()
+        self.assertTrue(text.startswith("---\nname: terminal-ct\n"))
+        for tool in ("project_status", "notes_write", "exec", "ct_create", "ct_apply", "screenshot"):  # names that exist
+            self.assertIn(f"`{tool}`", text)
+        self.assertTrue({"project_status", "ct_apply"} <= ct.AGENT_NAMES)
+        dest = tempfile.mkdtemp()
+        quiet(ct.skills, "install", dest)
+        self.assertTrue(os.path.isfile(os.path.join(dest, "terminal-ct", "SKILL.md")))
+
+
 class SnapshotsAndClones(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
@@ -1082,8 +1113,13 @@ class FakeVnc(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("TERMINAL_CT_REAL"), "set TERMINAL_CT_REAL=1 to run against real engines")
 class RealEngines(unittest.TestCase):
+    def setUp(self):  # its own store, and a quota a small CI runner does not hit (its default: cores - 1)
+        ct.STORE = tempfile.mkdtemp()
+        with open(os.path.join(ct.STORE, "quota.json"), "w") as f:
+            json.dump({"cpus": 64, "memory_gb": 256, "containers": 64}, f)
+
     def test_round_trip(self):
-        for engine in ("podman", "docker"):
+        for engine in REAL_ENGINES:
             if not shutil.which(engine):
                 continue
             with self.subTest(engine=engine):
@@ -1101,9 +1137,8 @@ class RealEngines(unittest.TestCase):
 
     def test_phase4(self):
         """Snapshot of files and /data, load back, clone with a copy of /data, push and pull."""
-        ct.STORE = tempfile.mkdtemp()
         sh = lambda n, c: quiet(ct.exec_, n, ["sh", "-c", c])["stdout"].strip()
-        for engine in ("podman", "docker"):
+        for engine in REAL_ENGINES:
             if not shutil.which(engine):
                 continue
             with self.subTest(engine=engine):
@@ -1139,9 +1174,8 @@ class RealEngines(unittest.TestCase):
 
     def test_phase3(self):
         """Limits in the cgroup and changed live, top, isolated network by name, internet off, sandbox reset."""
-        ct.STORE = tempfile.mkdtemp()
         sh = lambda n, c: quiet(ct.exec_, n, ["sh", "-c", c])
-        for engine in ("podman", "docker"):
+        for engine in REAL_ENGINES:
             if not shutil.which(engine):
                 continue
             with self.subTest(engine=engine):

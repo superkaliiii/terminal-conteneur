@@ -26,6 +26,8 @@ labels; containers without them are never touched.
   apply FILE [--project P] | scale STACK SERVICE N | stack ls|show|rm [STACK] | events [--stack S] [-n 50] [--follow]
   daemon run|start|stop|status | prune      desired state kept by the daemon (restarts, health, ttl); stale images
   dash [--project P]  |  logs NAME [-n 100]    live dashboard (keys: s start, t stop, r rm, +/- scale, l logs, v view)
+  bench [--runs 10] [--desktop]   median/min/max of create, start, exec, stop, rm, ls (containers bench-*)
+  skills get|path|install [--dir D]   the agent's SKILL.md (install: into ~/.claude/skills/terminal-ct)
   web [--project P] [--no-open]   web dashboard (containers, terminal-vm's VMs, screens, stacks), served by the
                       daemon on 127.0.0.1 (TERMINAL_CT_WEB_PORT, default 7171) behind a token; opens the browser
   snapshot NAME save|load|rm TAG | snapshot NAME ls     file system + /data (load: stopped container)
@@ -36,10 +38,10 @@ labels; containers without them are never touched.
   image ls | image pull REF | image build NAME DIR | image rm NAME
 Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if installed, else docker).
 """
-import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, queue, re, secrets, shlex, shutil, \
-    socket, struct, subprocess, sys, threading, time, urllib.parse, webbrowser, zlib
+import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, \
+    shlex, shutil, socket, struct, subprocess, sys, threading, time, urllib.parse, webbrowser, zlib
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 WINDOWS = os.name == "nt"
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {}  # the daemon has no console: no flash
 if not WINDOWS:
@@ -3645,6 +3647,86 @@ def mcp(name=None, project=None):
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"unknown method {method}"}})
 
 
+# ---------- measurements and the agent's skill ----------
+BENCH_IMAGE = "alpine:3.20"
+
+
+def _timed(f, *a, **k):
+    t = time.perf_counter()
+    quiet(f, *a, **k)
+    return (time.perf_counter() - t) * 1000
+
+
+def _summary(ms):
+    ms = sorted(ms)
+    return {"median_ms": round(ms[len(ms) // 2] if len(ms) % 2 else (ms[len(ms) // 2 - 1] + ms[len(ms) // 2]) / 2, 1),
+            "min_ms": round(ms[0], 1), "max_ms": round(ms[-1], 1), "runs": len(ms)}
+
+
+def bench(runs=10, desktop=False):
+    """Time terminal-ct's own operations on this engine: median, min and max of `runs` cycles of create, start,
+    exec, stop, rm on a small image, the listing and the dashboard's data; with desktop, the desktop's readiness,
+    a screenshot, its memory. Uses containers named bench-*, removed after; the quota applies as for any start."""
+    if desktop and WINDOWS:
+        raise SystemExit("bench --desktop runs on a Linux host or in WSL (desktop containers need one)")
+    if not local_image(BENCH_IMAGE):
+        pull(BENCH_IMAGE)
+    times, extra, made = collections.defaultdict(list), {}, set()
+    base = f"bench-{os.getpid()}-{secrets.token_hex(2)}"  # never an existing name: only bench's own are removed
+
+    def make(name, **k):
+        r = _timed(create, name, BENCH_IMAGE if not k else DEFAULT_IMAGE, **k)
+        made.add(name)
+        return r
+    try:
+        name = base + "-ct"
+        for _ in range(runs):
+            times["create"].append(make(name))
+            times["start"].append(_timed(start, name))
+            times["exec_true"].append(_timed(exec_, name, ["true"]))
+            times["ls"].append(_timed(containers))
+            times["dashboard_data"].append(_timed(dashboard_data, None, False))
+            times["stop"].append(_timed(stop, name, 1))
+            times["rm"].append(_timed(rm, name))
+            made.discard(name)
+        if desktop:
+            name = base + "-desk"
+            make(name, desktop=True)  # the first one builds the desktop image: not counted
+            for _ in range(max(3, runs // 3)):
+                r = quiet(start, name)
+                if r.get("desktop_ready") is not None:  # absent: not ready within 10 s
+                    times["desktop_ready"].append(r["desktop_ready"] * 1000)
+                times["screenshot"].append(_timed(act, name, "screenshot", {}))
+                extra["desktop_memory_mb"] = round(
+                    _stats([find(name)]).get(PREFIX + name, {}).get("used_memory_gb", 0) * 1024)
+                quiet(stop, name, 1)
+    finally:
+        for name in made:
+            with contextlib.suppress(SystemExit):
+                quiet(rm, name)
+    host = platform.platform() + (" (WSL)" if in_wsl() else "")
+    version = node().run(["version", "--format", "{{.Client.Version}}"], check=False).stdout.strip()
+    return {"tool": f"terminal-ct {VERSION}", "engine": f"{node().engine} {version}", "host": host,
+            "date": time.strftime("%Y-%m-%d"), "image": BENCH_IMAGE,
+            "results": {k: _summary(v) for k, v in times.items()}, **extra}
+
+
+SKILL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "terminal-ct", "SKILL.md")
+
+
+def skills(cmd, dest=None):
+    """The agent's skill: print it, its path, or copy it where Claude Code reads skills."""
+    if cmd == "get":
+        with open(SKILL, encoding="utf-8") as f:
+            return print(f.read(), end="")
+    if cmd == "path":
+        return print(SKILL)
+    dest = os.path.join(dest or os.path.expanduser("~/.claude/skills"), "terminal-ct")
+    os.makedirs(dest, exist_ok=True)
+    shutil.copy(SKILL, os.path.join(dest, "SKILL.md"))
+    print(json.dumps({"installed": os.path.join(dest, "SKILL.md")}))
+
+
 def doctor():
     checks = []
     for e in ("podman", "docker"):
@@ -3687,6 +3769,8 @@ def main(argv=None):
     sub.add_parser("daemon").add_argument("daemon_cmd", choices=["run", "start", "stop", "status"])
     sub.add_parser("prune")
     da = sub.add_parser("dash"); da.add_argument("--project")
+    bn = sub.add_parser("bench"); bn.add_argument("--runs", type=int, default=10); bn.add_argument("--desktop", action="store_true")
+    sk_ = sub.add_parser("skills"); sk_.add_argument("skill_cmd", choices=["get", "path", "install"]); sk_.add_argument("--dir")
     wb = sub.add_parser("web"); wb.add_argument("--project"); wb.add_argument("--no-open", action="store_true")
     lg = sub.add_parser("logs"); lg.add_argument("name"); lg.add_argument("-n", type=int, default=100)
     sn = sub.add_parser("snapshot"); sn.add_argument("name"); sn.add_argument("snap_cmd", choices=["save", "load", "rm", "ls"])
@@ -3763,6 +3847,8 @@ def main(argv=None):
     if o.cmd == "prune": return show_json(prune())
     if o.cmd == "dash": return dash(o.project)
     if o.cmd == "web": return show_json(web(not o.no_open, o.project))
+    if o.cmd == "bench": return show_json(bench(max(1, o.runs), o.desktop))
+    if o.cmd == "skills": return skills(o.skill_cmd, o.dir)
     if o.cmd == "logs": return print(logs(o.name, o.n), end="")
     if o.cmd == "snapshot": return show_json(snapshot(o.name, o.snap_cmd, o.tag))
     if o.cmd == "clone": return show_json(clone(o.src, o.new, project=o.project))

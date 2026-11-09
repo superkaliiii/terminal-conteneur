@@ -1,0 +1,133 @@
+{
+ "note": "terminal-ct bench --runs 10 --desktop; one object per engine and host. Rerun: terminal-ct bench",
+ "runs": [
+  {
+   "tool": "terminal-ct 0.7.0",
+   "engine": "podman 5.4.2",
+   "host": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41 (WSL)",
+   "date": "2026-11-09",
+   "image": "alpine:3.20",
+   "results": {
+    "create": {
+     "median_ms": 3161.1,
+     "min_ms": 3077.7,
+     "max_ms": 3235.6,
+     "runs": 10
+    },
+    "start": {
+     "median_ms": 1606.4,
+     "min_ms": 1557.7,
+     "max_ms": 1723.0,
+     "runs": 10
+    },
+    "exec_true": {
+     "median_ms": 866.4,
+     "min_ms": 824.2,
+     "max_ms": 898.6,
+     "runs": 10
+    },
+    "ls": {
+     "median_ms": 689.6,
+     "min_ms": 603.9,
+     "max_ms": 740.8,
+     "runs": 10
+    },
+    "dashboard_data": {
+     "median_ms": 1026.5,
+     "min_ms": 1004.7,
+     "max_ms": 1067.0,
+     "runs": 10
+    },
+    "stop": {
+     "median_ms": 1326.6,
+     "min_ms": 1268.5,
+     "max_ms": 1437.1,
+     "runs": 10
+    },
+    "rm": {
+     "median_ms": 1783.1,
+     "min_ms": 1720.6,
+     "max_ms": 1822.8,
+     "runs": 10
+    },
+    "desktop_ready": {
+     "median_ms": 400.0,
+     "min_ms": 400.0,
+     "max_ms": 1000.0,
+     "runs": 3
+    },
+    "screenshot": {
+     "median_ms": 366.8,
+     "min_ms": 357.7,
+     "max_ms": 380.4,
+     "runs": 3
+    }
+   },
+   "desktop_memory_mb": 19
+  },
+  {
+   "tool": "terminal-ct 0.7.0",
+   "engine": "docker 26.1.5+dfsg1",
+   "host": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41 (WSL)",
+   "date": "2026-11-09",
+   "image": "alpine:3.20",
+   "results": {
+    "create": {
+     "median_ms": 943.7,
+     "min_ms": 921.2,
+     "max_ms": 1021.1,
+     "runs": 10
+    },
+    "start": {
+     "median_ms": 746.8,
+     "min_ms": 688.5,
+     "max_ms": 1332.5,
+     "runs": 10
+    },
+    "exec_true": {
+     "median_ms": 271.4,
+     "min_ms": 233.5,
+     "max_ms": 305.8,
+     "runs": 10
+    },
+    "ls": {
+     "median_ms": 188.3,
+     "min_ms": 184.0,
+     "max_ms": 198.1,
+     "runs": 10
+    },
+    "dashboard_data": {
+     "median_ms": 1807.9,
+     "min_ms": 1793.9,
+     "max_ms": 1831.1,
+     "runs": 10
+    },
+    "stop": {
+     "median_ms": 469.1,
+     "min_ms": 433.7,
+     "max_ms": 500.1,
+     "runs": 10
+    },
+    "rm": {
+     "median_ms": 499.0,
+     "min_ms": 488.9,
+     "max_ms": 538.1,
+     "runs": 10
+    },
+    "desktop_ready": {
+     "median_ms": 500.0,
+     "min_ms": 500.0,
+     "max_ms": 900.0,
+     "runs": 3
+    },
+    "screenshot": {
+     "median_ms": 112.9,
+     "min_ms": 111.8,
+     "max_ms": 114.6,
+     "runs": 3
+    }
+   },
+   "desktop_memory_mb": 22
+  }
+ ]
+}
