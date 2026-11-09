@@ -1,4 +1,4 @@
-import base64, contextlib, hashlib, io, re, json, os, shutil, socket, struct, subprocess, sys, tempfile, threading, time, unittest, unittest.mock, zlib
+import base64, contextlib, hashlib, io, re, json, os, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, unittest, unittest.mock, zlib
 
 import terminal_ct as ct
 
@@ -1145,7 +1145,8 @@ class Nodes(unittest.TestCase):
         with open(os.path.join(ctx, "Dockerfile"), "w") as f:
             f.write("FROM alpine\n")
         n.run(["build", "-t", "mine", ctx])                                     # the context folder sent as a tar
-        self.assertRegex(self.shell[-2], r"tar -xf /tmp/tct-\w+\.tar -C /tmp/tct-\w+ && docker build -t mine /tmp/tct-")
+        self.assertRegex(self.shell[-2], r"tar -xf /tmp/tct-\w+/ctx\.tar -C /tmp/tct-\w+/ctx && docker build -t mine /tmp/tct-\w+/ctx$")
+        self.assertTrue(any(re.match(r"mkdir -m 700 /tmp/tct-\w+ && mkdir /tmp/tct-\w+/ctx$", c) for c in self.shell))
         import tarfile
         pushed = [c for c in self.vm_calls if c[0] == "push"][-1][3]          # the context, pushed last
         with tarfile.open(fileobj=io.BytesIO(self.files[pushed])) as tar:
@@ -1159,8 +1160,8 @@ class Nodes(unittest.TestCase):
             f.write(b"hello")
         self.cli("push", "web", src, "/data/")                                   # routed to n1 by its placement
         pushed = [c for c in self.vm_calls if c[0] == "push"][-1]
-        self.assertRegex(pushed[3], r"^/tmp/tct-\w+/notes\.txt$")
-        self.assertTrue(any(re.match(r"docker cp -a /tmp/tct-\w+/notes\.txt tct-web:/data/$", c) for c in self.shell))
+        self.assertRegex(pushed[3], r"^/tmp/tct-\w+/in/notes\.txt$")                # inside the private folder
+        self.assertTrue(any(re.match(r"docker cp -a /tmp/tct-\w+/in/notes\.txt tct-web:/data/$", c) for c in self.shell))
         self.cli("pull", "web", "/data/notes.txt", back)
         with open(back, "rb") as f:
             self.assertEqual(f.read(), b"from the container")
@@ -1654,6 +1655,180 @@ class FakeVnc(unittest.TestCase):
         self.assertEqual(struct.unpack(">BxHii", got["enc"]), (2, 2, 0, -223))
         self.assertEqual(got["pointer"], struct.pack(">BBHH", 5, 4, 1, 0))
         self.assertEqual(got["key"], struct.pack(">BBxxI", 4, 1, 0xFF0D))
+
+
+@unittest.skipUnless(shutil.which("openssl"), "the agent makes its certificate with openssl")
+class RemoteAgent(unittest.TestCase):
+    """Phase 11.1: another PC's agent: pinned certificate, then token; exec, push, pull; SSH as the other way."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.store = ct.STORE = tempfile.mkdtemp()
+        cls.srv = ct.agent_serve("127.0.0.1", 0)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.host = {"url": f"https://127.0.0.1:{cls.srv.server_address[1]}", "fingerprint": cls.srv.fingerprint,
+                    "token": cls.srv.token}
+        seen = ssl.get_server_certificate(("127.0.0.1", cls.srv.server_address[1]))
+        if hashlib.sha256(ssl.PEM_cert_to_DER_cert(seen)).hexdigest() != cls.srv.fingerprint:
+            cls.tearDownClass()  # an antivirus re-signs even local HTTPS (seen: Avast on Windows): pinning refuses it
+            raise unittest.SkipTest("TLS intercepted on this machine (antivirus HTTPS scanning)")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def setUp(self):
+        ct.STORE = self.store
+
+    def log(self):
+        with open(os.path.join(self.store, "agent", "agent.log"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_credentials_kept_and_private(self):
+        self.assertEqual(ct.agent_credentials(), (self.srv.fingerprint, self.srv.token))
+        self.assertGreaterEqual(len(self.srv.token), 32)
+        if not ct.WINDOWS:
+            self.assertEqual(os.stat(os.path.join(self.store, "agent", "cert.pem")).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(os.path.join(self.store, "agent", "token")).st_mode & 0o777, 0o600)
+
+    def test_ping_and_exec(self):
+        self.assertEqual(ct.agent_request(self.host, "GET", "/ping")["tool"], "terminal-ct")
+        n = ct.NodeRemote("pc1", self.host)
+        r = n._exec([sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)"], 30)
+        self.assertEqual((r["exit"], r["stdout"].strip(), r["stderr"].strip()), (3, "out", "err"))
+        self.assertEqual(n._exec(["no-such-program-tct"], 30)["exit"], 127)
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            ct.agent_request(self.host, "POST", "/exec", {"argv": [sys.executable, "-c", "import time; time.sleep(5)"],
+                                                         "timeout": 0.5})
+        self.assertIn("exec ", self.log())
+
+    def test_refusals(self):
+        for bad in ({"argv": "ls"}, {"argv": []}, {"argv": ["x", 1]}, {"argv": ["x"], "timeout": 0},
+                    {"argv": ["x"], "timeout": 99999}, {"argv": ["x"], "stdin": 5}, {}):
+            with self.assertRaisesRegex(RuntimeError, "exec wants"):
+                ct.agent_request(self.host, "POST", "/exec", bad)
+        with self.assertRaisesRegex(RuntimeError, "not found"):
+            ct.agent_request(self.host, "GET", "/etc/passwd")
+        with self.assertRaises(RuntimeError):  # "too large", or a broken pipe: refused before all was sent
+            ct.agent_request(self.host, "POST", "/exec", b"x" * (ct.AGENT_MAX_JSON + 1))
+        self.assertEqual(ct.agent_request(self.host, "GET", "/ping")["tool"], "terminal-ct")  # still serving
+
+    def test_wrong_token_refused_and_logged(self):
+        ct._REFUSED.clear()
+        with self.assertRaisesRegex(RuntimeError, "wrong token"):
+            ct.agent_request(dict(self.host, token="x" * 43), "POST", "/exec", {"argv": ["whoami"]})
+        self.assertIn("refused POST /exec", self.log())
+
+    def test_wrong_certificate_never_gets_the_token(self):
+        before = self.log() if os.path.exists(os.path.join(self.store, "agent", "agent.log")) else ""
+        spy = dict(self.host, fingerprint="00" * 32, token="secret-" + "y" * 40)
+        with self.assertRaisesRegex(RuntimeError, "not the pinned one"):
+            ct.agent_request(spy, "GET", "/ping")
+        time.sleep(0.2)
+        after = self.log() if os.path.exists(os.path.join(self.store, "agent", "agent.log")) else ""
+        self.assertEqual(before, after)  # no request reached the agent: the token never left
+
+    def test_unreachable(self):
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        with self.assertRaisesRegex(RuntimeError, "agent https://127.0.0.1"):
+            ct.agent_request(dict(self.host, url=f"https://127.0.0.1:{port}"), "GET", "/ping", timeout=5)
+
+    def test_push_pull_round_trip(self):
+        d = tempfile.mkdtemp()
+        src, there, back = (os.path.join(d, f) for f in ("src.bin", "there.bin", "back.bin"))
+        data = os.urandom(3 << 20) + b"\r\n\x00end"
+        with open(src, "wb") as f:
+            f.write(data)
+        n = ct.NodeRemote("pc1", self.host)
+        n.copy("push", src, there)
+        n.copy("pull", there, back)
+        with open(back, "rb") as f:
+            self.assertEqual(f.read(), data)
+        self.assertEqual(sorted(os.listdir(d)), ["back.bin", "src.bin", "there.bin"])  # no part files left
+        with self.assertRaisesRegex(SystemExit, "copy failed"):
+            n.copy("pull", os.path.join(d, "missing"), back)
+        with self.assertRaisesRegex(SystemExit, "copy failed"):
+            n.copy("push", src, os.path.join(d, "no-dir", "x"))
+
+    def test_rotate_gives_a_new_token(self):
+        old = ct.agent_credentials()
+        new = ct.agent_credentials(rotate=True)
+        try:
+            self.assertEqual(new[0], old[0])
+            self.assertNotEqual(new[1], old[1])
+        finally:
+            ct._web_write(os.path.join(self.store, "agent", "token"), old[1], 0o600)
+
+    def test_ssh_way(self):
+        n = ct.NodeRemote("pc2", {"url": "ssh://me@pc2:2222"})
+        seen = []
+
+        def run(cmd, **k):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 255 if "fail" in cmd[-1] else 0, "ok\n", "nope")
+        with unittest.mock.patch.object(ct.subprocess, "run", run):
+            self.assertEqual(n._exec(["docker", "ps", "--format", "{{.Names}} x"], 30)["stdout"], "ok\n")
+            self.assertEqual(seen[-1][:2], ["ssh", "-T"])
+            self.assertEqual(seen[-1][-3:], ["--", "me@pc2", "docker ps --format '{{.Names}} x'"])
+            self.assertIn("2222", seen[-1])
+            with self.assertRaisesRegex(RuntimeError, "ssh me@pc2: nope"):
+                n._exec(["fail"], 30)
+            n.copy("push", "a b.tar", "/tmp/x")
+            self.assertEqual(seen[-1][0], "scp")
+            self.assertEqual(seen[-1][-3:], ["--", "a b.tar", "me@pc2:/tmp/x"])
+            n.copy("pull", "/tmp/x", "y")
+            self.assertEqual(seen[-1][-2:], ["me@pc2:/tmp/x", "y"])
+            seen.clear()
+            for bad in ("ssh://-oProxyCommand=touch@pc", "ssh://-oproxycommand=x", "ssh://pc:abc", "ssh://me:pw@pc",
+                        "ssh://pc/path", "ssh://a b@pc", "https://pc", "ssh://", "ssh://pc?x=1"):
+                with self.assertRaises((RuntimeError, ValueError, KeyError), msg=bad):  # host add checks first
+                    ct.NodeRemote("x", {"url": bad})._exec(["true"], 5)
+                with self.assertRaisesRegex(SystemExit, "copy failed", msg=bad):
+                    ct.NodeRemote("x", {"url": bad}).copy("push", "a", "b")
+            self.assertEqual(seen, [])  # nothing ever ran
+        self.assertEqual(ct.ssh_target("ssh://u_1@10.0.0.5:22")[1], 22)
+
+    def test_pushed_file_private_and_log_safe(self):
+        d = tempfile.mkdtemp()
+        src, there = os.path.join(d, "s"), os.path.join(d, "t")
+        with open(src, "wb") as f:
+            f.write(b"secret")
+        ct.NodeRemote("pc1", self.host).copy("push", src, there)
+        if not ct.WINDOWS:
+            self.assertEqual(os.stat(there).st_mode & 0o777, 0o600)
+        with self.assertRaisesRegex(RuntimeError, "not a regular file"):
+            ct.agent_request(self.host, "GET", "/pull?path=" + ct.urllib.parse.quote(d), out=os.path.join(d, "o"))
+        ct._REFUSED.clear()
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+        for _ in range(3):  # one line a minute per address, escaped (http.client would not send these bytes)
+            with ctx.wrap_socket(socket.create_connection(("127.0.0.1", self.srv.server_address[1]))) as s:
+                s.sendall(b"GET /x\x1b[2J\x07forged HTTP/1.0\r\n\r\n")
+                self.assertIn(b"401", s.recv(100))
+        log = self.log()
+        self.assertNotIn("\x1b", log)
+        self.assertEqual(log.count("refused GET /x"), 1)
+        self.assertNotIn("\x07", log)
+
+    def test_connections_capped(self):
+        srv = ct.agent_serve("127.0.0.1", 0)
+        srv.slots = threading.BoundedSemaphore(2)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        host, socks = dict(self.host, url=f"https://127.0.0.1:{srv.server_address[1]}"), []
+        try:
+            for _ in range(2):  # two idle clients hold the two slots
+                socks.append(socket.create_connection(("127.0.0.1", srv.server_address[1])))
+            time.sleep(0.3)
+            with self.assertRaises(RuntimeError):  # the third is closed at once
+                ct.agent_request(host, "GET", "/ping", timeout=5)
+            for s in socks:
+                s.close()
+            time.sleep(0.5)  # their slots come back
+            self.assertEqual(ct.agent_request(host, "GET", "/ping")["tool"], "terminal-ct")
+        finally:
+            for s in socks:
+                s.close()
+            srv.shutdown(); srv.server_close()
 
 
 @unittest.skipUnless(os.environ.get("TERMINAL_CT_REAL"), "set TERMINAL_CT_REAL=1 to run against real engines")

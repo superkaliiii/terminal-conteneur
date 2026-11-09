@@ -40,7 +40,7 @@ Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if inst
 """
 import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, \
     shlex, shutil, socket, socketserver, struct, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, webbrowser, zlib
-import importlib.util, ipaddress
+import importlib.util, ipaddress, http.client, ssl
 
 VERSION = "0.9.0"
 WINDOWS = os.name == "nt"
@@ -183,14 +183,15 @@ class NodeVM(Node):
         if args[0] == "build" and os.path.isdir(args[-1]):  # a context folder of this host: unpacked in the node
             remote = f"/tmp/tct-{secrets.token_hex(6)}"
             try:
+                self.sh(f"mkdir -m 700 {remote} && mkdir {remote}/ctx", timeout=30)  # private: a PC has other users
                 with tempfile.TemporaryDirectory() as tmp:
                     _tar(args[-1], ".", os.path.join(tmp, "context.tar"))
-                    self.copy("push", os.path.join(tmp, "context.tar"), remote + ".tar")
-                out = self.sh(f"mkdir -m 700 {remote} && tar -xf {remote}.tar -C {remote} && docker "
-                              + " ".join(shlex.quote(a) for a in args[:-1]) + f" {remote}", timeout=3600)
+                    self.copy("push", os.path.join(tmp, "context.tar"), f"{remote}/ctx.tar")
+                out = self.sh(f"tar -xf {remote}/ctx.tar -C {remote}/ctx && docker "
+                              + " ".join(shlex.quote(a) for a in args[:-1]) + f" {remote}/ctx", timeout=3600)
             finally:
                 with contextlib.suppress(SystemExit):
-                    self.sh(f"rm -rf {remote} {remote}.tar", timeout=60)
+                    self.sh(f"rm -rf {remote}", timeout=60)
             if not capture:
                 sys.stderr.write(out)
             return subprocess.CompletedProcess(["docker", *args], 0, out, "")
@@ -288,33 +289,369 @@ class NodeVM(Node):
         """push/pull with a container of the node: through a folder of the node, as `docker cp` would do here
         (a folder crosses as a tar)."""
         q, tmp = shlex.quote, f"/tmp/tct-{secrets.token_hex(6)}"
-        self.sh(f"mkdir -m 700 {tmp}", timeout=30)
+        self.sh(f"mkdir -m 700 {tmp} && mkdir {tmp}/in", timeout=30)  # everything inside: a PC has other users
         try:
             if direction == "push":
                 base = os.path.basename(os.path.normpath(src))
                 if os.path.isdir(src):
                     with tempfile.TemporaryDirectory() as t:
                         _tar(src, base, os.path.join(t, "x.tar"))
-                        self.copy("push", os.path.join(t, "x.tar"), f"{tmp}.tar")  # beside: any folder name is free
-                    self.sh(f"tar -xf {tmp}.tar -C {tmp}", timeout=600)
+                        self.copy("push", os.path.join(t, "x.tar"), f"{tmp}/x.tar")  # beside in/: any name is free
+                    self.sh(f"tar -xf {tmp}/x.tar -C {tmp}/in", timeout=600)
                 else:
-                    self.copy("push", src, f"{tmp}/{base}")
-                self.sh(f"docker cp -a {q(f'{tmp}/{base}')} {q(f'{container}:{dest}')}", timeout=600)
+                    self.copy("push", src, f"{tmp}/in/{base}")
+                self.sh(f"docker cp -a {q(f'{tmp}/in/{base}')} {q(f'{container}:{dest}')}", timeout=600)
                 return
             self.sh(f"docker cp {q(f'{container}:{src}')} {tmp}/out", timeout=600)
             if os.path.isdir(dest):  # as docker cp: into an existing folder, under the source's name
                 dest = os.path.join(dest, os.path.basename(src.rstrip("/")) or "out")
             if self.sh(f"test -d {tmp}/out && echo dir || echo file", timeout=30).strip() == "file":
                 return self.copy("pull", f"{tmp}/out", dest)
-            self.sh(f"tar -cf {tmp}.tar -C {tmp} out", timeout=600)
+            self.sh(f"tar -cf {tmp}/x.tar -C {tmp} out", timeout=600)
             with tempfile.TemporaryDirectory() as t:
-                self.copy("pull", f"{tmp}.tar", os.path.join(t, "x.tar"))
+                self.copy("pull", f"{tmp}/x.tar", os.path.join(t, "x.tar"))
                 with tarfile.open(os.path.join(t, "x.tar")) as tar:
                     _extract(tar, t)
                 shutil.move(os.path.join(t, "out"), dest)
         finally:
             with contextlib.suppress(SystemExit):
-                self.sh(f"rm -rf {tmp} {tmp}.tar", timeout=60)
+                self.sh(f"rm -rf {tmp}", timeout=60)
+
+
+# ---------- other PCs (phase 11): one central PC drives the others ----------
+# The central PC keeps all state (stacks, placement, quota); another PC only runs what it is sent: engine calls,
+# terminal-vm, file copies. Direct: HTTPS to `terminal-ct agent` there (self-signed certificate pinned by its SHA-256
+# before the token is sent). SSH: plain ssh/scp, nothing of ours runs there. Either way the token (or the SSH login)
+# is a shell as the agent's user there, as `docker` access is anyway.
+
+AGENT_PORT = int(os.environ.get("TERMINAL_CT_AGENT_PORT") or 7173)
+AGENT_MAX_JSON = 2 ** 20
+
+
+def _agent_path(f):
+    d = os.path.join(STORE, "agent")
+    if not os.path.isdir(d):
+        os.makedirs(d, mode=0o700)
+        if WINDOWS:  # chmod means nothing there: this user alone, whatever folder TERMINAL_CT_HOME names
+            subprocess.run(["icacls", d, "/inheritance:r", "/grant:r", f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"],
+                           capture_output=True, **NO_WINDOW)
+    if not WINDOWS:
+        os.chmod(d, 0o700)  # makedirs sets it only when it makes the folder
+    return os.path.join(d, f)
+
+
+def agent_credentials(rotate=False):
+    """(certificate SHA-256, token) of this PC's agent: the certificate made once (openssl), a new token on rotate."""
+    cert, tok = _agent_path("cert.pem"), _agent_path("token")  # cert.pem holds the certificate and its key
+    if not os.path.isfile(cert):
+        exe = shutil.which("openssl")
+        if not exe:
+            raise SystemExit("agent needs openssl once, to make its certificate (Linux, macOS, WSL and Git for Windows "
+                             "have it); or reach this PC over SSH instead (host add NAME ssh://user@pc)")
+        new, key = f"{cert}.{os.getpid()}.new", f"{cert}.{os.getpid()}.key"  # two first starts: each its own files
+        r = subprocess.run([exe, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-subj",
+                            "/CN=terminal-ct agent", "-keyout", key, "-out", new],
+                           capture_output=True, text=True, **NO_WINDOW)
+        try:
+            if r.returncode:
+                raise SystemExit(f"openssl: {r.stderr.strip()}")
+            os.chmod(new, 0o600)
+            with open(new, "a") as f, open(key) as k:  # one file, one replace: never a key of another start
+                f.write(k.read())
+            os.replace(new, cert)
+        finally:
+            for x in (new, key):
+                with contextlib.suppress(OSError):
+                    os.remove(x)
+    if rotate or not os.path.isfile(tok):
+        _web_write(tok, secrets.token_urlsafe(32), 0o600)
+    with open(tok) as f:  # what the file says: another start may have written it first
+        token = f.read().strip()
+    if len(token) < 32:  # cut short: an empty token would let anyone in
+        _web_write(tok, secrets.token_urlsafe(32), 0o600)
+        with open(tok) as f:
+            token = f.read().strip()
+    with open(cert) as f:
+        pem = f.read()
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem[:pem.index("-----END CERTIFICATE-----") + 25])).hexdigest(), token
+
+
+AGENT_LOG_MAX = 5 * 2 ** 20
+_REFUSED = {}  # address: time of its last refusal logged
+
+
+def _agent_log(client, what, refusal=False):
+    if refusal:
+        if time.time() - _REFUSED.get(client, 0) < 60:  # a flood of bad tokens fills no disk
+            return
+        if len(_REFUSED) > 10000:
+            _REFUSED.clear()
+        _REFUSED[client] = time.time()
+    path = _agent_path("agent.log")
+    with contextlib.suppress(OSError):
+        if os.path.getsize(path) > AGENT_LOG_MAX:
+            os.replace(path, path + ".1")  # one older log kept
+    with contextlib.suppress(OSError):
+        with open(path, "a", encoding="utf-8") as f:  # escaped: a client's text forges no line, no terminal escape
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {client} {what.encode('unicode_escape').decode('ascii')}\n")
+
+
+class _AgentHandler(http.server.BaseHTTPRequestHandler):
+    server_version, sys_version = "terminal-ct-agent", ""  # no versions told to whoever asks
+    timeout = 15  # seconds a client may stay silent (handshake included) before its thread is freed
+
+    def log_message(self, *a):
+        pass
+
+    def setup(self):
+        self.request.settimeout(self.timeout)
+        self.request.do_handshake()  # here, in this request's thread: a slow client never holds up the others
+        super().setup()
+
+    def _reply(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorized(self):
+        given = self.headers.get("X-Token", "").encode("utf-8", "replace")
+        if given and secrets.compare_digest(given, self.server.token.encode()):
+            return True
+        _agent_log(self.client_address[0], f"refused {self.command} {self.path[:80]}", refusal=True)
+        time.sleep(0.5)  # slows down guessing
+        self.close_connection = True
+        self._reply(401, {"error": "wrong token (terminal-ct agent on that PC shows it; host add again)"})
+        return False
+
+    def do_GET(self):
+        u = urllib.parse.urlsplit(self.path)
+        if not self._authorized():
+            return
+        if u.path == "/ping":
+            return self._reply(200, {"tool": TOOL, "version": VERSION, "os": sys.platform})
+        if u.path != "/pull":
+            return self._reply(404, {"error": "not found"})
+        path = dict(urllib.parse.parse_qsl(u.query)).get("path", "")
+        try:
+            if not os.path.isfile(path):  # a FIFO or a device would stream forever
+                raise OSError("not a regular file")
+            f = open(path, "rb")
+        except OSError as e:
+            return self._reply(404, {"error": f"{path}: {e.strerror or e}"})
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            _agent_log(self.client_address[0], f"pull {path}")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            while size:  # exactly what was announced, even if the file grows meanwhile
+                chunk = f.read(min(size, 1 << 20))
+                if not chunk:  # it shrank: the client sees a short reply and fails
+                    break
+                self.wfile.write(chunk)
+                size -= len(chunk)
+
+    def do_POST(self):
+        u = urllib.parse.urlsplit(self.path)
+        try:
+            n = int(self.headers.get("Content-Length") or "")
+        except ValueError:
+            n = -1
+        if n < 0:
+            self.close_connection = True
+            return self._reply(411, {"error": "Content-Length needed"})
+        raw = self.rfile.read(n) if u.path == "/exec" and n <= AGENT_MAX_JSON else None  # read even when refused
+        if not self._authorized():
+            return
+        if u.path == "/push":
+            return self._push(dict(urllib.parse.parse_qsl(u.query)).get("path", ""), n)
+        if u.path != "/exec":
+            return self._reply(404, {"error": "not found"})
+        if raw is None:
+            self.close_connection = True
+            return self._reply(413, {"error": "request too large"})
+        try:
+            req = json.loads(raw)
+            argv, timeout, stdin = req["argv"], float(req.get("timeout", 60)), req.get("stdin")
+            if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)) or \
+                    not 0 < timeout <= 3600 or not isinstance(stdin, (str, type(None))):
+                raise ValueError
+        except (ValueError, TypeError, KeyError):
+            return self._reply(400, {"error": "exec wants {argv: [strings], timeout: 1-3600 s, stdin?: string}"})
+        _agent_log(self.client_address[0], "exec " + " ".join(argv)[:200])
+        try:
+            r = subprocess.run(argv, input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                               timeout=timeout, stdin=None if stdin is not None else subprocess.DEVNULL, **NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            return self._reply(504, {"error": f"{argv[0]} timed out ({timeout:g} s)"})
+        except OSError as e:
+            return self._reply(200, {"exit": 127, "stdout": "", "stderr": f"{argv[0]}: {e.strerror or e}"})
+        self._reply(200, {"exit": r.returncode, "stdout": r.stdout, "stderr": r.stderr})
+
+    def _push(self, path, n):
+        tmp = f"{path}.tct-{secrets.token_hex(4)}"  # whole or not at all: a cut connection leaves no half file
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+            with os.fdopen(fd, "wb") as f:  # owner only, and never through a link planted there
+                left = n
+                while left:
+                    chunk = self.rfile.read(min(left, 1 << 20))
+                    if not chunk:
+                        raise OSError("connection cut short")
+                    f.write(chunk)
+                    left -= len(chunk)
+            os.replace(tmp, path)
+        except OSError as e:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            self.close_connection = True
+            return self._reply(400, {"error": f"{path}: {e.strerror or e}"})
+        _agent_log(self.client_address[0], f"push {path} ({n} bytes)")
+        self._reply(200, {"path": path, "bytes": n})
+
+
+def agent_serve(listen="127.0.0.1", port=None):
+    """This PC's agent, HTTPS on listen:port (a thread serves it; serve_forever() to block): the server."""
+    ip = ipaddress.ip_address(listen)  # an address, never a name: what is reachable stays explicit
+    fp, token = agent_credentials()
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(_agent_path("cert.pem"))
+    srv = (_AgentServer6 if ip.version == 6 else _AgentServer)((str(ip), AGENT_PORT if port is None else port),
+                                                               _AgentHandler)
+    srv.slots = threading.BoundedSemaphore(AGENT_CONNECTIONS)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
+    srv.token, srv.fingerprint = token, fp
+    return srv
+
+
+def agent(listen="127.0.0.1", port=None, rotate=False):
+    if rotate:
+        agent_credentials(rotate=True)
+    srv = agent_serve(listen, port)
+    host = f"[{listen}]" if ":" in listen else listen
+    url = f"https://{host}:{srv.server_address[1]}"
+    print(json.dumps({"url": url, "fingerprint": srv.fingerprint, "token": srv.token,
+                      "on the central PC": f"terminal-ct host add NAME {url} --fingerprint {srv.fingerprint} "
+                                           f"--token {srv.token}"}, indent=1), flush=True)
+    srv.serve_forever()
+
+
+def agent_request(host, method, path, body=None, timeout=60, out=None, length=None):
+    """One call to another PC's agent: its JSON reply, or with out its reply body written to that file;
+    RuntimeError when the agent cannot be reached, is not the pinned one, or refuses."""
+    u = urllib.parse.urlsplit(host["url"])
+    headers = {"X-Token": host["token"]}
+    if isinstance(body, dict):
+        body = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    if body is not None:
+        headers["Content-Length"] = str(len(body) if length is None else length)
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE  # trust = the pinned fingerprint, checked below
+        c = http.client.HTTPSConnection(u.hostname, u.port or AGENT_PORT, timeout=timeout, context=ctx)
+        try:
+            c.connect()
+            got = hashlib.sha256(c.sock.getpeercert(binary_form=True)).hexdigest()
+            if not secrets.compare_digest(got, host["fingerprint"].lower().replace(":", "")):  # before the token
+                raise RuntimeError(f"certificate {got} is not the pinned one (another machine, a new agent "
+                                   "certificate there: host add again, or an antivirus scanning HTTPS in between: "
+                                   "exclude this program, or use ssh://)")
+            try:
+                c.request(method, path, body=body, headers=headers)
+            except (BrokenPipeError, ConnectionResetError):  # refused before all was sent: its answer says why
+                pass
+            r = c.getresponse()
+            if r.status == 200 and out:
+                tmp = f"{out}.tct-{secrets.token_hex(4)}"
+                try:
+                    with open(tmp, "wb") as f:
+                        shutil.copyfileobj(r, f)
+                    if r.length:  # http.client leaves what was not read: the body was cut short
+                        raise OSError("reply cut short")
+                    os.replace(tmp, out)
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp)
+                return None
+            data = r.read()
+        finally:
+            c.close()
+    except (OSError, http.client.HTTPException) as e:  # ssl errors are OSErrors
+        raise RuntimeError(f"agent {host['url']}: {e}") from None
+    except RuntimeError as e:
+        raise RuntimeError(f"agent {host['url']}: {e}") from None
+    try:
+        reply = json.loads(data)
+    except ValueError:
+        raise RuntimeError(f"agent {host['url']}: unreadable reply ({r.status})") from None
+    if r.status != 200:
+        raise RuntimeError(f"agent {host['url']}: {reply.get('error') if isinstance(reply, dict) else r.status}")
+    return reply
+
+
+def ssh_target(url):
+    """(urlsplit of an ssh://[user@]host[:port] address, its port or None), or ValueError: nothing in it may read as
+    an ssh option (ssh://-oProxyCommand=... would run a command on this PC)."""
+    u = urllib.parse.urlsplit(url)
+    port = u.port  # ValueError when not a number
+    if u.scheme != "ssh" or not u.hostname or u.path not in ("", "/") or u.query or u.password is not None or \
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*|[0-9a-fA-F:.]+", u.hostname) or \
+            u.username is not None and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", u.username):
+        raise ValueError(f"not an ssh://[user@]host[:port] address: {url!r}")
+    return u, port
+
+
+class NodeRemote(NodeVM):
+    """Containers of another PC: each engine call is run there by its agent (https://...) or over SSH (ssh://...).
+    shortcut: Docker there (its command is docker); a PC with Podman alone needs podman-docker."""
+    def __init__(self, name, remote, timeout=None):
+        self.name, self.remote, self.engine, self.timeout = name, remote, "docker", timeout
+
+    def _ssh(self, scp=False):
+        u, port = ssh_target(self.remote["url"])
+        port = ["-P" if scp else "-p", str(port)] if port else []
+        return ["scp" if scp else "ssh", "-q" if scp else "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                *port], (f"{u.username}@{u.hostname}" if u.username else u.hostname)
+
+    def _exec(self, argv, timeout):
+        if self.remote["url"].startswith("https://"):
+            return agent_request(self.remote, "POST", "/exec", {"argv": argv, "timeout": timeout}, timeout + 30)
+        cmd, target = self._ssh()
+        try:
+            r = subprocess.run([*cmd, "--", target, " ".join(shlex.quote(a) for a in argv)], capture_output=True,
+                               text=True, encoding="utf-8", errors="replace", timeout=timeout + 30,
+                               stdin=subprocess.DEVNULL, **NO_WINDOW)
+        except OSError as e:
+            raise RuntimeError(f"ssh: {e.strerror or e}") from None
+        if r.returncode == 255:  # ssh's own failure (the remote command's exit codes are below)
+            raise RuntimeError(f"ssh {target}: {r.stderr.strip() or 'connection failed'}")
+        return {"exit": r.returncode, "stdout": r.stdout, "stderr": r.stderr}
+
+    def copy(self, direction, src, dest):
+        try:
+            if self.remote["url"].startswith("https://"):
+                if direction == "push":
+                    with open(src, "rb") as f:
+                        agent_request(self.remote, "POST", "/push?" + urllib.parse.urlencode({"path": dest}), f,
+                                      timeout=3600, length=os.fstat(f.fileno()).st_size)
+                else:
+                    agent_request(self.remote, "GET", "/pull?" + urllib.parse.urlencode({"path": src}),
+                                  timeout=3600, out=dest)
+                return
+            cmd, target = self._ssh(scp=True)
+            pair = [src, f"{target}:{dest}"] if direction == "push" else [f"{target}:{src}", dest]
+            r = subprocess.run([*cmd, "--", *pair], capture_output=True, text=True, timeout=3600,
+                               stdin=subprocess.DEVNULL, **NO_WINDOW)
+            if r.returncode:
+                raise RuntimeError(r.stderr.strip() or "scp failed")
+        except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+            raise SystemExit(f"host {self.name}: copy failed ({e})") from None
 
 
 def _tar(src, arcname, path):
@@ -3261,6 +3598,30 @@ if (!token) msg("no token: open the dashboard with the web command (terminal-ct 
 # ===== end of shared web dashboard =====
 
 
+AGENT_CONNECTIONS = 64
+
+
+class _AgentServer(_WebServer):
+    """At most AGENT_CONNECTIONS clients at once: idle connections (15 s each) never use up threads or memory."""
+    def handle_error(self, *a):  # a failed handshake, a client gone: just that client
+        pass
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            return socketserver.TCPServer.shutdown_request(self, request)  # full: closed, no slot to give back
+        super().process_request(request, client_address)  # its thread failing to start: shutdown_request below
+
+    def shutdown_request(self, request):  # end of a request that had a slot
+        try:
+            super().shutdown_request(request)
+        finally:
+            self.slots.release()
+
+
+class _AgentServer6(_AgentServer):
+    address_family = socket.AF_INET6
+
+
 # ---------- snapshots, clones, files ----------
 # A snapshot is the container's file system committed to an image (tct-snap-NAME:TAG) plus its /data volume as a
 # tar file (STORE/NAME/snaps/TAG.tar): load brings both back. A clone starts from the same two. Sandboxes have
@@ -4797,6 +5158,8 @@ def main(argv=None):
     bn = sub.add_parser("bench"); bn.add_argument("--runs", type=int, default=10); bn.add_argument("--desktop", action="store_true")
     sk_ = sub.add_parser("skills"); sk_.add_argument("skill_cmd", choices=["get", "path", "install"]); sk_.add_argument("--dir")
     wb = sub.add_parser("web"); wb.add_argument("--project"); wb.add_argument("--no-open", action="store_true")
+    ag = sub.add_parser("agent", help="serve this PC to a central PC (HTTPS, pinned certificate + token)")
+    ag.add_argument("--listen", default="127.0.0.1"); ag.add_argument("--port", type=int); ag.add_argument("--rotate", action="store_true")
     lg = sub.add_parser("logs"); lg.add_argument("name"); lg.add_argument("-n", type=int, default=100)
     sn = sub.add_parser("snapshot"); sn.add_argument("name"); sn.add_argument("snap_cmd", choices=["save", "load", "rm", "ls"])
     sn.add_argument("tag", nargs="?")
@@ -4898,6 +5261,7 @@ def main(argv=None):
             return print(json.dumps(web_api("GET", "/api/state", {"project": o.project or ""})[1]))
         return dash(o.project)
     if o.cmd == "web": return show_json(web(not o.no_open, o.project))
+    if o.cmd == "agent": return agent(o.listen, o.port, o.rotate)
     if o.cmd == "bench": return show_json(bench(max(1, o.runs), o.desktop))
     if o.cmd == "skills": return skills(o.skill_cmd, o.dir)
     if o.cmd == "logs": return print(logs(o.name, o.n), end="")
