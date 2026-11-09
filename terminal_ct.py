@@ -40,6 +40,7 @@ Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if inst
 """
 import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, \
     shlex, shutil, socket, socketserver, struct, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, webbrowser, zlib
+import importlib.util
 
 VERSION = "0.9.0"
 WINDOWS = os.name == "nt"
@@ -165,6 +166,19 @@ class NodeVM(Node):
     def __init__(self, name, timeout=None):
         self.name, self.engine, self.timeout = name, "docker", timeout  # timeout: each call's, when looking around
 
+    def _exec(self, argv, timeout):
+        """A program in the node, as root, by its guest agent: {exit, stdout, stderr}; RuntimeError when the node
+        cannot run it. terminal-vm in this process when it can be loaded (~0.1 s a call), else its command line
+        (a new Python each time: 0.3 s, 1-2 s from a Windows folder in WSL)."""
+        vm = vm_module()
+        if vm is None:
+            return vm_call(["exec", self.name, "--timeout", str(timeout), "--", *argv], timeout=timeout + 30)
+        try:
+            with captured(io.StringIO()):
+                return vm.guest_run(self.name, argv, max(1.0, min(float(timeout), 3600)))
+        except (SystemExit, ValueError, KeyError, IndexError, OSError) as e:  # what its command line reports as errors
+            raise RuntimeError(str(e) or f"terminal-vm exec failed ({type(e).__name__})") from None
+
     def run(self, args, check=True, timeout=None, capture=True):
         if args[0] == "build" and os.path.isdir(args[-1]):  # a context folder of this host: unpacked in the node
             remote = f"/tmp/tct-{secrets.token_hex(6)}"
@@ -182,7 +196,7 @@ class NodeVM(Node):
             return subprocess.CompletedProcess(["docker", *args], 0, out, "")
         t = timeout or self.timeout or (600 if capture else 3600)  # uncaptured: a pull or a build, minutes
         try:
-            r = vm_call(["exec", self.name, "--timeout", str(t), "--", "docker", *args], timeout=t + 30)
+            r = self._exec(["docker", *args], t)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             raise SystemExit(f"node {self.name}: {e}") from None
         if not capture and r.get("stdout"):
@@ -200,7 +214,7 @@ class NodeVM(Node):
 
     def free_bytes(self, root):
         try:
-            r = vm_call(["exec", self.name, "--timeout", "30", "--", "df", "-Pk", root], timeout=60)
+            r = self._exec(["df", "-Pk", root], 30)
             return int(r["stdout"].splitlines()[-1].split()[3]) * 1024
         except (RuntimeError, subprocess.TimeoutExpired, KeyError, IndexError, ValueError) as e:
             raise SystemExit(f"node {self.name}: cannot read its free disk space ({e})") from None
@@ -208,7 +222,7 @@ class NodeVM(Node):
     def sh(self, command, timeout=600):
         """A shell command in the node, as root; its output, or SystemExit with its error."""
         try:
-            r = vm_call(["exec", self.name, "--timeout", str(timeout), "--", "sh", "-c", command], timeout=timeout + 30)
+            r = self._exec(["sh", "-c", command], timeout)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             raise SystemExit(f"node {self.name}: {e}") from None
         if r.get("exit"):
@@ -255,9 +269,8 @@ class NodeVM(Node):
         self.deploy()
         t = int(float(a.get("timeout", 30))) + 60 if tool in ("wait", "ready") else 60
         try:
-            r = vm_call(["exec", self.name, "--timeout", str(t), "--", "env", f"TERMINAL_CT_HOME={STORE}",
-                         "TERMINAL_CT_ENGINE=docker", "python3", NODE_CT, "_act", name, tool, json.dumps(a)],
-                        timeout=t + 30)
+            r = self._exec(["env", f"TERMINAL_CT_HOME={STORE}", "TERMINAL_CT_ENGINE=docker", "python3", NODE_CT,
+                            "_act", name, tool, json.dumps(a)], t)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             raise RuntimeError(f"node {self.name}: {e}") from None
         if r.get("exit"):
@@ -2335,6 +2348,44 @@ _VM_NAME = re.compile(r"\w[\w.-]{0,63}")
 
 def vm_cli():
     return peer_cli("TERMINAL_VM", "terminal-vm")
+
+
+_VM_MODULE, _VM_LOCK = {}, threading.Lock()  # (path, mtime): module or None
+
+
+def vm_module():
+    """terminal-vm itself, loaded in this process when its command is plainly a Python file (TERMINAL_VM="python3
+    /path/terminal_vm.py", or install.sh's launcher that runs one); loaded again when that file changes (a daemon
+    outlives a reinstall). None otherwise (sudo, env, wsl or ssh in front; a Mac's terminal-mac; a binary): then
+    its command line is used, which knows what those mean."""
+    cli, path = vm_cli() or [], None
+    if len(cli) == 2 and os.path.basename(cli[0]).lower().startswith("python") and cli[1].endswith(".py"):
+        path = cli[1]
+    elif len(cli) == 1 and os.path.isfile(cli[0]) and os.path.getsize(cli[0]) < 4096:
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            with open(cli[0], encoding="utf-8") as f:
+                found = re.search(r'^exec python3 "([^"]+terminal_vm\.py)" "\$@"$', f.read(), re.M)  # install.sh's
+            path = found and found[1]
+    try:
+        key = (path, os.path.getmtime(path)) if path else None
+    except OSError:
+        key = None
+    if key is None:
+        return None
+    with _VM_LOCK:
+        if key not in _VM_MODULE:
+            mod = None
+            try:
+                spec = importlib.util.spec_from_file_location("terminal_vm_peer", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                if not hasattr(mod, "guest_run"):  # an older terminal-vm: its command line then
+                    mod = None
+            except Exception:  # any trouble loading it: the command line still works
+                mod = None
+            _VM_MODULE.clear()
+            _VM_MODULE[key] = mod
+        return _VM_MODULE[key]
 
 
 def vm_call(args, timeout=60, **k):

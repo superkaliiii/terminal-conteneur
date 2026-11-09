@@ -51,6 +51,10 @@ Never try to work around a refusal.
 - Stacks: `ct_apply` a desired state (`services` with `image`, `replicas`, `cpus`, `memory_gb`, `restart`,
   `health: {exec, every, retries}`, `ttl`); the daemon keeps it so (restarts, health probes, replicas). `ct_scale`
   changes the replicas, `ct_stack` shows or removes it, `ct_events` tells what happened.
+- Nodes (Linux VMs running Docker, added by the user with `terminal-ct node add`): `ct_list` marks a container in
+  one with `node`; every tool on it works the same (screen tools included, ~1.5 s per action). In a stack,
+  `"spread": "nodes"` spreads a service's replicas over the running nodes and moves them when one goes down
+  (`failover` events, `/data` not kept); `"node": "N"` keeps them on N. Not yet with isolated networks.
 - `net_create` + `net_attach` (stopped containers): an isolated network where containers reach each other by name.
 - Stay within `quota`; `ct_resources` asks for the CPUs and memory a task needs, give them back after; `top` and
   `dashboard` show where things stand.

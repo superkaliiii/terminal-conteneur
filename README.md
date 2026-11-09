@@ -81,8 +81,11 @@ of a VM, the lightness of containers inside it.
 - `--node NAME create ...` puts a container there; terminal-ct remembers it (`STORE/nodes.json`), so `start`,
   `stop`, `exec`, `logs`, `status`, `rm` of that container go to its node without `--node`. `--node NAME ls`, `top`,
   `quota` show the node's own containers and capacity.
-- terminal-ct stays on the host and decides: each engine call is `docker ...` run in the node by its guest agent
-  (`terminal-vm exec`), no network port opened, nothing listening (about 0.15 s per call; a command takes about 1 s).
+- terminal-ct stays on the host and decides: each engine call is `docker ...` run in the node by its guest agent,
+  no network port opened, nothing listening. terminal-vm is loaded into terminal-ct's own process when it is a Python
+  file (`TERMINAL_VM`, or install.sh's launcher), else called by its command line; loaded, `bench` in an Alpine node
+  (WSL, host CPU half busy, `bench/results.json`): create 4.5 s, start 2.6 s, exec 0.9 s, ls 0.8 s, stop 1.2 s, rm
+  2 s; by the command line each call also started a Python (0.3 s, 1-2 s from a Windows folder): create took 25 s.
 - `node rm NAME` refuses while containers live there; `--force` removes them first (their `/data` with them).
 - `ls`, `stack show`, the dashboards and the MCP `ct_list` show the nodes' containers too (field `node`); MCP and
   web actions on one go to its node.

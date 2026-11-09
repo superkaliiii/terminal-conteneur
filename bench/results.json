@@ -128,6 +128,57 @@
     }
    },
    "desktop_memory_mb": 22
+  },
+  {
+   "tool": "terminal-ct 0.9.0",
+   "engine": "docker 29.9.3 in a node (Alpine VM of terminal-vm, calls through its guest agent; host CPU ~50% busy)",
+   "host": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41 (WSL)",
+   "date": "2026-11-09",
+   "image": "alpine:3.20",
+   "results": {
+    "create": {
+     "median_ms": 4457.1,
+     "min_ms": 4023.6,
+     "max_ms": 5735.9,
+     "runs": 5
+    },
+    "start": {
+     "median_ms": 2634.0,
+     "min_ms": 2121.5,
+     "max_ms": 3071.6,
+     "runs": 5
+    },
+    "exec_true": {
+     "median_ms": 936.3,
+     "min_ms": 721.9,
+     "max_ms": 1123.4,
+     "runs": 5
+    },
+    "ls": {
+     "median_ms": 793.9,
+     "min_ms": 560.5,
+     "max_ms": 952.0,
+     "runs": 5
+    },
+    "dashboard_data": {
+     "median_ms": 6652.7,
+     "min_ms": 5759.3,
+     "max_ms": 6987.4,
+     "runs": 5
+    },
+    "stop": {
+     "median_ms": 1172.1,
+     "min_ms": 1106.4,
+     "max_ms": 1523.4,
+     "runs": 5
+    },
+    "rm": {
+     "median_ms": 2025.5,
+     "min_ms": 1861.6,
+     "max_ms": 2092.0,
+     "runs": 5
+    }
+   }
   }
  ]
 }

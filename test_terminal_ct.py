@@ -874,9 +874,11 @@ class Nodes(unittest.TestCase):
         self.patch.start()
         self.age = unittest.mock.patch.object(ct, "UP_MAX_AGE", -1)  # the test changes VM states at once
         self.age.start()
+        self.inproc = unittest.mock.patch.object(ct, "vm_module", lambda: None)  # through the fake command line
+        self.inproc.start()
 
     def tearDown(self):
-        self.patch.stop(); self.age.stop()
+        self.patch.stop(); self.age.stop(); self.inproc.stop()
         ct.NODE = None
 
     def cli(self, *argv):
@@ -1089,6 +1091,52 @@ class Nodes(unittest.TestCase):
                     with self.assertRaises((SystemExit, tarfile.TarError)):
                         ct._extract(tar, d)
                 self.assertFalse(os.path.exists(os.path.join(d, "..", "evil")))
+
+    def test_terminal_vm_loaded_in_process(self):
+        """install.sh's launcher names the Python file: loaded, its guest_run called directly; its errors become
+        RuntimeError as from its command line; reloaded when the file changes; never with a prefix (sudo...)."""
+        self.inproc.stop()
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        lib = os.path.join(d, "terminal_vm.py")
+
+        def write(version):
+            with open(lib, "w") as f:
+                f.write(f"VERSION = {version}\ncalls = []\n"
+                        "def guest_run(name, argv, timeout):\n"
+                        "    calls.append((name, argv, timeout))\n"
+                        "    if argv[0] == 'fail':\n"
+                        "        raise SystemExit(name + ' is not running')\n"
+                        "    if argv[0] == 'qmp':\n"
+                        "        raise OSError('timed out')\n"
+                        "    return {'exit': 0, 'stdout': 'ok', 'stderr': ''}\n")
+        write(1)
+        launcher = os.path.join(d, "terminal-vm")
+        with open(launcher, "w") as f:
+            f.write(f'#!/bin/sh\nexec python3 "{lib}" "$@"\n')
+        try:
+            with unittest.mock.patch.object(ct, "vm_cli", lambda: [launcher]), \
+                    unittest.mock.patch.object(ct, "_VM_MODULE", {}):
+                n = ct.NodeVM("n1")
+                self.assertEqual(n.run(["ps", "-q"]).stdout, "ok")
+                self.assertEqual(ct.vm_module().calls, [("n1", ["docker", "ps", "-q"], 600.0)])
+                with self.assertRaisesRegex(RuntimeError, "n1 is not running"):
+                    n._exec(["fail"], 5)
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    n._exec(["qmp"], 5)                                           # an OSError: no traceback
+                write(2)
+                os.utime(lib, (time.time() + 5, time.time() + 5))                 # reinstalled
+                self.assertEqual(ct.vm_module().VERSION, 2)
+                with open(lib, "w") as f:
+                    f.write("VERSION = 0\n")                                    # an older one, without guest_run
+                os.utime(lib, (time.time() + 10, time.time() + 10))
+                self.assertIsNone(ct.vm_module())
+            for cli in (["sudo", "python3", lib], ["python3", "-X", lib], ["wsl", "python3", lib]):
+                with unittest.mock.patch.object(ct, "vm_cli", lambda: cli), unittest.mock.patch.object(ct, "_VM_MODULE", {}):
+                    self.assertIsNone(ct.vm_module(), cli)                         # their command line knows what those mean
+            self.assertEqual(self.vm_calls, [])                                  # no command line was run
+        finally:
+            self.inproc.start()
 
     def test_engine_errors_and_free_space(self):
         n = ct.NodeVM("n1")
