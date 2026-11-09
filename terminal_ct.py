@@ -23,6 +23,8 @@ labels; containers without them are never touched.
                       user); with --project, only that project, and project_status / notes_write to resume
   create ... --project P  |  project ls | project show [P] | project notes [P [TEXT]] | project move NAME P
   resume [--stay]  |  autostart [on|off]     start again what was running before a restart; at each logon
+  apply FILE [--project P] | scale STACK SERVICE N | stack ls|show|rm [STACK] | events [--stack S] [-n 50] [--follow]
+  daemon run|start|stop|status | prune      desired state kept by the daemon (restarts, health, ttl); stale images
   snapshot NAME save|load|rm TAG | snapshot NAME ls     file system + /data (load: stopped container)
   clone SRC NEW [--project P]                          NEW from SRC as it is (files and a copy of /data)
   push NAME LOCAL PATH | pull NAME PATH LOCAL          copy files in or out
@@ -31,10 +33,10 @@ labels; containers without them are never touched.
   image ls | image pull REF | image build NAME DIR | image rm NAME
 Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if installed, else docker).
 """
-import argparse, base64, collections, contextlib, io, json, os, queue, re, shlex, shutil, socket, struct, \
+import argparse, base64, calendar, collections, contextlib, hashlib, io, json, os, queue, re, secrets, shlex, shutil, socket, struct, \
     subprocess, sys, threading, time, zlib
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 WINDOWS = os.name == "nt"
 if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
@@ -274,8 +276,10 @@ SANDBOX_PIDS = 256
 
 
 def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_by="user",
-           desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=(), project=None):
-    """Internet: on by default for the user's containers; sandboxes and agents' containers start offline."""
+           desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=(), project=None, labels=None,
+           own_volume=False):
+    """Internet: on by default for the user's containers; sandboxes and agents' containers start offline.
+    labels: more terminal-ct.* labels (a stack's service and replica)."""
     check_name(name)
     project = check_project(project or DEFAULT_PROJECT)
     recover(name)  # an interrupted remake's container is still NAME's: never create over it
@@ -295,14 +299,15 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     for n in nets:
         if n not in known:
             raise SystemExit(f"no network {n!r}; create it with: terminal-ct net create {n}")
-    if not sandbox and node().run(["volume", "inspect", f"{PREFIX}{name}-data"], check=False).returncode == 0:
+    # own_volume: a stack's replica remade (its configuration changed) takes back its own /data
+    if not sandbox and not own_volume and node().run(["volume", "inspect", f"{PREFIX}{name}-data"], check=False).returncode == 0:
         # never hand an earlier container's data to a new owner (an agent could then delete it unasked)
         raise SystemExit(f"a volume {PREFIX}{name}-data is left from an earlier {name}: keep it under another name, "
                          f"or remove it: {node().engine} volume rm {PREFIX}{name}-data")
     quota_check({"disk_gb": 0})  # what a container will write is unknown: refuse once the disk quota is reached
     internet = not sandbox and created_by == "user" if internet is None else internet
     spec = {"image": image, "cmd": cmd, "desktop": desktop, "width": width, "height": height, "sandbox": sandbox}
-    out = _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=True)
+    out = _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=True, labels=labels)
     want(name, "stopped")
     print(json.dumps(out))
 
@@ -315,7 +320,7 @@ def ensure_image(spec):
         image_cmd(spec["image"])
 
 
-def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=False):
+def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=False, labels=None):
     """Create the engine container from its spec (kept in a label: a sandbox is recreated from it at each start)."""
     volume, extra = f"{PREFIX}{name}-data", []  # /data is kept when the container is recreated, removed by rm
     image, cmd, sandbox, podman = spec["image"], spec.get("cmd"), spec.get("sandbox"), node().engine == "podman"
@@ -357,7 +362,8 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
             "--label", f"{LABEL}.name={name}", "--label", f"{LABEL}.created_by={created_by}",
             "--label", f"{LABEL}.project={project}", "--label", f"{LABEL}.sandbox={int(bool(sandbox))}",
             "--label", f"{LABEL}.desktop={int(bool(spec.get('desktop')))}",
-            "--label", f"{LABEL}.spec={json.dumps(spec, separators=(',', ':'))}", *data, *extra,
+            "--label", f"{LABEL}.spec={json.dumps(spec, separators=(',', ':'))}",
+            *(x for k, v in (labels or {}).items() for x in ("--label", f"{LABEL}.{k}={v}")), *data, *extra,
             "--cpus", f"{cpus:g}", "--memory", str(int(memory * 2 ** 30)), "--memory-swap", str(int(memory * 2 ** 30)),
             image, *(cmd or [])]  # memory-swap = memory: no swap, so the quota's memory is the real ceiling
     try:
@@ -428,7 +434,7 @@ def remake(name, info, keep=False, **change):
     node().run(["rename", PREFIX + name, old])
     try:
         _make(name, spec, lab.get(f"{LABEL}.created_by", "user"), cpus or DEFAULT_CPUS, mem or DEFAULT_MEMORY,
-              internet, nets, project)
+              internet, nets, project, labels={k: lab[f"{LABEL}.{k}"] for k in STACK_LABELS if f"{LABEL}.{k}" in lab})
     except BaseException:
         node().run(["rm", "-f", PREFIX + name], check=False)
         node().run(["rename", old, PREFIX + name], check=False)
@@ -672,13 +678,27 @@ def quota_limits(use):
 
 
 class quota_lock:
-    """Cross-process lock (an atomic mkdir), so two commands cannot both pass the check and then both start."""
+    """Cross-process lock (an atomic mkdir), so two commands cannot both pass the check and then both start.
+    what: another lock of the same kind (reconcile)."""
+    def __init__(self, what="quota"):
+        self.what = what
+
     def __enter__(self):
         os.makedirs(STORE, exist_ok=True)
-        self.path = os.path.join(STORE, ".quota.lock")
+        self.path = os.path.join(STORE, f".{self.what}.lock")
         for _ in range(300):
             try:
-                os.mkdir(self.path); return self
+                os.mkdir(self.path)
+                self.token = os.path.join(self.path, f"{os.getpid()}-{secrets.token_hex(4)}")
+                open(self.token, "w").close()
+                self.held = threading.Event()
+
+                def fresh():  # held for long (an image build under it): never "stale" while its holder lives
+                    while not self.held.wait(30):
+                        with contextlib.suppress(OSError):
+                            os.utime(self.path)
+                threading.Thread(target=fresh, daemon=True).start()
+                return self
             except FileExistsError:
                 with contextlib.suppress(OSError):
                     if time.time() - os.path.getmtime(self.path) > 120:  # left by a crashed command
@@ -686,12 +706,14 @@ class quota_lock:
                         # second remove the first's fresh lock)
                         stale = f"{self.path}.{os.getpid()}"
                         os.rename(self.path, stale)
-                        os.rmdir(stale)
+                        shutil.rmtree(stale)
                 time.sleep(0.1)
-        raise SystemExit("another terminal-ct command holds the quota lock; try again")
+        raise SystemExit(f"another terminal-ct command holds the {self.what} lock; try again")
 
     def __exit__(self, *exc):
-        with contextlib.suppress(OSError):
+        self.held.set()
+        with contextlib.suppress(OSError):  # only our own: if it was broken and taken, the token is not there
+            os.remove(self.token)
             os.rmdir(self.path)
 
 
@@ -888,13 +910,15 @@ def resume(stay=False, wait=60):
             time.sleep(1)
         for c in raw_containers():
             n = labels_of(c).get(f"{LABEL}.name")
-            if wanted(n) == "running" and not running(c):
+            if wanted(n) == "running" and not running(c) and not labels_of(c).get(f"{LABEL}.stack"):
                 try:
                     out.append(dict(quiet(start, n), name=n, engine=n_.engine))
                 except (SystemExit, Exception) as e:  # one refusal (quota) must not keep the others down
                     out.append({"name": n, "engine": n_.engine, "error": str(e)})
+    if stacks():  # the daemon brings the stacks' containers back to their desired state
+        out.append({"daemon": daemon("start")})
     print(json.dumps({"resumed": out}))
-    while stay and any(running(c) for _ in each_engine() for c in raw_containers()):
+    while stay and (daemon_alive() or any(running(c) for _ in each_engine() for c in raw_containers())):
         time.sleep(60)
 
 
@@ -1014,6 +1038,508 @@ def project_move(name, project):
     # a sandbox starts from its image anyway: committing would make whatever is in it now its new image
     remake(name, info, keep=labels_of(info).get(f"{LABEL}.sandbox") != "1", project=check_project(project))
     return {"name": name, "project": project}
+
+
+# ---------- orchestration: stacks, reconciliation, health, events ----------
+# A stack is a desired state (STORE/stacks/NAME.json, from `apply FILE`): services, each with its replicas
+# (containers NAME-SERVICE-1..N, labelled stack, service, replica and a hash of their configuration). `reconcile`
+# makes the engine match it: creates what is missing, removes the surplus, recreates what drifted, starts again
+# what stopped (restart policy, exponential backoff), removes what outlived its ttl; the daemon does that every
+# few seconds and runs the health probes. Everything it does goes to the event log.
+STACK_LABELS = ("stack", "service", "replica", "hash")
+SERVICE_KEYS = {"image", "cmd", "replicas", "cpus", "memory_gb", "desktop", "width", "height", "sandbox", "internet",
+                "networks", "restart", "health", "ttl"}
+RECREATE_KEYS = ("image", "cmd", "desktop", "width", "height", "sandbox", "internet", "networks")  # cpus, memory: live
+RESTARTS = ("always", "on-failure", "never")
+TICK = 3  # seconds between the daemon's passes
+BACKOFF_MAX = 300
+
+
+def stacks_dir():
+    d = os.path.join(STORE, "stacks")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def stacks():
+    return sorted(f[:-5] for f in os.listdir(stacks_dir()) if f.endswith(".json") and not f.startswith("."))
+
+
+def load_stack(name):
+    try:
+        with open(os.path.join(stacks_dir(), check_name(name) + ".json"), encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise SystemExit(f"no stack named {name!r}; apply one: terminal-ct apply FILE") from None
+
+
+def _save_stack(s):
+    path = os.path.join(stacks_dir(), s["stack"] + ".json")
+    with open(path + ".new", "w", encoding="utf-8") as f:
+        json.dump(s, f, indent=1)
+    os.replace(path + ".new", path)  # never a half-written desired state for the daemon to read
+
+
+def parse_ttl(v):
+    """Seconds from 90, "90s", "30m", "2h", "1d"; None for no ttl."""
+    if v in (None, "", 0):
+        return None
+    m = re.fullmatch(r"(\d+)([smhd]?)", str(v).strip())
+    if not m or int(m.group(1)) <= 0:
+        raise SystemExit(f"invalid ttl {v!r}: a number of seconds, or 30m, 2h, 1d")
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def check_stack(s):
+    """The stack file, validated and with defaults filled in. Errors name the field."""
+    if not isinstance(s, dict) or not isinstance(s.get("services"), dict) or not s["services"]:
+        raise SystemExit('a stack is {"stack": NAME, "services": {SERVICE: {...}, ...}}')
+    name = check_name(s.get("stack"))
+    out = {"stack": name, "services": {}}
+    if s.get("project"):
+        out["project"] = check_project(s["project"])
+    for svc, c in s["services"].items():
+        check_name(svc)
+        if not isinstance(c, dict) or set(c) - SERVICE_KEYS:
+            raise SystemExit(f"service {svc}: unknown keys {sorted(set(c) - SERVICE_KEYS) if isinstance(c, dict) else c}"
+                             f" (allowed: {', '.join(sorted(SERVICE_KEYS))})")
+        c = dict(c)
+        c["replicas"] = c.get("replicas", 1)
+        if not isinstance(c["replicas"], int) or not 0 <= c["replicas"] <= 100:
+            raise SystemExit(f"service {svc}: replicas must be 0 to 100")
+        check_name(f"{name}-{svc}-{max(c['replicas'], 1)}")  # the longest replica name must be a valid name
+        c["restart"] = c.get("restart", "always")
+        if c["restart"] not in RESTARTS:
+            raise SystemExit(f"service {svc}: restart is one of {', '.join(RESTARTS)}")
+        parse_ttl(c.get("ttl"))
+        if c.get("cmd") is not None and not (isinstance(c["cmd"], list) and all(isinstance(x, str) for x in c["cmd"])):
+            raise SystemExit(f"service {svc}: cmd is a list of strings")
+        for n in c.get("networks") or []:
+            check_name(n)
+        h = c.get("health")
+        if h is not None:
+            if not isinstance(h, dict) or not isinstance(h.get("exec"), str):
+                raise SystemExit(f'service {svc}: health is {{"exec": "COMMAND", "every": 10, "retries": 3, "grace": 30}}')
+            h = {"exec": h["exec"], "every": max(2, int(h.get("every", 10))), "retries": max(1, int(h.get("retries", 3))),
+                 "grace": max(0, int(h.get("grace", 30)))}  # no probe in the first seconds: a desktop takes a while
+            c["health"] = h
+        out["services"][svc] = c
+    return out
+
+
+def service_hash(c):
+    """What a replica is made from: a change here recreates it (replicas, restart, health, ttl do not)."""
+    return hashlib.sha256(json.dumps({k: c.get(k) for k in RECREATE_KEYS}, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def _replace(tmp, path):
+    """os.replace, retried: on Windows it fails while another process has the file open for a moment."""
+    for i in range(20):
+        try:
+            return os.replace(tmp, path)
+        except PermissionError:
+            if i == 19:
+                raise
+            time.sleep(0.05)
+
+
+def _write_atomic(path, text):
+    tmp = f"{path}.{os.getpid()}.new"  # one per writer: two writers never share it
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    _replace(tmp, path)
+
+
+def event(kind, stack=None, service=None, container=None, detail=None):
+    """One line of the event log (STORE/events.log): what the reconciler, the daemon or a probe did or saw."""
+    e = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": kind,
+         **{k: v for k, v in (("stack", stack), ("service", service), ("container", container), ("detail", detail)) if v}}
+    path = os.path.join(STORE, "events.log")
+    with contextlib.suppress(OSError):
+        os.makedirs(STORE, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(e) + "\n")
+        if os.path.getsize(path) > 4 * 2 ** 20:  # a daemon runs for months: keep the latest lines
+            with open(path, encoding="utf-8") as f:
+                keep = f.readlines()[-10000:]
+            _write_atomic(path, "".join(keep))
+    return e
+
+
+def events(stack=None, n=50, project=None):
+    try:
+        with open(os.path.join(STORE, "events.log"), encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+    except (OSError, ValueError):
+        return []
+    own = None if project is None else {s for s in stacks() if under(load_stack(s).get("project") or DEFAULT_PROJECT, project)}
+    rows = [e for e in rows if (stack is None or e.get("stack") == stack) and (own is None or e.get("stack") in own)]
+    return rows[-n:]
+
+
+def follow_events(stack=None):
+    """Print new events as they come; a rotation of the log starts over at its beginning."""
+    path, pos = os.path.join(STORE, "events.log"), 0
+    while True:
+        with contextlib.suppress(OSError):
+            if os.path.getsize(path) < pos:
+                pos = 0
+            with open(path, encoding="utf-8") as f:
+                f.seek(pos)
+                for line in f:
+                    if line.endswith("\n"):
+                        e = json.loads(line)
+                        if stack is None or e.get("stack") == stack:
+                            print(json.dumps(e), flush=True)
+                        pos += len(line.encode("utf-8"))
+        time.sleep(1)
+
+
+def _state():
+    """The reconciler's memory per container (first creation, restarts, backoff, health, expired), across passes.
+    Read and written under the reconcile lock only."""
+    try:
+        with open(os.path.join(stacks_dir(), ".state.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(st):
+    _write_atomic(os.path.join(stacks_dir(), ".state.json"), json.dumps(st))
+
+
+def _time(t):
+    """Seconds since the epoch from an engine's time (Docker: UTC, Z; Podman: local time and its offset)."""
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.\d+)?\s*(Z|[+-]\d\d:?\d\d)?", t or "")
+    if not m or m.group(1) == "0001":
+        return None
+    utc = calendar.timegm(tuple(int(x) for x in m.groups()[:6]) + (0, 0, 0))
+    off = (m.group(7) or "Z").replace(":", "")
+    return utc - (0 if off == "Z" else (1 if off[0] == "+" else -1) * (int(off[1:3]) * 3600 + int(off[3:5]) * 60))
+
+
+def _started(c):
+    """When the container last started (None if never)."""
+    return _time((c.get("State") or {}).get("StartedAt"))
+
+
+def reconcile(name, now=None):
+    """One pass over a stack; returns the events it caused."""
+    with quota_lock("reconcile"):
+        st, now = _state(), now or time.time()
+        try:
+            out = _reconcile(load_stack(name), st, now)
+        finally:
+            _save_state(st)
+        return out
+
+
+def _rm_quiet(name, keep_data=False):
+    with contextlib.redirect_stdout(io.StringIO()):
+        if not keep_data:
+            return rm(name)
+        node().run(["rm", "-f", PREFIX + name])  # the replica remade: same name, same /data
+
+
+def _reconcile(s, st, now):
+    name, owner, project = s["stack"], s.get("created_by", "user"), s.get("project") or DEFAULT_PROJECT
+    done = []
+    ev = lambda kind, svc=None, c=None, detail=None: done.append(event(kind, name, svc, c, detail))
+    have = {labels_of(c).get(f"{LABEL}.name"): c for c in raw_containers() if labels_of(c).get(f"{LABEL}.stack") == name}
+    known = networks()
+    for svc, c in s["services"].items():
+        h = service_hash(c)
+        blocked = None
+        for n in c.get("networks") or []:
+            if n not in known:
+                net_create(n, owner, project)
+                known[n] = {"created_by": owner, "project": project, "members": []}
+                ev("network_created", svc, detail=n)
+            elif owner == "agent" and known[n]["created_by"] != "agent" and n not in s.get("approved_networks", []):
+                blocked = n  # the user's network, made since the approval: not the agent's to use
+        ttl = parse_ttl(c.get("ttl"))
+        for i in range(1, c["replicas"] + 1):
+            cname = f"{name}-{svc}-{i}"
+            info, mem = have.pop(cname, None), st.setdefault(cname, {})
+            if mem.get("expired"):
+                if info is not None:
+                    _rm_quiet(cname)
+                continue
+            if info is not None and labels_of(info).get(f"{LABEL}.hash") != h:
+                _rm_quiet(cname, keep_data=True)
+                ev("recreated", svc, cname, "its configuration changed (its /data kept)")
+                info = None
+                mem = st[cname] = {"born": mem.get("born")}
+            if info is None:
+                if now < mem.get("next", 0):
+                    continue  # backing off after a failed creation
+                if blocked:
+                    ev("create_failed", svc, cname, f"network {blocked!r} is the user's: apply the stack again "
+                                                    "so they can approve it"); continue
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        create(cname, c.get("image") or DEFAULT_IMAGE, c.get("cpus"), c.get("memory_gb"), c.get("cmd"),
+                               created_by=owner, desktop=bool(c.get("desktop")), width=int(c.get("width", 1280)),
+                               height=int(c.get("height", 800)), sandbox=bool(c.get("sandbox")),
+                               internet=c.get("internet"), nets=c.get("networks") or (), project=project,
+                               labels={"stack": name, "service": svc, "replica": i, "hash": h}, own_volume=True)
+                except SystemExit as e:
+                    mem["fails"] = mem.get("fails", 0) + 1
+                    mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["fails"])
+                    ev("create_failed", svc, cname, str(e)); continue
+                mem["fails"] = 0
+                mem.setdefault("born", None)
+                mem["born"] = mem["born"] or now  # a ttl runs from the first creation (a sandbox is remade at starts)
+                ev("created", svc, cname)
+                info = find(cname)
+            mem.setdefault("born", _time(info.get("Created")) or now)
+            want_c, want_m = c.get("cpus") or DEFAULT_CPUS, c.get("memory_gb") or DEFAULT_MEMORY
+            have_c, have_m = allotted(info, None)
+            if abs(have_c - want_c) > 1e-6 or abs(have_m - want_m) > 1e-3:  # changed in place, nothing remade
+                try:
+                    resources(cname, want_c, want_m)
+                    ev("resized", svc, cname, f"{want_c:g} CPUs, {want_m:g} GiB")
+                except SystemExit as e:
+                    ev("pending", svc, cname, str(e))
+            if ttl and now - mem["born"] > ttl:
+                _rm_quiet(cname)
+                mem["expired"] = True
+                ev("expired", svc, cname, f"ttl {c['ttl']}")
+                continue
+            started = _started(info)
+            if running(info):
+                if started and now - started > 60:
+                    mem["restarts"] = 0  # a minute up: the next failure starts the backoff over
+                continue
+            status, code = (info.get("State") or {}).get("Status"), (info.get("State") or {}).get("ExitCode", 0)
+            first = status == "created" or mem.get("unhealthy", False)  # dropped once it started again
+            if not first and wanted(cname) == "stopped":
+                continue  # stopped by the user (terminal-ct stop): left so until they start it
+            if not first and (c["restart"] == "never" or c["restart"] == "on-failure" and code == 0):
+                continue  # stopped and meant to stay so (a finished job, or a policy of never)
+            if now < mem.get("next", 0):
+                continue  # backing off
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    start(cname)
+            except SystemExit as e:
+                mem["fails"] = mem.get("fails", 0) + 1
+                mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["fails"])
+                ev("pending" if "quota" in str(e) else "start_failed", svc, cname, str(e)); continue
+            mem["fails"] = 0
+            mem["started_at"] = now
+            mem.pop("unhealthy", None)
+            if status == "created":
+                ev("started", svc, cname)
+            else:
+                mem["restarts"] = mem.get("restarts", 0) + 1
+                mem["next"] = now + min(BACKOFF_MAX, 2 ** mem["restarts"])
+                ev("restarted", svc, cname, f"exit code {code}, restart {mem['restarts']}")
+    for cname in have:  # replicas no service asks for any more: removed with their /data
+        _rm_quiet(cname)
+        st.pop(cname, None)
+        ev("removed", labels_of(have[cname]).get(f"{LABEL}.service"), cname, "not in the stack any more (its /data too)")
+    return done
+
+
+def probe(s, now=None):
+    """Health probes of a stack's running replicas, each at its service's interval, after its grace time; after
+    `retries` failures in a row the replica is stopped and marked, so the next pass starts it again (unless its
+    policy is never). Probes run unlocked; their results are merged into the state under the lock."""
+    now, out, results = now or time.time(), [], {}
+    with quota_lock("reconcile"):
+        st = _state()
+    for c in raw_containers():
+        lab = labels_of(c)
+        cfg = s["services"].get(lab.get(f"{LABEL}.service")) if lab.get(f"{LABEL}.stack") == s["stack"] else None
+        h = (cfg or {}).get("health")
+        cname = lab.get(f"{LABEL}.name")
+        mem = st.get(cname, {})
+        up = _started(c) or now
+        if not h or not running(c) or now - up < h["grace"] or now - mem.get("probed", 0) < h["every"]:
+            continue
+        try:
+            ok = quiet(exec_, cname, ["sh", "-c", h["exec"]], h["every"])["exit"] == 0
+        except SystemExit:
+            ok = False
+        results[cname] = (ok, cfg, lab.get(f"{LABEL}.service"))
+    with quota_lock("reconcile"):
+        st = _state()  # what reconcile wrote meanwhile stays
+        for cname, (ok, cfg, svc) in results.items():
+            mem = st.setdefault(cname, {})
+            mem["probed"] = now
+            mem["health_fails"] = 0 if ok else mem.get("health_fails", 0) + 1
+            if mem["health_fails"] >= cfg["health"]["retries"]:
+                mem.update(health_fails=0, unhealthy=cfg["restart"] != "never")
+                node().run(["stop", "-t", "5", PREFIX + cname], check=False)  # not stop(): the user did not ask
+                out.append(event("unhealthy", s["stack"], svc, cname,
+                                 f"{cfg['health']['retries']} failed probes: {cfg['health']['exec']}"))
+        _save_state(st)
+    return out
+
+
+def apply(s, created_by="user", project=None, approved_networks=()):
+    """Store a desired state and reconcile it once now; the daemon keeps it so (started if it does not run).
+    Applying again also runs again the replicas whose ttl had expired."""
+    s = check_stack(s)
+    if project:
+        s["project"] = project
+    with quota_lock("stacks"):
+        path = os.path.join(stacks_dir(), s["stack"] + ".json")
+        if os.path.isfile(path):
+            old = load_stack(s["stack"])
+            if old.get("created_by", "user") != created_by:
+                raise SystemExit(f"stack {s['stack']!r} belongs to the {'agent' if old.get('created_by') == 'agent' else 'user'}")
+            s.setdefault("project", old.get("project"))
+        s.update(created_by=created_by, engine=node().engine)
+        if approved_networks:
+            s["approved_networks"] = sorted(set(approved_networks))
+        if not s.get("project"):
+            s.pop("project", None)
+        _save_stack(s)
+    event("applied", s["stack"])
+    try:
+        with quota_lock("reconcile"):
+            st = _state()
+            for k in [k for k in st if k.startswith(s["stack"] + "-")]:
+                st[k].pop("expired", None)
+            _save_state(st)
+        out = reconcile(s["stack"])
+    except SystemExit as e:  # a long pass of the daemon holds the lock: it will reconcile this stack itself
+        if "lock" not in str(e):
+            raise
+        out = [{"event": "queued", "detail": "the daemon is busy; it reconciles this stack at its next pass"}]
+    return {"stack": s["stack"], "events": out, "daemon": daemon("start")}
+
+
+def scale(stack, service, replicas):
+    with quota_lock("stacks"):
+        s = load_stack(stack)
+        if service not in s["services"]:
+            raise SystemExit(f"stack {stack} has no service {service!r} ({', '.join(s['services'])})")
+        s["services"][service]["replicas"] = replicas
+        keep = {k: s[k] for k in ("created_by", "engine", "approved_networks") if k in s}
+        s = dict(check_stack(s), **keep)
+        _save_stack(s)
+    event("scaled", stack, service, detail=f"{replicas} replicas")
+    return {"stack": stack, "service": service, "replicas": replicas, "events": reconcile(stack)}
+
+
+def stack_show(name):
+    s = load_stack(name)
+    with quota_lock("reconcile"):
+        st = _state()
+    reps = [dict(normalize(c), **{k: v for k, v in st.get(labels_of(c).get(f"{LABEL}.name"), {}).items()
+                                  if k in ("restarts", "expired", "health_fails")})
+            for c in raw_containers() if labels_of(c).get(f"{LABEL}.stack") == name]
+    return {"stack": name, "project": s.get("project") or DEFAULT_PROJECT, "created_by": s.get("created_by", "user"),
+            "services": {svc: dict(c, running=sum(r["status"] == "running" for r in reps
+                                                  if r["name"].startswith(f"{name}-{svc}-")))
+                         for svc, c in s["services"].items()},
+            "containers": sorted(reps, key=lambda r: r["name"]), "events": events(name, 10)}
+
+
+def stack_rm(name):
+    """Remove a stack: its desired state, then its containers with their /data (networks stay: other stacks may
+    use them)."""
+    load_stack(name)
+    with quota_lock("stacks"), quota_lock("reconcile"):
+        os.remove(os.path.join(stacks_dir(), name + ".json"))
+        st, gone = _state(), []
+        for c in raw_containers():
+            if labels_of(c).get(f"{LABEL}.stack") == name:
+                n = labels_of(c).get(f"{LABEL}.name")
+                _rm_quiet(n)
+                st.pop(n, None)
+                gone.append(n)
+        _save_state(st)
+    event("stack_removed", name, detail=f"{len(gone)} containers")
+    return {"removed": name, "containers": gone}
+
+
+def prune():
+    """Images terminal-ct made for containers that are gone (kept file systems, snapshots)."""
+    names = {labels_of(c).get(f"{LABEL}.name") for _ in each_engine() for c in raw_containers()}
+    out = []
+    for _ in each_engine():
+        for line in node().run(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]).stdout.splitlines():
+            repo = line.rsplit(":", 1)[0].split("/")[-1]
+            for pre in (KEEP, SNAP):
+                if repo.startswith(pre) and repo[len(pre):] not in names:
+                    if node().run(["image", "rm", line], check=False).returncode == 0:
+                        out.append(line)
+    return {"pruned": out}
+
+
+# the daemon: one per STORE (it holds the daemon lock for its whole life), seen through a heartbeat file and asked
+# to stop through a file: no signals, the same on Windows
+def _daemon_file(kind):
+    return os.path.join(STORE, f"daemon.{kind}")
+
+
+def daemon_alive():
+    try:
+        with open(_daemon_file("beat")) as f:
+            return time.time() - float(f.read().split()[0]) < 5 * TICK
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def daemon(cmd="status"):
+    if cmd == "status":
+        return {"daemon": "running" if daemon_alive() else "stopped", "stacks": stacks()}
+    if cmd == "stop":
+        if daemon_alive():
+            open(_daemon_file("stop"), "w").close()
+            for _ in range(10 * TICK):
+                if not daemon_alive():
+                    break
+                time.sleep(0.5)
+        return {"daemon": "running" if daemon_alive() else "stopped"}
+    if cmd == "start":
+        if daemon_alive():
+            return "running"
+        with contextlib.suppress(OSError):
+            os.remove(_daemon_file("stop"))
+        os.makedirs(STORE, exist_ok=True)
+        log = open(_daemon_file("log"), "ab")
+        args = [sys.executable, os.path.abspath(__file__), "daemon", "run"]
+        if WINDOWS:  # out of the parent's job too: else it dies with the terminal or MCP server that started it
+            base = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+            try:
+                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 creationflags=base | 0x01000000)  # CREATE_BREAKAWAY_FROM_JOB
+            except OSError:  # a job that forbids breaking away
+                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, creationflags=base)
+        else:
+            subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        return "started"
+    if cmd != "run":
+        raise SystemExit("daemon run|start|stop|status")
+    global NODE
+    with quota_lock("daemon"):  # a second daemon waits, then gives up: one per store
+
+        def beat():  # its own thread: a long pass (a desktop image build) must not make the daemon look dead
+            while True:
+                _write_atomic(_daemon_file("beat"), f"{time.time()} {os.getpid()}")
+                time.sleep(TICK)
+        threading.Thread(target=beat, daemon=True).start()
+        event("daemon_started", detail=f"pid {os.getpid()}")
+        while not os.path.exists(_daemon_file("stop")):
+            for name in stacks():
+                try:
+                    s = load_stack(name)
+                    NODE = Node(s.get("engine")) if s.get("engine") else NODE  # each stack on the engine it was applied to
+                    reconcile(name)
+                    probe(s)
+                except (SystemExit, Exception) as e:  # one broken stack must not stop the others
+                    event("reconcile_failed", name, detail=str(e))
+            time.sleep(TICK)
+        with contextlib.suppress(OSError):
+            os.remove(_daemon_file("stop"))
+            os.remove(_daemon_file("beat"))
+        event("daemon_stopped")
 
 
 # ---------- snapshots, clones, files ----------
@@ -1860,6 +2386,18 @@ AGENT_TOOLS = [
     ("ct_clone", "A new container from one as it is now (file system and a copy of /data), in seconds. Cloning one "
                  "of the user's containers needs their approval, and the clone starts offline.",
      _schema({**_NAME, "new": {"type": "string"}, "project": {"type": "string"}}, ["name", "new"])),
+    ("ct_apply", "Apply a desired state: {\"stack\": NAME, \"services\": {SERVICE: {image, replicas, cpus, memory_gb, "
+                 "desktop, sandbox (default true), internet, networks, cmd, restart: always|on-failure|never, health: "
+                 "{exec, every, retries}, ttl: 30m}}}. Replicas are NAME-SERVICE-1..N; a daemon keeps them so "
+                 "(restarts with backoff, health probes, ttl). Same approvals as ct_create.",
+     _schema({"stack": {"type": "object"}, "project": {"type": "string"}}, ["stack"])),
+    ("ct_scale", "Set the number of replicas of a stack's service.",
+     _schema({"stack": {"type": "string"}, "service": {"type": "string"}, "replicas": {"type": "integer"}},
+             ["stack", "service", "replicas"])),
+    ("ct_stack", "Stacks: ls, show (services, replicas with restarts, latest events) or rm (its containers too).",
+     _schema({"action": {"type": "string", "enum": ["ls", "show", "rm"]}, "stack": {"type": "string"}}, ["action"])),
+    ("ct_events", "The event log: created, started, restarted, unhealthy, expired, pending (quota)...",
+     _schema({"stack": {"type": "string"}, "n": {"type": "integer"}})),
     ("ct_resources", "Show, or change at once (even running), a container's CPUs and memory within the quota.",
      _schema({**_NAME, "cpus": _N, "memory_gb": _N}, ["name"])),
     ("ct_internet", "Show (without on) or change a stopped container's internet access; on needs the user's approval.",
@@ -1890,7 +2428,7 @@ INSTRUCTIONS = ("terminal-ct: containers with a desktop and a shell. Call projec
                 "project already has and what earlier sessions did and noted. Before you stop, record with "
                 "notes_write what you set up and what is left, so the next session can pick up from there.")
 AGENT_NAMES = {n for n, _, _ in AGENT_TOOLS}
-PROJECT_ARG_TOOLS = {"ct_create", "ct_clone", "net_create", "project_status", "notes_write"}  # take `project` without one of their own
+PROJECT_ARG_TOOLS = {"ct_create", "ct_clone", "ct_apply", "net_create", "project_status", "notes_write"}  # take `project` without one of their own
 AGENT_LOG = "agent.log"
 
 
@@ -1943,12 +2481,46 @@ def local_image(ref):
     return any(node().run(["image", "inspect", r], check=False).returncode == 0 for r in (ref, qualified(ref)))
 
 
+def creation_approvals(name, img, desk, internet, wanted_nets, approve, nets, project):
+    """What a creation by an agent needs the user's approval for: an image not here yet, internet, the user's
+    networks. A network in another project does not exist for a scoped agent. Returns the user's networks approved."""
+    if not (desk and local_image(desktop_tag(img))):
+        if not local_image(img):
+            approve(f"Download the image {img} for {name}?", f"terminal-ct image pull {img}")
+        if desk:
+            approve(f"Build the desktop image for {img} (packages from the internet, a few minutes)?",
+                    f"terminal-ct create {name} --desktop --image {img}")
+    if internet:
+        approve(f"Give {name} internet access?", f"terminal-ct internet {name} on")
+    approved = []
+    for n in wanted_nets:
+        if project and n not in nets and n in networks():
+            raise SystemExit(f"no network {n!r}; create it with: terminal-ct net create {n}")
+        if n in networks() and nets.get(n, {}).get("created_by") != "agent":  # a new one is created as the agent's
+            approve(f"Plug {name} into your network {n!r} (it would reach your containers on it)?",
+                    f"terminal-ct net attach {name} {n}")
+            approved.append(n)
+    return approved
+
+
+def stack_in_scope(stack, project, approve=None):
+    """An agent's own stack in its project; someone else's needs approval (approve) or is refused (no approve)."""
+    s = load_stack(stack)
+    if not under(s.get("project") or DEFAULT_PROJECT, project):
+        raise SystemExit(f"no stack named {stack!r}; apply one: terminal-ct apply FILE")
+    if s.get("created_by") != "agent":
+        if approve is None:
+            raise SystemExit(f"stack {stack!r} belongs to the user")
+        approve(f"Let the agent change your stack {stack}?", f"terminal-ct stack ... {stack}")
+    return s
+
+
 def agent_call(tool, a, approve, project=None):
     """project: the server's own (--project); then nothing outside it is visible or reachable."""
     name, net = a.get("name"), a.get("net")
     mine = lambda p: under(p, project)
     nets = {}
-    if tool.startswith("net_") or tool == "ct_create":  # its networks, and only its containers on them
+    if tool.startswith("net_") or tool in ("ct_create", "ct_apply"):  # its networks, and only its containers on them
         own = {c["name"] for c in containers() if mine(c["project"])}
         nets = {k: dict(v, members=[m for m in v["members"] if m in own])
                 for k, v in networks().items() if mine(v["project"])}
@@ -2005,24 +2577,37 @@ def agent_call(tool, a, approve, project=None):
         if node().run(["inspect", "--type", "container", PREFIX + check_name(name)], check=False).returncode == 0:
             raise SystemExit(f"the name {name!r} is not available: choose another")  # same answer, any project
         img, desk = a.get("image") or DEFAULT_IMAGE, bool(a.get("desktop"))
-        if not (desk and local_image(desktop_tag(img))):
-            if not local_image(img):
-                approve(f"Download the image {img} for {name}?", f"terminal-ct image pull {img}")
-            if desk:
-                approve(f"Build the desktop image for {img} (packages from the internet, a few minutes)?",
-                        f"terminal-ct create {name} --desktop --image {img}")
-        if a.get("internet"):
-            approve(f"Give the new container {name} internet access?", f"terminal-ct internet {name} on")
-        for n in a.get("networks") or []:
-            if project and n not in nets and n in networks():
-                raise SystemExit(f"no network {n!r}; create it with: terminal-ct net create {n}")
-            if nets.get(n, {}).get("created_by") != "agent":
-                approve(f"Plug {name} into your network {n!r} (it would reach your containers on it)?",
-                        f"terminal-ct net attach {name} {n}")
+        creation_approvals(name, img, desk, a.get("internet"), a.get("networks") or [], approve, nets, project)
         return quiet(create, name, img, a.get("cpus"), a.get("memory_gb"), created_by="agent", desktop=desk,
                      width=int(a.get("width", 1280)), height=int(a.get("height", 800)),
                      sandbox=a.get("sandbox", True), internet=bool(a.get("internet")), nets=a.get("networks") or (),
                      project=where)
+    if tool == "ct_apply":
+        st = a.get("stack")
+        if not isinstance(st, dict):
+            raise SystemExit("stack: the desired state as an object")
+        st, approved = check_stack(st), []
+        for svc, c in st["services"].items():
+            c.setdefault("sandbox", True)  # an agent's services are sandboxes unless it says otherwise
+            if c.get("internet") and c.get("sandbox"):
+                raise SystemExit(f"service {svc}: a sandbox is offline; set sandbox false to give it internet")
+            approved += creation_approvals(f"{st['stack']}-{svc}", c.get("image") or DEFAULT_IMAGE, bool(c.get("desktop")),
+                                           c.get("internet"), c.get("networks") or [], approve, nets, project)
+        if st["stack"] in stacks():
+            stack_in_scope(st["stack"], project)
+        return apply(st, created_by="agent", project=where, approved_networks=approved)
+    if tool == "ct_scale":
+        stack_in_scope(a["stack"], project, approve)
+        return scale(a["stack"], a["service"], int(a["replicas"]))
+    if tool == "ct_stack":
+        what = a.get("action", "ls")
+        if what == "ls":
+            return [dict(stack_show(n), events=None) for n in stacks()
+                    if under(load_stack(n).get("project") or DEFAULT_PROJECT, project)]
+        stack_in_scope(a["stack"], project, approve if what == "rm" else lambda m, c: None)
+        return stack_show(a["stack"]) if what == "show" else stack_rm(a["stack"])
+    if tool == "ct_events":
+        return events(a.get("stack"), int(a.get("n", 50)), project)
     if tool == "ct_snapshot":
         act_ = a.get("action", "ls")
         if act_ in ("load", "rm"):
@@ -2226,6 +2811,13 @@ def main(argv=None):
     c.add_argument("--net", action="append", default=[], help="an isolated network (repeatable)")
     c.add_argument("--project")
     rs = sub.add_parser("resume"); rs.add_argument("--stay", action="store_true")
+    ap = sub.add_parser("apply"); ap.add_argument("file"); ap.add_argument("--project")
+    sk = sub.add_parser("stack"); sk.add_argument("stack_cmd", choices=["ls", "show", "rm"]); sk.add_argument("stack", nargs="?")
+    sc = sub.add_parser("scale"); sc.add_argument("stack"); sc.add_argument("service"); sc.add_argument("replicas", type=int)
+    ev_ = sub.add_parser("events"); ev_.add_argument("--stack"); ev_.add_argument("-n", type=int, default=50)
+    ev_.add_argument("--follow", action="store_true")
+    sub.add_parser("daemon").add_argument("daemon_cmd", choices=["run", "start", "stop", "status"])
+    sub.add_parser("prune")
     sn = sub.add_parser("snapshot"); sn.add_argument("name"); sn.add_argument("snap_cmd", choices=["save", "load", "rm", "ls"])
     sn.add_argument("tag", nargs="?")
     cl = sub.add_parser("clone"); cl.add_argument("src"); cl.add_argument("new"); cl.add_argument("--project")
@@ -2275,6 +2867,29 @@ def main(argv=None):
                       project=o.project)
     show_json = lambda r: print(json.dumps(r, indent=1))
     if o.cmd == "resume": return resume(o.stay)
+    if o.cmd == "apply":
+        try:
+            with open(o.file, encoding="utf-8") as f:
+                desired = json.load(f)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"{o.file}: {e}")
+        return show_json(apply(desired, project=o.project))
+    if o.cmd == "stack":
+        if o.stack_cmd != "ls" and not o.stack:
+            raise SystemExit(f"stack {o.stack_cmd} NAME")
+        return show_json([dict(stack_show(n), events=None) for n in stacks()] if o.stack_cmd == "ls" else
+                         stack_show(o.stack) if o.stack_cmd == "show" else stack_rm(o.stack))
+    if o.cmd == "scale": return show_json(scale(o.stack, o.service, o.replicas))
+    if o.cmd == "events":
+        if o.follow:
+            return follow_events(o.stack)
+        for e in events(o.stack, o.n):
+            print(json.dumps(e))
+        return
+    if o.cmd == "daemon":
+        r = daemon(o.daemon_cmd)
+        return None if o.daemon_cmd == "run" else show_json(r if isinstance(r, dict) else {"daemon": r})
+    if o.cmd == "prune": return show_json(prune())
     if o.cmd == "snapshot": return show_json(snapshot(o.name, o.snap_cmd, o.tag))
     if o.cmd == "clone": return show_json(clone(o.src, o.new, project=o.project))
     if o.cmd in ("push", "pull"): return show_json(transfer(o.name, o.cmd, o.src, o.dest))

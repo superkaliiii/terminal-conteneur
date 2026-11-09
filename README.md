@@ -4,9 +4,10 @@ Containers with a desktop and a shell, for people and computer-use agents. The c
 [terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm): same command and
 MCP shape, independent of it (each installs and works alone), and able to show its VMs when both are installed.
 
-Status: **phase 4** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
+Status: **phase 5** of 8: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch image),
 screen tools, terminal viewer, quota and live resources, isolated networks, sandboxes, and an MCP server that
-manages containers under agent-authority rules; snapshots, clones and file copies. Orchestration (desired state, restarts, replicas) and
+manages containers under agent-authority rules; snapshots, clones and file copies; stacks kept in their desired state by a daemon (replicas, restarts, health
+probes, ttl, events). Dashboards (desired state, restarts, replicas) and
 dashboards (terminal and web) come next.
 
 ## Requirements
@@ -105,6 +106,43 @@ those labels are never listed or touched. An image whose default command is a ba
   needs approval, and so does cloning one of the user's containers (the clone starts offline). `push`/`pull` are
   CLI only: an agent tool would read or write any host file.
 
+## Stacks (desired state)
+
+```json
+{"stack": "lab", "project": "lab",
+ "services": {
+   "web": {"image": "debian:stable-slim", "replicas": 2, "cpus": 1, "memory_gb": 1, "networks": ["lab"],
+           "restart": "always", "health": {"exec": "test -f /data/ok", "every": 10, "retries": 3}},
+   "job": {"image": "alpine:3.20", "cmd": ["sh", "-c", "work"], "restart": "on-failure", "ttl": "30m"}}}
+```
+
+- `apply stack.json` stores it (`STORE/stacks/`), reconciles once and starts the daemon. Replicas are named
+  `STACK-SERVICE-N` and labelled with their stack, service, replica and a hash of their configuration. Service keys:
+  `image`, `cmd`, `replicas` (0-100), `cpus`, `memory_gb`, `desktop` (+ `width`, `height`), `sandbox`, `internet`,
+  `networks` (created if missing), `restart`, `health`, `ttl`.
+- Reconciliation (`daemon`, every 3 s): creates the missing replicas; removes the surplus (`scale STACK SERVICE N`,
+  or a service taken out of the file) **with its `/data`**; changes `cpus` / `memory_gb` live; remakes a replica
+  whose image, command, desktop, sandbox, internet or networks changed (re-apply the file), keeping its `/data`;
+  starts again what stopped by the restart policy (`always`; `on-failure`: exit code not 0; `never`) with an
+  exponential backoff up to 300 s (back to zero after a minute up), but never a replica the user stopped with
+  `terminal-ct stop` (until they start it); removes what outlived its `ttl`, counted from its first creation, and
+  does not recreate it until the stack is applied again. A start the quota refuses is `pending`, tried again later.
+- Health: `health.exec` runs in each running replica every `every` seconds after `grace` (default 30 s); after
+  `retries` failures in a row the replica is stopped and started again (a sandbox fresh), unless its policy is
+  `never`.
+- `events [--stack S] [-n 50] [--follow]`: created, started, restarted (with exit code), unhealthy, expired, pending,
+  removed, recreated... (`STORE/events.log`, the latest half kept past 4 MB). `stack ls|show|rm`; `stack rm` removes
+  the containers too (networks stay).
+- `daemon start|stop|status|run`: one per store, seen through a heartbeat file and stopped through a file (the same
+  on Windows); `resume` (and so `autostart`) starts it again when stacks exist. `prune` removes kept and snapshot
+  images whose container is gone.
+- Measured (WSL, alpine): a killed replica is back in 4-6 s, a failed probe restarts it in 5-9 s; Docker creates
+  and starts a replica in ~1 s, Podman in ~5 s (each Podman call costs 0.3-0.7 s).
+- Agents: `ct_apply` (services are sandboxes unless the stack says otherwise; same approvals as `ct_create`: an
+  image to download or build, internet, a network of the user's), `ct_scale`, `ct_stack` (ls, show, rm),
+  `ct_events`. Its own stacks freely; changing one of the user's needs approval, and it cannot apply over it. A
+  network of the user's made after the approval is not used: apply again to be asked.
+
 ## Agents
 
 `mcp [NAME] [--project P]` serves, over stdio:
@@ -112,7 +150,7 @@ those labels are never listed or touched. An image whose default command is a ba
 - screen tools and `exec` (`screenshot`, `click`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `status`, `exec`;
   input tools take `screenshot: true`) on NAME, or on another container with `container`;
 - `ct_list`, `ct_create`, `ct_start`, `ct_stop`, `ct_remove`, `ct_resources`, `ct_internet`, `ct_snapshot`,
-  `ct_clone`, `net_list`,
+  `ct_clone`, `ct_apply`, `ct_scale`, `ct_stack`, `ct_events`, `net_list`,
   `net_create`, `net_remove`, `net_attach`, `net_detach`, `top`, `quota`;
 - `autostart` (restart after a PC restart; changing it asks the user);
 - `project_status` (where things stand: containers and networks with what each should be doing, notes, latest

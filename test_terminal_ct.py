@@ -1,4 +1,4 @@
-import contextlib, io, json, os, shutil, socket, struct, subprocess, tempfile, threading, unittest, unittest.mock, zlib
+import contextlib, io, json, os, shutil, socket, struct, subprocess, tempfile, threading, time, unittest, unittest.mock, zlib
 
 import terminal_ct as ct
 
@@ -46,9 +46,9 @@ class FakeNode(ct.Node):
             found = [self.objects[n] for n in args[3:] if n in self.objects]
             out, code = json.dumps(found), (0 if found else 1)
         elif args[0] == "start":
-            self.objects[args[1]]["State"]["Status"] = "running"
+            self.objects[args[1]]["State"].update(Status="running", StartedAt=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         elif args[0] == "stop":
-            self.objects[args[-1]]["State"]["Status"] = "exited"
+            self.objects[args[-1]]["State"].update(Status="exited", ExitCode=getattr(self, "exit_code", 0))
         elif args[0] == "update":
             hc = self.objects[args[-1]]["HostConfig"]
             if "--cpus" in args: hc["NanoCpus"] = int(float(opt("--cpus")) * 1e9)
@@ -58,7 +58,7 @@ class FakeNode(ct.Node):
         elif args[0] == "rm":
             self.objects.pop(args[-1], None)
         elif args[0] == "exec":
-            out = "hi\n"
+            out, code = "hi\n", getattr(self, "exec_code", 0)
         elif args[0] == "stats":
             out = "\n".join(f"{n}|12.5%|512MiB / 1GiB|7" for n in args[4:])
         elif args[:2] == ["network", "create"]:
@@ -388,6 +388,158 @@ class AgentAuthority(unittest.TestCase):
         self.assertTrue(replies[3]["result"]["isError"])                  # no server container: name one
         with open(os.path.join(ct.STORE, "projects", "default", "agent.log")) as f:
             self.assertEqual(json.loads(f.readline())["tool"], "ct_start")
+
+
+class Orchestration(unittest.TestCase):
+    STACK = {"stack": "lab", "services": {
+        "web": {"image": "alpine:3.20", "replicas": 2, "restart": "always",
+                "health": {"exec": "true", "every": 10, "retries": 2}},
+        "job": {"image": "alpine:3.20", "restart": "on-failure", "ttl": "30m"}}}
+
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
+        self.p = unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test")  # no background process
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def kinds(self, out):
+        return [(e["event"], e.get("container")) for e in out]
+
+    def test_validation(self):
+        bad = [{"stack": "x"}, {"stack": "x", "services": {"a": {"nope": 1}}},
+               {"stack": "x", "services": {"a": {"restart": "sometimes"}}},
+               {"stack": "x", "services": {"a": {"ttl": "soon"}}}, {"stack": "x", "services": {"a": {"replicas": 101}}},
+               {"stack": "x" * 40, "services": {"service": {"replicas": 10}}},           # lab-...-10 too long
+               {"stack": "x", "services": {"a": {"health": {"every": 3}}}}, {"stack": "x", "services": {"a": {"cmd": "ls"}}}]
+        for s in bad:
+            with self.assertRaises(SystemExit, msg=s):
+                ct.check_stack(s)
+        self.assertEqual(ct.check_stack({"stack": "x", "services": {"a": {}}})["services"]["a"],
+                         {"replicas": 1, "restart": "always"})
+        self.assertEqual([ct.parse_ttl(v) for v in (None, 90, "90s", "30m", "2h", "1d")], [None, 90, 90, 1800, 7200, 86400])
+
+    def test_apply_scale_drift_and_rm(self):
+        out = ct.apply(self.STACK)
+        self.assertEqual(sorted(c for k, c in self.kinds(out["events"]) if k == "started"),
+                         ["lab-job-1", "lab-web-1", "lab-web-2"])
+        lab = ct.find("lab-web-2")["Config"]["Labels"]
+        self.assertEqual((lab["terminal-ct.stack"], lab["terminal-ct.service"], lab["terminal-ct.replica"]), ("lab", "web", "2"))
+        self.assertEqual(ct.reconcile("lab"), [])                                       # converged: nothing to do
+        out = ct.scale("lab", "web", 1)
+        self.assertEqual(self.kinds(out["events"]), [("removed", "lab-web-2")])
+        s = ct.load_stack("lab"); s["services"]["web"]["image"] = "debian:stable-slim"; ct._save_stack(s)
+        self.assertIn(("recreated", "lab-web-1"), self.kinds(ct.reconcile("lab")))      # its configuration drifted
+        self.assertEqual(sorted(ct.stack_rm("lab")["containers"]), ["lab-job-1", "lab-web-1"])
+        self.assertEqual(ct.stacks(), [])
+
+    def test_restart_policies_and_backoff(self):
+        ct.apply(self.STACK)
+        self.n.exit_code = 1
+        for c in ("tct-lab-web-1", "tct-lab-job-1"):
+            self.n.run(["stop", c])                                                      # both died with code 1
+        out = self.kinds(ct.reconcile("lab"))
+        self.assertIn(("restarted", "lab-web-1"), out); self.assertIn(("restarted", "lab-job-1"), out)
+        self.n.run(["stop", "tct-lab-web-1"])
+        self.assertEqual(ct.reconcile("lab"), [])                                         # backing off (2 s)
+        self.assertIn(("restarted", "lab-web-1"), self.kinds(ct.reconcile("lab", now=time.time() + 5)))
+        self.n.exit_code = 0
+        self.n.run(["stop", "tct-lab-job-1"])                                             # the job finished well
+        self.assertNotIn(("restarted", "lab-job-1"), self.kinds(ct.reconcile("lab", now=time.time() + 600)))
+
+    def test_quota_leaves_replicas_pending(self):
+        with open(os.path.join(ct.STORE, "quota.json"), "w") as f:
+            json.dump({"cpus": 2}, f)
+        out = self.kinds(ct.apply(self.STACK)["events"])
+        self.assertEqual(sum(k == "started" for k, _ in out), 2)
+        self.assertEqual(sum(k == "pending" for k, _ in out), 1)                          # the third waits for room
+
+    def test_ttl_expires_and_is_not_recreated(self):
+        ct.apply(self.STACK)
+        out = self.kinds(ct.reconcile("lab", now=time.time() + 1801))
+        self.assertIn(("expired", "lab-job-1"), out)
+        self.assertNotIn("tct-lab-job-1", self.n.objects)
+        self.assertNotIn(("created", "lab-job-1"), self.kinds(ct.reconcile("lab", now=time.time() + 1900)))
+
+    def test_health_probe_restarts_after_retries(self):
+        ct.apply(self.STACK)
+        self.n.exec_code = 1
+        s = ct.load_stack("lab")
+        now = time.time()
+        self.assertEqual(ct.probe(s, now), [])                                            # in its grace time
+        self.assertEqual(ct.probe(s, now + 31), [])                                       # first failure
+        out = ct.probe(s, now + 42)
+        self.assertEqual(self.kinds(out), [("unhealthy", "lab-web-1"), ("unhealthy", "lab-web-2")])
+        self.assertEqual(self.n.objects["tct-lab-web-1"]["State"]["Status"], "exited")
+        self.assertIn(("restarted", "lab-web-1"), self.kinds(ct.reconcile("lab")))        # back, policy always
+
+    def test_events_and_agent_rules(self):
+        ct.apply(self.STACK)
+        self.assertTrue(all(e["stack"] == "lab" for e in ct.events("lab")))
+        asked = []
+        approve = lambda m, c: asked.append(c)
+        with self.assertRaisesRegex(SystemExit, "belongs to the user"):
+            ct.agent_call("ct_apply", {"stack": dict(self.STACK)}, approve)
+        ct.agent_call("ct_scale", {"stack": "lab", "service": "web", "replicas": 3}, approve)
+        self.assertEqual(asked, ["terminal-ct stack ... lab"])                            # the user's stack: asked
+        mine = {"stack": "bot", "services": {"w": {"image": "alpine:3.20", "internet": True, "sandbox": False}}}
+        asked.clear()
+        out = ct.agent_call("ct_apply", {"stack": mine}, approve, project="p")
+        self.assertEqual(asked, ["terminal-ct internet bot-w on"])
+        self.assertEqual((ct.load_stack("bot")["created_by"], ct.load_stack("bot")["project"]), ("agent", "p"))
+        self.assertTrue(ct.agent_owned(ct.find("bot-w-1")))
+        self.assertEqual([s["stack"] for s in ct.agent_call("ct_stack", {"action": "ls"}, approve, project="p")], ["bot"])
+        with self.assertRaisesRegex(SystemExit, "no stack named 'lab'"):
+            ct.agent_call("ct_stack", {"action": "show", "stack": "lab"}, approve, project="p")
+        self.assertTrue(all(e["stack"] == "bot" for e in ct.agent_call("ct_events", {}, approve, project="p")))
+        sandboxed = {"stack": "sb", "services": {"w": {"image": "alpine:3.20"}}}
+        ct.agent_call("ct_apply", {"stack": sandboxed}, approve)
+        self.assertEqual(ct.find("sb-w-1")["Config"]["Labels"]["terminal-ct.sandbox"], "1")  # sandbox by default
+
+    def test_user_stop_is_kept_and_live_resize_keeps_data(self):
+        ct.apply(self.STACK)
+        quiet(ct.stop, "lab-web-1")                                                       # the user's own stop
+        self.assertNotIn(("restarted", "lab-web-1"), self.kinds(ct.reconcile("lab", now=time.time() + 600)))
+        quiet(ct.start, "lab-web-1")
+        s = ct.load_stack("lab"); s["services"]["web"]["cpus"] = 2; ct._save_stack(s)
+        out = self.kinds(ct.reconcile("lab"))
+        self.assertIn(("resized", "lab-web-1"), out); self.assertNotIn(("recreated", "lab-web-1"), out)
+        s["services"]["web"]["image"] = "debian:stable-slim"; ct._save_stack(s)
+        self.assertIn(("recreated", "lab-web-1"), self.kinds(ct.reconcile("lab")))
+        self.assertNotIn(["volume", "rm", "tct-lab-web-1-data"], self.n.calls)          # drift keeps /data
+        ct.scale("lab", "web", 1)
+        self.assertIn(["volume", "rm", "tct-lab-web-2-data"], self.n.calls)             # scale down drops it
+
+    def test_agent_stack_and_a_user_network_made_later(self):
+        bot = {"stack": "bot", "services": {"w": {"image": "alpine:3.20", "networks": ["lab"]}}}
+        ct.agent_call("ct_apply", {"stack": bot}, lambda m, c: None)                     # lab created as the agent's
+        quiet(ct.rm, "bot-w-1"); ct.net_rm("lab"); ct.net_create("lab")                  # now the user's
+        self.assertIn(("create_failed", "bot-w-1"), self.kinds(ct.reconcile("bot")))
+        asked = []
+        ct.agent_call("ct_apply", {"stack": bot}, lambda m, c: asked.append(c))          # applied again: asked
+        self.assertEqual((asked, ct.load_stack("bot")["approved_networks"]), (["terminal-ct net attach bot-w lab"], ["lab"]))
+        self.assertTrue(ct.find("bot-w-1"))
+
+    def test_apply_again_reruns_expired_jobs(self):
+        ct.apply(self.STACK)
+        ct.reconcile("lab", now=time.time() + 1801)
+        self.assertNotIn("tct-lab-job-1", self.n.objects)
+        ct.apply(self.STACK)
+        self.assertIn("tct-lab-job-1", self.n.objects)
+
+    def test_lock_is_only_removed_by_its_holder(self):
+        with ct.quota_lock("x") as l:
+            shutil.rmtree(l.path); os.mkdir(l.path)                                      # broken and taken by another
+        self.assertTrue(os.path.isdir(os.path.join(ct.STORE, ".x.lock")))                 # theirs is left alone
+
+    def test_resume_leaves_stacks_to_the_daemon(self):
+        ct.apply(self.STACK)
+        self.n.run(["stop", "tct-lab-web-1"])
+        out = quiet(ct.resume)
+        self.assertEqual([r for r in out["resumed"] if r.get("name")], [])
+        self.assertEqual(out["resumed"][-1], {"daemon": "test"})
 
 
 class SnapshotsAndClones(unittest.TestCase):
