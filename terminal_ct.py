@@ -25,7 +25,7 @@ labels; containers without them are never touched.
   resume [--stay]  |  autostart [on|off]     start again what was running before a restart; at each logon
   apply FILE [--project P] | scale STACK SERVICE N | stack ls|show|rm [STACK] | events [--stack S] [-n 50] [--follow]
   daemon run|start|stop|status | prune      desired state kept by the daemon (restarts, health, ttl); stale images
-  dash [--project P]  |  logs NAME [-n 100]    live dashboard (keys: s start, t stop, r rm, +/- scale, l logs, v view)
+  dash [--project P] [--json]  |  logs NAME [-n 100]    live dashboard (keys: s start, t stop, r rm, +/- scale, l logs, v view)
   bench [--runs 10] [--desktop]   median/min/max of create, start, exec, stop, rm, ls (containers bench-*)
   skills get|path|install [--dir D]   the agent's SKILL.md (install: into ~/.claude/skills/terminal-ct)
   web [--project P] [--no-open]   web dashboard (containers, terminal-vm's VMs, screens, stacks), served by the
@@ -41,7 +41,7 @@ Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if inst
 import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, \
     shlex, shutil, socket, socketserver, struct, subprocess, sys, threading, time, urllib.parse, webbrowser, zlib
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 WINDOWS = os.name == "nt"
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {}  # the daemon has no console: no flash
 if not WINDOWS:
@@ -1484,15 +1484,15 @@ def stack_rm(name):
     use them)."""
     load_stack(name)
     with quota_lock("stacks"), quota_lock("reconcile"):
-        os.remove(os.path.join(stacks_dir(), name + ".json"))
         st, gone = _state(), []
-        for c in raw_containers():
+        for c in raw_containers():  # first: an unreachable engine keeps the stack, not orphan containers
             if labels_of(c).get(f"{LABEL}.stack") == name:
                 n = labels_of(c).get(f"{LABEL}.name")
                 _rm_quiet(n)
                 st.pop(n, None)
                 gone.append(n)
         _save_state(st)
+        os.remove(os.path.join(stacks_dir(), name + ".json"))
     event("stack_removed", name, detail=f"{len(gone)} containers")
     return {"removed": name, "containers": gone}
 
@@ -1852,55 +1852,21 @@ def dash(project=None, refresh=2.0):
         restore()
 
 
-# ---------- web dashboard: served by the daemon on 127.0.0.1, behind a token ----------
-# GET / is the page (no data in it); every /api/ call needs the X-Token header, which a cross-site page cannot set
-# without a CORS preflight this server never grants, and a Host header naming this server (DNS rebinding).
+# ---------- web dashboard: terminal-ct's side (containers here, terminal-vm's VMs through its command line) ----------
+TOOL = "terminal-ct"
 WEB_PORT = int(os.environ.get("TERMINAL_CT_WEB_PORT") or 7171)
 _VM_NAME = re.compile(r"\w[\w.-]{0,63}")
 
 
-def web_token():
-    """The dashboard's token (STORE/web.token, owner only): kept across daemon restarts, so open tabs go on."""
-    path = os.path.join(STORE, "web.token")
-    with contextlib.suppress(OSError):
-        with open(path) as f:
-            t = f.read().strip()
-        if len(t) >= 32:
-            return t
-    # missing, or cut short (a crash while writing): an empty token would let any request in
-    os.makedirs(STORE, exist_ok=True)
-    t, tmp = secrets.token_urlsafe(24), f"{path}.{os.getpid()}.{threading.get_ident()}.new"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(t)
-    _replace(tmp, path)
-    return t
-
-
 def vm_cli():
-    """terminal-vm's command (TERMINAL_VM, e.g. "python3 /path/terminal_vm.py", else on the PATH), or None."""
-    if os.environ.get("TERMINAL_VM"):
-        return [a.strip('"') for a in shlex.split(os.environ["TERMINAL_VM"], posix=not WINDOWS)]  # Windows paths keep their backslashes
-    exe = shutil.which("terminal-vm")
-    return [exe] if exe else None
+    return peer_cli("TERMINAL_VM", "terminal-vm")
 
 
-def vm_call(args, timeout=60):
+def vm_call(args, timeout=60, **k):
     cli = vm_cli()
     if not cli:
         raise RuntimeError("terminal-vm not found: put it on the PATH, or set TERMINAL_VM")
-    r = subprocess.run(cli + args, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
-                       **NO_WINDOW)
-    if r.returncode:
-        err = (r.stderr or r.stdout).strip()
-        with contextlib.suppress(ValueError, AttributeError):
-            err = json.loads(err.splitlines()[-1])["error"]
-        raise RuntimeError(err or f"terminal-vm {args[0]} failed")
-    out = r.stdout.strip()
-    try:
-        return json.loads(out) if out else {}
-    except ValueError:  # progress lines first: the reply is the last one
-        return json.loads(out.splitlines()[-1])
+    return cli_call(cli, args, timeout, **k)
 
 
 _VM_CACHE = {}  # project: (time, reply): several tabs, one terminal-vm call every few seconds
@@ -1926,7 +1892,10 @@ def _vm_state(project=None):
             use = {v["name"]: v for v in vm_call(["top"]).get("vms", [])}
             for v in vms:
                 v.update({k: use.get(v["name"], {}).get(k) for k in ("cpu_percent", "host_memory_gb")})
-        return {"vms": vms}
+        evs = []
+        with contextlib.suppress(RuntimeError, ValueError):  # an older terminal-vm has no events
+            evs = vm_call(["events", "-n", "8"], lines=True)
+        return {"vms": vms, "events": [e for e in evs if not e.get("vm") or e["vm"] in {v["name"] for v in vms}]}
     except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
         return {"vms": [], "note": f"terminal-vm: {e}"}
 
@@ -1934,7 +1903,7 @@ def _vm_state(project=None):
 def vm_screenshot(name):
     if not _VM_NAME.fullmatch(name or ""):
         raise ValueError(f"invalid VM name {name!r}")
-    os.makedirs(os.path.join(STORE, "web"), exist_ok=True)
+    os.makedirs(os.path.join(STORE, "web"), mode=0o700, exist_ok=True)
     path = os.path.join(STORE, "web", f"vm-{name}.{threading.get_ident()}.png")  # one per request: two tabs at once
     try:
         vm_call(["action", name, "screenshot", "--output", path], timeout=20)
@@ -1943,10 +1912,6 @@ def vm_screenshot(name):
     finally:
         with contextlib.suppress(OSError):
             os.remove(path)
-
-
-class NoRoute(Exception):
-    pass
 
 
 @contextlib.contextmanager
@@ -1970,7 +1935,7 @@ def web_api(method, path, q, body=None):
         check_project(project)
     if method == "GET" and path == "/api/state":
         d = dashboard_data(project, with_quota=False)  # the quota measures the disk (seconds): /api/quota
-        d["stacks"] = []
+        d["tool"], d["stacks"] = TOOL, []
         for n in stacks():
             with contextlib.suppress(SystemExit):
                 s = load_stack(n)
@@ -2032,6 +1997,110 @@ def web_api(method, path, q, body=None):
     raise NoRoute(path)
 
 
+# ===== shared web dashboard: identical in terminal-ct and terminal-vm (their tests compare it; edit both) =====
+# The daemon serves it on 127.0.0.1. GET / is the page (no data in it); every /api/ call needs the X-Token header,
+# which a cross-site page cannot set without a CORS preflight this server never grants, and a Host header naming
+# this server (DNS rebinding). Each tool defines around it: TOOL, WEB_PORT, STORE, WINDOWS, NO_WINDOW, in_wsl,
+# check_project, daemon, daemon_alive, _daemon_file, and web_api(method, path, query, body) -> (content type,
+# value): its own objects directly, the other tool's through that tool's JSON command line (cli_call).
+
+class _Capture(threading.local):
+    buf = None
+
+
+_CAPTURE = _Capture()
+
+
+class _Stdout:
+    """sys.stdout once a thread captures: each thread's prints go to its own buffer, the others' to the real one
+    (contextlib.redirect_stdout swaps it for every thread: the daemon's work and the web's actions mixed)."""
+    def __init__(self, real):
+        self.real = real
+
+    def write(self, s):
+        return (_CAPTURE.buf or self.real).write(s)
+
+    def __getattr__(self, k):
+        return getattr(_CAPTURE.buf or self.real, k)
+
+
+@contextlib.contextmanager
+def captured(buf):
+    if not isinstance(sys.stdout, _Stdout):
+        sys.stdout = _Stdout(sys.stdout)
+    old, _CAPTURE.buf = _CAPTURE.buf, buf
+    try:
+        yield buf
+    finally:
+        _CAPTURE.buf = old
+
+
+def peer_cli(env, exe):
+    """The other tool's command: from the environment (e.g. TERMINAL_VM="python3 /path/terminal_vm.py"), else
+    found on the PATH, else None."""
+    if os.environ.get(env):
+        return [a.strip('"') for a in shlex.split(os.environ[env], posix=not WINDOWS)]  # Windows paths keep their backslashes
+    found = shutil.which(exe)
+    return [found] if found else None
+
+
+def cli_call(cli, args, timeout=60, lines=False, raw=False):
+    """Run a JSON command line: its reply (the last line when progress lines come first; every line with lines;
+    the text with raw). A failure raises RuntimeError with the tool's own message."""
+    r = subprocess.run(cli + args, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
+                       **NO_WINDOW)
+    if r.returncode:
+        err = (r.stderr or r.stdout).strip()
+        with contextlib.suppress(ValueError, AttributeError, IndexError):
+            err = json.loads(err.splitlines()[-1])["error"]
+        raise RuntimeError(err or f"{os.path.basename(cli[-1])} {args[0]} failed")
+    out = r.stdout if raw else r.stdout.strip()
+    if raw:
+        return out
+    if lines:
+        return [json.loads(l) for l in out.splitlines() if l.strip()]
+    try:
+        return json.loads(out) if out else {}
+    except ValueError:  # progress lines first: the reply is the last one
+        return json.loads(out.splitlines()[-1])
+
+
+class NoRoute(Exception):
+    pass
+
+
+def _web_write(path, text, mode=0o644):
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    for i in range(20):  # Windows: refused while another process has the file open for a moment
+        try:
+            return os.replace(tmp, path)
+        except PermissionError:
+            if i == 19:
+                raise
+            time.sleep(0.05)
+
+
+def web_token():
+    """The dashboard's token (STORE/web.token, owner only): kept across daemon restarts, so open tabs go on."""
+    path = os.path.join(STORE, "web.token")
+    with contextlib.suppress(OSError):
+        with open(path) as f:
+            t = f.read().strip()
+        if len(t) >= 32:
+            return t
+    # missing, or cut short (a crash while writing): an empty token would let any request in
+    os.makedirs(STORE, exist_ok=True)
+    t = secrets.token_urlsafe(24)
+    _web_write(path, t, 0o600)
+    return t
+
+
+WEB_LAST = [0.0]  # time of the latest API call: a daemon with an open dashboard does not end for being idle
+
+
 class _WebServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = not WINDOWS  # on Windows it lets a second process bind the same port
@@ -2043,10 +2112,10 @@ class _WebServer(http.server.ThreadingHTTPServer):
 
 
 class _WebHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "terminal-ct"
+    server_version = "terminal-dashboard"
     timeout = 30  # a client stalling mid-request frees its thread
 
-    def log_message(self, *a):  # quiet: the daemon's log is for the reconciler
+    def log_message(self, *a):  # quiet: the daemon's log is for its own work
         pass
 
     def _send(self, code, ctype, body):
@@ -2069,7 +2138,8 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             return self._send(200, "text/html; charset=utf-8", WEB_PAGE.encode())
         given = self.headers.get("X-Token", "").encode("utf-8", "replace")
         if not given or not secrets.compare_digest(given, web_token().encode()):
-            return self._send(401, "application/json", {"error": "token: open the dashboard with terminal-ct web"})
+            return self._send(401, "application/json", {"error": f"token: open the dashboard with {TOOL} web"})
+        WEB_LAST[0] = time.time()
         try:
             body = None
             if method == "POST":
@@ -2083,8 +2153,14 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, ctype, out)
         except NoRoute:
             self._send(404, "application/json", {"error": "not found"})
+        except ConnectionError:  # the browser left: no error reply on a closed socket
+            raise
         except (SystemExit, Exception) as e:  # a bad request or a failed action: the server goes on
             self._send(400, "application/json", {"error": str(e) or type(e).__name__})
+
+    def handle(self):
+        with contextlib.suppress(ConnectionError):  # the browser left before the reply (closed or frozen tab)
+            super().handle()
 
     def do_GET(self):
         self._handle("GET")
@@ -2103,9 +2179,9 @@ def web_serve(port=None):
             srv = _WebServer(("127.0.0.1", 0), _WebHandler)
         p = srv.server_address[1]
         srv.hosts = {f"127.0.0.1:{p}", f"localhost:{p}"}
-        _write_atomic(_daemon_file("web"), json.dumps({"port": p, "pid": os.getpid()}))
+        _web_write(_daemon_file("web"), json.dumps({"port": p, "pid": os.getpid()}))
         srv.serve_forever()
-    except Exception as e:  # the dashboard down must not take the reconciler with it
+    except Exception as e:  # the dashboard down must not take the daemon's own work with it
         print(f"{time.strftime('%H:%M:%S')} web: {e}", file=sys.stderr, flush=True)
 
 
@@ -2127,8 +2203,8 @@ def web(open_browser=True, project=None):
             break
         except (OSError, ValueError, KeyError, IndexError):
             if time.time() > end:
-                raise SystemExit("the daemon serves no dashboard (started by an older version?): "
-                                 "terminal-ct daemon stop, then terminal-ct web") from None
+                raise SystemExit(f"the daemon serves no dashboard (started by an older version?): "
+                                 f"{TOOL} daemon stop, then {TOOL} web") from None
             time.sleep(0.3)
     url = f"http://127.0.0.1:{w['port']}/#t={web_token()}" + (f"&p={urllib.parse.quote(project)}" if project else "")
     if open_browser:
@@ -2143,7 +2219,7 @@ def web(open_browser=True, project=None):
 
 WEB_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>terminal-ct dashboard</title>
+<title>Terminal dashboard</title>
 <style>
 :root{--bg:#f6f7f9;--panel:#fff;--fg:#1d2330;--mute:#6b7385;--line:#e2e5ea;--acc:#2f6fdb;--ok:#1f9d55;--warn:#c98a00;--bad:#d64545;--cpu:#2f6fdb;--mem:#8a4fd8}
 @media (prefers-color-scheme:dark){:root{--bg:#12151b;--panel:#1a1f27;--fg:#e4e8ef;--mute:#8e97a8;--line:#2a313c;--acc:#6aa0ff;--ok:#3cc47c;--warn:#e0b040;--bad:#ff6b6b;--cpu:#6aa0ff;--mem:#b68cff}}
@@ -2165,12 +2241,12 @@ dialog{width:min(1100px,96vw);max-height:92vh;border:1px solid var(--line);borde
 dialog img{max-width:100%;max-height:78vh;display:block;margin:auto}dialog pre{max-height:76vh;overflow:auto;font:12px ui-monospace,monospace;white-space:pre-wrap}
 select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:5px}.mute{color:var(--mute)}
 </style></head><body>
-<header><h1>terminal-ct</h1><span id="engine" class="chip">…</span><span id="daemon" class="chip">daemon …</span>
+<header><h1 id="tool">terminal</h1><span id="engine" class="chip">…</span><span id="daemon" class="chip">daemon …</span>
 <label class="mute">project <select id="project"><option value="">all</option></select></label><span id="quota" class="mute"></span>
 <span id="msg"></span></header>
 <main>
 <section><h2>Screens</h2><div id="shots" class="shots"><span class="mute">no running desktop</span></div></section>
-<section><h2>Containers</h2><table><thead><tr><th>name</th><th>status</th><th>health</th><th>project</th><th>stack</th><th>CPU</th><th>memory</th><th>age</th><th>restarts</th><th>flags</th><th></th></tr></thead><tbody id="cts"></tbody></table></section>
+<section><h2>Containers</h2><table><thead><tr><th>name</th><th>status</th><th>health</th><th>project</th><th>stack</th><th>CPU</th><th>memory</th><th>age</th><th>restarts</th><th>flags</th><th></th></tr></thead><tbody id="cts"></tbody></table><div id="ctnote" class="mute"></div></section>
 <section><h2>VMs (terminal-vm)</h2><table><thead><tr><th>name</th><th>os</th><th>status</th><th>project</th><th>CPU</th><th>memory</th><th></th></tr></thead><tbody id="vms"></tbody></table><div id="vmnote" class="mute"></div></section>
 <section><h2>Stacks</h2><table><thead><tr><th>stack</th><th>project</th><th>services (running / wanted)</th><th></th></tr></thead><tbody id="stacks"></tbody></table>
 <p><button id="new">new stack</button></p><div id="editor" hidden><textarea id="spec" spellcheck="false"></textarea><p><button id="apply">apply</button><button id="close">close</button></p></div></section>
@@ -2332,11 +2408,13 @@ $("new").onclick = () => { $("spec").value = JSON.stringify({stack: "web", proje
 $("close").onclick = () => { $("editor").hidden = true; };
 $("apply").onclick = async () => { let s; try { s = JSON.parse($("spec").value); } catch (e) { return msg("JSON: " + e.message, true); }
   if (await act({op: "apply", stack: s}, $("apply"))) $("editor").hidden = true; };
-function renderTop(d) {
-  if (d.engine) {
-  $("engine").textContent = d.engine; $("daemon").textContent = "daemon " + (d.daemon ? "running" : "stopped");
+function renderTop(d, v) {
+  if (d.tool) {  // a state reply (the quota refresh passes only the quota)
+  $("tool").textContent = d.tool; $("ctnote").textContent = d.note || "";
+  $("engine").textContent = d.engine || "no container engine"; $("daemon").textContent = "daemon " + (d.daemon ? "running" : "stopped");
   $("daemon").style.color = d.daemon ? css("--ok") : css("--bad");
-  $("events").textContent = (d.events || []).slice().reverse().map(e => [e.time, e.event, e.stack, e.service, e.container, e.detail].filter(Boolean).join("  ")).join("\n") || "no event";
+  const evs = (d.events || []).concat((v && v.events) || []).sort((a, b) => (a.time < b.time ? 1 : a.time > b.time ? -1 : 0)).slice(0, 12);
+  $("events").textContent = evs.map(e => [e.time, e.event, e.stack, e.service, e.container, e.vm && "VM " + e.vm, e.detail].filter(Boolean).join("  ")).join("\n") || "no event";
   }
   if (d.quota) last = d.quota;
   if (last) $("quota").textContent = Object.entries(last).map(([k, v]) => k.replace("_gb", "") + " " + (v.used ?? "?") + "/" + (v.limit ?? "∞")).join(" · ");
@@ -2354,7 +2432,7 @@ async function refresh() {
     const [d, v] = await Promise.all([api("/api/state?" + q({project: p})).then(r => r.json()),
       api("/api/vms?" + q({project: p})).then(r => r.json()).catch(e => ({vms: [], note: e.message}))]);
     if (p !== project()) return;  // the project changed meanwhile: the next pass shows it
-    renderTop(d); renderCts(d); renderVms(v); renderStacks(d); renderShots(d, v.vms);
+    renderTop(d, v); renderCts(d); renderVms(v); renderStacks(d); renderShots(d, v.vms);
     if ($("msg").className === "err" && $("msg").textContent.startsWith("dashboard:")) msg("");
   } catch (e) { msg("dashboard: " + e.message, true); }
   finally { busy = false; if (again) { again = false; refresh(); } }
@@ -2369,9 +2447,10 @@ $("project").onchange = () => { sessionStorage.setItem("tct-project", project())
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { refresh(); refreshQuota(); } });
 const saved = sessionStorage.getItem("tct-project");
 if (saved) $("project").append(h("option", {value: saved, textContent: saved})), $("project").value = saved;
-if (!token) msg("no token: open the dashboard with  terminal-ct web", true); else { refresh(); refreshQuota(); setInterval(refresh, 2000); setInterval(refreshQuota, 15000); }
+if (!token) msg("no token: open the dashboard with the web command (terminal-ct web, terminal-vm web)", true); else { refresh(); refreshQuota(); setInterval(refresh, 2000); setInterval(refreshQuota, 15000); }
 </script></body></html>
 """
+# ===== end of shared web dashboard =====
 
 
 # ---------- snapshots, clones, files ----------
@@ -3273,37 +3352,6 @@ def _image(data):
     return {"type": "image", "data": base64.b64encode(data).decode(), "mimeType": "image/png"}
 
 
-class _Capture(threading.local):
-    buf = None
-
-
-_CAPTURE = _Capture()
-
-
-class _Stdout:
-    """sys.stdout once a thread captures: each thread's prints go to its own buffer, the others' to the real one
-    (contextlib.redirect_stdout swaps it for every thread: the daemon's reconciler and the web's actions mixed)."""
-    def __init__(self, real):
-        self.real = real
-
-    def write(self, s):
-        return (_CAPTURE.buf or self.real).write(s)
-
-    def __getattr__(self, k):
-        return getattr(_CAPTURE.buf or self.real, k)
-
-
-@contextlib.contextmanager
-def captured(buf):
-    if not isinstance(sys.stdout, _Stdout):
-        sys.stdout = _Stdout(sys.stdout)
-    old, _CAPTURE.buf = _CAPTURE.buf, buf
-    try:
-        yield buf
-    finally:
-        _CAPTURE.buf = old
-
-
 def quiet(f, *a, **k):
     """Call a CLI function that prints its JSON result (stdout is the MCP channel) and return that result."""
     buf = io.StringIO()
@@ -3772,7 +3820,7 @@ def main(argv=None):
     ev_.add_argument("--follow", action="store_true")
     sub.add_parser("daemon").add_argument("daemon_cmd", choices=["run", "start", "stop", "status"])
     sub.add_parser("prune")
-    da = sub.add_parser("dash"); da.add_argument("--project")
+    da = sub.add_parser("dash"); da.add_argument("--project"); da.add_argument("--json", action="store_true")
     bn = sub.add_parser("bench"); bn.add_argument("--runs", type=int, default=10); bn.add_argument("--desktop", action="store_true")
     sk_ = sub.add_parser("skills"); sk_.add_argument("skill_cmd", choices=["get", "path", "install"]); sk_.add_argument("--dir")
     wb = sub.add_parser("web"); wb.add_argument("--project"); wb.add_argument("--no-open", action="store_true")
@@ -3836,9 +3884,13 @@ def main(argv=None):
     if o.cmd == "stack":
         if o.stack_cmd != "ls" and not o.stack:
             raise SystemExit(f"stack {o.stack_cmd} NAME")
-        return show_json([dict(stack_show(n), events=None) for n in stacks()] if o.stack_cmd == "ls" else
-                         stack_show(o.stack) if o.stack_cmd == "show" else stack_rm(o.stack))
-    if o.cmd == "scale": return show_json(scale(o.stack, o.service, o.replicas))
+        if o.stack_cmd == "ls":
+            return show_json([dict(stack_show(n), events=None) for n in stacks()])
+        with contextlib.nullcontext() if o.engine else on_stack_engine(o.stack):  # the engine it was applied to
+            return show_json(stack_show(o.stack) if o.stack_cmd == "show" else stack_rm(o.stack))
+    if o.cmd == "scale":
+        with contextlib.nullcontext() if o.engine else on_stack_engine(o.stack):
+            return show_json(scale(o.stack, o.service, o.replicas))
     if o.cmd == "events":
         if o.follow:
             return follow_events(o.stack)
@@ -3849,7 +3901,10 @@ def main(argv=None):
         r = daemon(o.daemon_cmd)
         return None if o.daemon_cmd == "run" else show_json(r if isinstance(r, dict) else {"daemon": r})
     if o.cmd == "prune": return show_json(prune())
-    if o.cmd == "dash": return dash(o.project)
+    if o.cmd == "dash":
+        if o.json:  # what the web dashboard shows (terminal-vm's dashboard reads it)
+            return print(json.dumps(web_api("GET", "/api/state", {"project": o.project or ""})[1]))
+        return dash(o.project)
     if o.cmd == "web": return show_json(web(not o.no_open, o.project))
     if o.cmd == "bench": return show_json(bench(max(1, o.runs), o.desktop))
     if o.cmd == "skills": return skills(o.skill_cmd, o.dir)

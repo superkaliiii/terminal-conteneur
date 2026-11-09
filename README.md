@@ -137,9 +137,13 @@ the quota and the latest events. From WSL it opens the Windows browser (WSL forw
 - Served by the daemon on 127.0.0.1 only, port `TERMINAL_CT_WEB_PORT` (default 7171; another free port if taken).
 - Every API call needs the token of `STORE/web.token` (owner only, kept across restarts): `web` puts it in the URL
   fragment, the page keeps it for the tab and removes it from the address bar. Other Host names are refused.
-- VMs come from terminal-vm's JSON CLI (`ls`, `top`, `action NAME screenshot`, `start`, `stop`): on the PATH, or
-  `TERMINAL_VM="python3 /path/terminal_vm.py"` in the daemon's environment. Without it, the VM section is empty.
+- VMs come from terminal-vm's JSON CLI (`ls`, `top`, `events`, `action NAME screenshot`, `start`, `stop`): on the
+  PATH, or `TERMINAL_VM="python3 /path/terminal_vm.py"` in the daemon's environment. Without it, the VM section is
+  empty. Their events (restarts, idle pauses) appear with the containers'.
 - The quota is fetched apart every 15 s (measuring the disk takes seconds with Podman); the table every 2 s.
+- The same dashboard comes with terminal-vm (`terminal-vm web`, port 7172): the page and its server are one block
+  of code, identical in both tools (each one's tests check it); each tool shows its own objects directly and the
+  other's through that tool's command line. `terminal-ct dash --json [--project P]` is what terminal-vm reads.
 
 ## Snapshots and clones
 

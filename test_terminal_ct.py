@@ -784,6 +784,26 @@ class Phase8(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(dest, "terminal-ct", "SKILL.md")))
 
 
+class SharedDashboard(unittest.TestCase):
+    """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
+    SHARED_SHA in both tests to the new value."""
+    SHARED_SHA = "a66afc10e8c277b0ac2b05f23ed7d5058dfb50aa3bc532170fb4f2993ffada72"
+
+    @staticmethod
+    def block(path):
+        text = open(path, encoding="utf-8").read().replace("\r\n", "\n")
+        return text[text.index("# ===== shared web dashboard"):text.index("# ===== end of shared web dashboard =====")]
+
+    def test_block_is_the_shared_one(self):
+        import hashlib
+        mine = self.block(ct.__file__)
+        self.assertEqual(hashlib.sha256(mine.encode()).hexdigest(), self.SHARED_SHA,
+                         "the shared dashboard block changed: copy it to the other tool and update SHARED_SHA in both")
+        other = os.environ.get("TERMINAL_VM_SRC") or os.path.join(os.path.dirname(os.path.abspath(ct.__file__)), "..", "terminal-mac-src", "terminal-vm", "terminal_vm.py")
+        if os.path.isfile(other):  # both checked out side by side: compare them directly
+            self.assertEqual(mine, self.block(other))
+
+
 class SnapshotsAndClones(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
