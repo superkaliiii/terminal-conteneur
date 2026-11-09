@@ -1665,7 +1665,7 @@ class Hosts(unittest.TestCase):
         self.local = ct.NODE = FakeNode("podman")
         ct.STORE = tempfile.mkdtemp()
         self.engines, self.down, self.uname, self.execs = {}, set(), {}, []
-        self.pc_vms, self.pc_files, self.vm_runs = {}, {}, []
+        self.pc_vms, self.pc_files, self.vm_runs, self.podman, self.podman_info = {}, {}, [], set(), {}
 
         def _exec(node, argv, timeout):
             self.execs.append((node.name, argv))
@@ -1707,10 +1707,15 @@ class Hosts(unittest.TestCase):
                 if argv[-1] != "/" and node.name in getattr(self, "mac", ()):  # Docker Desktop: store in its VM
                     return {"exit": 1, "stdout": "Filesystem 1K-blocks Used Available\n", "stderr": "no such file"}
                 return {"exit": 0, "stdout": "Filesystem 1K-blocks Used Available\n/dev/sda1 9 1 10485760 1% /\n"}
-            if argv[0] == "docker":
-                if argv[1] == "version":
-                    return {"exit": 0, "stdout": "27.0\n", "stderr": ""}
-                r = self.engines.setdefault(node.name, FakeNode("docker")).run(argv[1:], check=False)
+            if argv[0] == "podman" and node.name not in self.podman:  # no Podman on most fake PCs
+                return {"exit": 127, "stdout": "", "stderr": "sh: podman: not found"}
+            if argv[0] in ("docker", "podman"):
+                if argv[1] == "info" and "Version" in argv[-1]:  # host add's probe
+                    if node.name in getattr(self, "hung_podman", ()) and argv[0] == "podman":
+                        raise RuntimeError("agent https://pc: podman timed out (30 s)")
+                    return {"exit": 0, "stdout": "27.0\n" if argv[0] == "docker" else
+                            self.podman_info.get(node.name, "5.4.2 true\n"), "stderr": ""}
+                r = self.engines.setdefault(node.name, FakeNode(argv[0])).run(argv[1:], check=False)
                 return {"exit": r.returncode, "stdout": r.stdout, "stderr": "no such object" if r.returncode else ""}
             return {"exit": 0, "stdout": "", "stderr": ""}
         alive = lambda name: name not in self.down
@@ -1722,6 +1727,7 @@ class Hosts(unittest.TestCase):
                         unittest.mock.patch.object(ct.NodeRemote, "copy", copy),
                         unittest.mock.patch.object(ct, "host_alive", alive),
                         unittest.mock.patch.object(ct, "UP_MAX_AGE", -1),
+                        unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"),  # no background process
                         unittest.mock.patch.object(ct, "vm_call", lambda args, timeout=60, host=None, **k:
                                                    ct.host_vm_call(host, args, timeout, **k) if host else [])]
         for p in self.patches:
@@ -1781,7 +1787,7 @@ class Hosts(unittest.TestCase):
 
     def test_add_keeps_the_token_private(self):
         r = self.add()
-        self.assertEqual((r["host"], r["os"], r["docker"]), ("pc1", "Linux", "27.0"))
+        self.assertEqual((r["host"], r["os"], r["engine"], r["version"]), ("pc1", "Linux", "docker", "27.0"))
         h = ct._hosts()["pc1"]
         self.assertEqual((h["fingerprint"], h["token"]), (self.FP, "t" * 43))  # lower-case, as compared
         with open(os.path.join(ct.STORE, "nodes.json")) as f:
@@ -1848,6 +1854,34 @@ class Hosts(unittest.TestCase):
         self.assertEqual(sorted(ct._nodes()["placement"].values()), ["pc1", "pc1"])  # third: moved to the PC still up
         ct.apply({"stack": "desk", "services": {"d": {"image": "alpine:3.20", "spread": "nodes", "desktop": True}}})
         self.assertNotIn("desk-d-1", ct._nodes()["placement"])  # never sent to another PC
+
+    def test_engine_of_another_pc(self):
+        self.podman.add("pod")
+        self.assertEqual(self.add("pod", "https://10.0.0.7:7173")["engine"], "podman")   # Podman first, as here
+        self.cli("--host", "pod", "create", "web")
+        self.assertEqual(self.engines["pod"].engine, "podman")
+        self.assertFalse([a for n, a in self.execs if n == "pod" and a[0] == "docker"])  # never docker there
+        with unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_AGENT_TOKEN": "t" * 43}):
+            r = self.cli("host", "add", "dk", "https://10.0.0.8:7173", "--fingerprint", self.FP, "--with", "docker")
+        self.assertEqual(r["engine"], "docker")
+        with unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_AGENT_TOKEN": "t" * 43}), \
+                self.assertRaisesRegex(SystemExit, "no container engine works"):
+            self.cli("host", "add", "np", "https://10.0.0.9:7173", "--fingerprint", self.FP, "--with", "podman")
+        self.assertEqual({n["node"]: n["engine"] for n in self.cli("host", "ls")}, {"pod": "podman", "dk": "docker"})
+        self.podman |= {"hung", "old", "root"}
+        self.hung_podman = {"hung"}                                           # a stopped Podman machine: Docker then
+        self.podman_info.update(old="3.4.4 true\n", root="5.4.2 false\n")
+        self.assertEqual(self.add("hung", "https://10.0.0.10:7173")["engine"], "docker")
+        self.assertEqual(self.add("old", "https://10.0.0.11:7173")["engine"], "docker")  # Podman 3: too old
+        self.add("root", "https://10.0.0.12:7173")
+        self.cli("--host", "root", "create", "s", "--sandbox")
+        made = [a for a in self.engines["root"].calls if a[0] == "create"][-1]
+        self.assertNotIn("--userns=keep-id", made)                            # a rootful Podman refuses it
+        legacy = ct.NodeRemote("x", {"url": "https://10.0.0.1:7173"})          # hosts.json before engines were kept
+        self.assertEqual((legacy.engine, legacy.rootless), ("docker", True))
+        net = lambda n: {"NetworkSettings": {"Networks": {n: {}}}, "HostConfig": {"NetworkMode": "bridge"}}
+        self.assertTrue(ct.online(net("podman")) and ct.online(net("bridge")))  # another PC's engine, either
+        self.assertFalse(ct.online(net("tct-net-lab")))
 
     def test_mac_with_docker_desktop(self):
         self.uname["mac"], self.mac = "Darwin", {"mac"}
@@ -1961,6 +1995,17 @@ class Hosts(unittest.TestCase):
         self.assertNotIn("terminal-vm not found", err.getvalue())            # the guest's 127, not ours
         with self.assertRaisesRegex(RuntimeError, "nonexistent"):              # TERMINAL_VM naming nothing
             ct.cli_call([os.path.join(ct.STORE, "nonexistent", "terminal-vm")], ["ls"])
+
+    def test_daemon_runs_on_this_store(self):
+        seen, stub = [], next(x for x in self.patches if x.attribute == "daemon")
+        stub.stop()  # the real daemon(), with Popen recorded
+        try:
+            with unittest.mock.patch.object(ct, "daemon_alive", lambda: False), \
+                    unittest.mock.patch.object(ct.subprocess, "Popen", lambda args, **k: seen.append(k)):
+                self.assertEqual(ct.daemon("start"), "started")
+        finally:
+            stub.start()
+        self.assertEqual(seen[0]["env"]["TERMINAL_CT_HOME"], ct.STORE)  # never the default store of the user
 
     def test_quota_of_a_vm_node_is_its_size(self):
         d = ct._nodes(); d["nodes"]["vm1"] = {"image": "alpine"}; ct._save_nodes(d)

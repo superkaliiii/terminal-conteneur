@@ -187,29 +187,31 @@ class NodeVM(Node):
                 with tempfile.TemporaryDirectory() as tmp:
                     _tar(args[-1], ".", os.path.join(tmp, "context.tar"))
                     self.copy("push", os.path.join(tmp, "context.tar"), f"{remote}/ctx.tar")
-                out = self.sh(f"tar -xf {remote}/ctx.tar -C {remote}/ctx && docker "
+                out = self.sh(f"tar -xf {remote}/ctx.tar -C {remote}/ctx && {self.engine} "
                               + " ".join(shlex.quote(a) for a in args[:-1]) + f" {remote}/ctx", timeout=3600)
             finally:
                 with contextlib.suppress(SystemExit):
                     self.sh(f"rm -rf {remote}", timeout=60)
             if not capture:
                 sys.stderr.write(out)
-            return subprocess.CompletedProcess(["docker", *args], 0, out, "")
+            return subprocess.CompletedProcess([self.engine, *args], 0, out, "")
         t = timeout or self.timeout or (600 if capture else 3600)  # uncaptured: a pull or a build, minutes
         try:
-            r = self._exec(["docker", *args], t)
+            r = self._exec([self.engine, *args], t)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             raise SystemExit(f"node {self.name}: {e}") from None
         if not capture and r.get("stdout"):
             sys.stderr.write(r["stdout"])  # progress (pull, build): stdout is the JSON reply
-        cp = subprocess.CompletedProcess(["docker", *args], r.get("exit", 1), r.get("stdout", ""), r.get("stderr", ""))
+        cp = subprocess.CompletedProcess([self.engine, *args], r.get("exit", 1), r.get("stdout", ""), r.get("stderr", ""))
         if check and cp.returncode:
-            raise SystemExit((cp.stderr or cp.stdout or f"docker {args[0]} failed on node {self.name}").strip())
+            raise SystemExit((cp.stderr or cp.stdout or f"{self.engine} {args[0]} failed on node {self.name}").strip())
         return cp
 
     def host(self):
         if not hasattr(self, "_host"):
-            c, m, root = self.run(["info", "--format", "{{.NCPU}} {{.MemTotal}} {{.DockerRootDir}}"]).stdout.split(None, 2)
+            fmt = "{{.Host.CPUs}} {{.Host.MemTotal}} {{.Store.GraphRoot}}" if self.engine == "podman" else \
+                "{{.NCPU}} {{.MemTotal}} {{.DockerRootDir}}"
+            c, m, root = self.run(["info", "--format", fmt]).stdout.split(None, 2)
             self._host = int(c), int(m) / 2 ** 30, root.strip()
         return self._host
 
@@ -244,7 +246,7 @@ class NodeVM(Node):
         try:
             if stdin:
                 self.copy("push", stdin, f"{tmp}/in")
-            self.sh("docker " + " ".join(shlex.quote(a) for a in args) + (f" < {tmp}/in" if stdin else " </dev/null")
+            self.sh(f"{self.engine} " + " ".join(shlex.quote(a) for a in args) + (f" < {tmp}/in" if stdin else " </dev/null")
                     + (f" > {tmp}/out" if stdout else " >/dev/null"), timeout=3600)
             if stdout:
                 self.copy("pull", f"{tmp}/out", stdout)
@@ -300,9 +302,9 @@ class NodeVM(Node):
                     self.sh(f"tar -xf {tmp}/x.tar -C {tmp}/in", timeout=600)
                 else:
                     self.copy("push", src, f"{tmp}/in/{base}")
-                self.sh(f"docker cp -a {q(f'{tmp}/in/{base}')} {q(f'{container}:{dest}')}", timeout=600)
+                self.sh(f"{self.engine} cp -a {q(f'{tmp}/in/{base}')} {q(f'{container}:{dest}')}", timeout=600)
                 return
-            self.sh(f"docker cp {q(f'{container}:{src}')} {tmp}/out", timeout=600)
+            self.sh(f"{self.engine} cp {q(f'{container}:{src}')} {tmp}/out", timeout=600)
             if os.path.isdir(dest):  # as docker cp: into an existing folder, under the source's name
                 dest = os.path.join(dest, os.path.basename(src.rstrip("/")) or "out")
             if self.sh(f"test -d {tmp}/out && echo dir || echo file", timeout=30).strip() == "file":
@@ -530,6 +532,8 @@ def agent_serve(listen="127.0.0.1", port=None):
 
 
 def agent(listen="127.0.0.1", port=None, rotate=False):
+    if in_wsl() and shutil.which("podman"):
+        Node("podman")  # its WSL fix (iptables, not nftables) for the podman calls the agent runs
     if rotate:
         agent_credentials(rotate=True)
     srv = agent_serve(listen, port)
@@ -609,9 +613,11 @@ def ssh_target(url):
 
 class NodeRemote(NodeVM):
     """Containers of another PC: each engine call is run there by its agent (https://...) or over SSH (ssh://...).
-    shortcut: Docker there (its command is docker); a PC with Podman alone needs podman-docker."""
+    Its engine (podman or docker) was found by host add."""
     def __init__(self, name, remote, timeout=None):
-        self.name, self.remote, self.engine, self.timeout = name, remote, "docker", timeout
+        self.name, self.remote, self.timeout = name, remote, timeout
+        self.engine = remote.get("engine") if remote.get("engine") in ("podman", "docker") else "docker"
+        self.rootless = remote.get("rootless", True)
 
     def free_bytes(self, root):
         try:
@@ -746,9 +752,9 @@ def _read_token():
     return t.strip()
 
 
-def host_add(name, url, fingerprint=None, token=None):
+def host_add(name, url, fingerprint=None, token=None, engine=None):
     """Another PC as a node: reached by its agent (https://IP:PORT, pinned fingerprint, token) or over SSH
-    (ssh://[user@]host[:port]). It must answer, run Linux or macOS, and have Docker."""
+    (ssh://[user@]host[:port]). It must answer, run Linux or macOS, and have Podman (4+) or Docker working."""
     check_name(name)  # as stacks name it (node: NAME)
     if "." in name:
         raise SystemExit(f"invalid host name {name!r} (lowercase letters, digits, _ and -)")
@@ -783,11 +789,30 @@ def host_add(name, url, fingerprint=None, token=None):
         if r["exit"] or kind not in ("Linux", "Darwin"):  # its commands are POSIX: sh, tar, /tmp
             raise SystemExit(f"host {name}: Linux or macOS only (found {kind or r['stderr'].strip()[:100]}); on "
                              "Windows run the agent inside WSL")
-        v = n._exec(["docker", "version", "--format", "{{.Server.Version}}"], 60)
+        tried = []
+        for eng in [engine] if engine else ["podman", "docker"]:  # as on this PC: Podman first, the one that works
+            # info, not version: it needs the engine itself working (a client alone answers version)
+            try:
+                v = n._exec([eng, "info", "--format", "{{.Version.Version}} {{.Host.Security.Rootless}}"
+                             if eng == "podman" else "{{.ServerVersion}}"], 30)
+            except (RuntimeError, subprocess.TimeoutExpired) as e:  # hung (a stopped Podman machine): the next one
+                tried.append(f"{eng}: {e}")
+                continue
+            got = v["stdout"].split() if not v["exit"] else []
+            if eng == "podman" and got and not got[0].split(".")[0].isdigit() or \
+                    eng == "podman" and got and int(got[0].split(".")[0]) < 4:
+                tried.append(f"podman {got[0]}: version 4 or later needed")
+                continue
+            if got:
+                h["engine"], version = eng, got[0]
+                if eng == "podman":
+                    h["rootless"] = got[1:2] == ["true"]  # keep-id is for a rootless Podman only
+                break
+            tried.append(f"{eng}: {(v.get('stderr') or 'no answer').strip()[:120]}")
+        else:
+            raise SystemExit(f"host {name}: no container engine works there ({'; '.join(tried)})")
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         raise SystemExit(f"host {name}: {e}") from None
-    if v["exit"]:
-        raise SystemExit(f"host {name}: Docker does not answer there ({v['stderr'].strip()[:200]})")
     with quota_lock("nodes"):
         d = _nodes()
         if name in d["nodes"]:  # added meanwhile by another command
@@ -795,11 +820,12 @@ def host_add(name, url, fingerprint=None, token=None):
         hosts = _hosts()
         hosts[name] = h
         _save_hosts(hosts)  # first: nodes.json never names a host whose token is not there
-        d["nodes"][name] = {"kind": "host", "url": h["url"], "added": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        d["nodes"][name] = {"kind": "host", "url": h["url"], "engine": h["engine"],
+                            "added": time.strftime("%Y-%m-%dT%H:%M:%S")}
         _save_nodes(d)
     _UP.clear()
     event("host_added", None, detail=f"{name} ({h['url']})")
-    return {"host": name, "url": h["url"], "os": kind, "docker": v["stdout"].strip()}
+    return {"host": name, "url": h["url"], "os": kind, "engine": h["engine"], "version": version}
 
 
 def host_alive(name):
@@ -1028,7 +1054,7 @@ def node_ls():
     if any(i.get("kind") != "host" for i in d["nodes"].values()):
         with contextlib.suppress(RuntimeError, ValueError, subprocess.TimeoutExpired):
             vms = {v["name"]: v for v in vm_call(["ls"])}
-    return [dict({"node": n, "kind": "host", "url": info.get("url"),
+    return [dict({"node": n, "kind": "host", "url": info.get("url"), "engine": info.get("engine", "docker"),
                   "status": "running" if up.get(n) else "unreachable"} if info.get("kind") == "host" else
                  {"node": n, "kind": "vm", "image": info.get("image"),
                   "status": vms.get(n, {}).get("status", "missing")},
@@ -1132,7 +1158,7 @@ def is_bridged(c):
 
 def online(c):
     if is_bridged(c):
-        return BRIDGE[node().engine] in networks_of(c)
+        return any(b in networks_of(c) for b in BRIDGE.values())  # listed here, it may be another engine's
     return (c.get("HostConfig") or {}).get("NetworkMode") != "none"
 
 
@@ -1326,7 +1352,8 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
     as_user = spec.get("desktop") or sandbox
     uid, gid = (1000, 1000) if WINDOWS else (os.getuid(), os.getgid())  # shortcut: no uid on Windows, typical one
     if as_user:
-        extra += [*(["--userns=keep-id"] if podman else []), "--user", f"{uid}:{gid}", "-e", "HOME=/data"]
+        keep_id = podman and getattr(node(), "rootless", True)  # a rootful Podman refuses keep-id
+        extra += [*(["--userns=keep-id"] if keep_id else []), "--user", f"{uid}:{gid}", "-e", "HOME=/data"]
     made_volume = False
     if sandbox:  # /data in memory, emptied at each stop; no host mount but the screen's socket
         data = ["--mount", "type=tmpfs,destination=/data,tmpfs-mode=0700,U=true"] if podman else \
@@ -1631,7 +1658,7 @@ def disk_bytes(infos):
     if node().engine == "podman":  # every tct- volume, also one left without its container
         rows = [r.split("\t") for r in node().run(["volume", "ls", "--format", "{{.Name}}\t{{.Mountpoint}}"]).stdout.splitlines()]
         vols = {r[0]: r[-1] for r in rows if r[0].startswith(PREFIX)}
-        if vols and not WINDOWS and all(os.path.isdir(p) for p in vols.values()):
+        if vols and not WINDOWS and not isinstance(node(), NodeVM) and all(os.path.isdir(p) for p in vols.values()):
             # rootless volumes are folders of ours: du takes 4 ms where `system df -v` took 0.7 s. shortcut: files
             # of other uids inside the container may be unreadable and left out (`podman unshare du` if that matters)
             r = subprocess.run(["du", "-skc", *vols.values()], capture_output=True, text=True)
@@ -2826,15 +2853,16 @@ def daemon(cmd="status"):
         os.makedirs(STORE, exist_ok=True)
         log = open(_daemon_file("log"), "ab")
         args = [sys.executable, os.path.abspath(__file__), "daemon", "run"]
+        env = dict(os.environ, TERMINAL_CT_HOME=STORE)  # this store, however it was chosen (else: the default one)
         if WINDOWS:  # out of the parent's job too: else it dies with the terminal or MCP server that started it
             base = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
             try:
-                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
                                  creationflags=base | 0x01000000)  # CREATE_BREAKAWAY_FROM_JOB
             except OSError:  # a job that forbids breaking away
-                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, creationflags=base)
+                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, creationflags=base)
         else:
-            subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+            subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, start_new_session=True)
         return "started"
     if cmd != "run":
         raise SystemExit("daemon run|start|stop|status")
@@ -5458,6 +5486,7 @@ def main(argv=None):
     hs = sub.add_parser("host", help="other PCs as nodes (their agent, or SSH)")
     hs.add_argument("host_cmd", choices=["add", "ls", "rm"]); hs.add_argument("host_name", nargs="?")
     hs.add_argument("url", nargs="?"); hs.add_argument("--fingerprint"); hs.add_argument("--force", action="store_true")
+    hs.add_argument("--with", dest="host_engine", choices=["podman", "docker"], help="its engine (else Podman, then Docker)")
     nd = sub.add_parser("node"); nd.add_argument("node_cmd", choices=["add", "ls", "rm", "join"])
     nd.add_argument("node_name", nargs="?"); nd.add_argument("node_net", nargs="?", help="join: the network")
     nd.add_argument("--image", dest="node_image", choices=["debian", "alpine"], default="debian")
@@ -5562,7 +5591,7 @@ def main(argv=None):
         if o.host_cmd in ("rm",) and not is_host(o.host_name):
             raise SystemExit(f"no host named {o.host_name!r} (terminal-ct host ls)")
         out = ([n for n in node_ls() if n["kind"] == "host"] if o.host_cmd == "ls" else
-               host_add(o.host_name, o.url, o.fingerprint) if o.host_cmd == "add" else node_rm(o.host_name, o.force))
+               host_add(o.host_name, o.url, o.fingerprint, engine=o.host_engine) if o.host_cmd == "add" else node_rm(o.host_name, o.force))
         return print(json.dumps(out, indent=1))
     if o.cmd == "node":
         if o.node_cmd != "ls" and not o.node_name:
