@@ -63,7 +63,7 @@ Never try to work around a refusal.
   (`node join`) with `"ports"` is found by name (`web`, `web.STACK`) from that network's containers.
 - Other PCs (added by the user with `terminal-ct host add`) are nodes too (`ct_list` shows `node`). Your stack runs
   there only after the user approves that PC for it (`ct_apply` asks once per PC); without approval keep it on this
-  PC. Networks there are its own (`--host PC net create NET`; names work within that PC), `ports` publish on its address; no desktops there yet. Their quota is their own (a share of someone's computer).
+  PC. Networks there are its own (`--host PC net create NET`; names work within that PC), `ports` publish on its address; desktops there work through its agent (or a terminal-ct installed there for SSH). Their quota is their own (a share of someone's computer).
 - `net_create` + `net_attach` (stopped containers): an isolated network where containers reach each other by name.
 - Stay within `quota`; `ct_resources` asks for the CPUs and memory a task needs, give them back after; `top` and
   `dashboard` show where things stand.

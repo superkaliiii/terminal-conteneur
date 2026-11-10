@@ -203,6 +203,12 @@ runs what it is sent (engine calls, file copies, terminal-vm). Another PC is a n
   Podman 4 or later first, else Docker (`--with` picks one). Kept in `STORE/hosts.json` (owner only). `host ls` shows
   them with whether they answer; `host rm NAME` refuses while containers live there, `--force` removes them first
   (a PC that does not answer keeps its containers running: remove them there).
+- **Desktops on another PC**: `--host PC create NAME --desktop` works there; the screen tools (`action`, MCP)
+  run through terminal-ct on that PC, next to the desktop's socket: the agent itself, or over SSH a terminal-ct
+  installed there (`TERMINAL_CT`, the login PATH or `~/.local/bin`), never copied onto someone's computer; without
+  it the error says so. The socket lives in that user's `~/.local/share/terminal-ct/central/NAME/run` (removed with
+  the container). `view`/`show` stay for this PC's desktops. Real run (WSL, an agent with Docker): create, start,
+  wait, screenshot, type, key, rm all right.
 - **Networks and ports on another PC**: its networks are its own engine's (`terminal-ct --host PC net create NET`,
   `net ls`, `net rm`); its containers on them reach each other by name, as here. `--ports N` publishes on the
   address the central PC reaches that PC by (its agent's, or the SSH host's), never on all of its interfaces. A

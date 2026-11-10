@@ -733,6 +733,9 @@ def agent_serve(listen="127.0.0.1", port=None):
 def agent(listen="127.0.0.1", port=None, rotate=False):
     if in_wsl() and shutil.which("podman"):
         Node("podman")  # its WSL fix (iptables, not nftables) for the podman calls the agent runs
+    # what it runs finds this terminal-ct (a desktop's screen tools). shortcut: split on spaces there, as
+    # TERMINAL_VM is: a path with a space breaks it; upgrade: an argv list in the request
+    os.environ.setdefault("TERMINAL_CT", f"{sys.executable} {os.path.abspath(__file__)}")
     if rotate:
         agent_credentials(rotate=True)
     srv = agent_serve(listen, port)
@@ -811,6 +814,11 @@ def ssh_target(url):
     return u, port
 
 
+_REMOTE_USER = {}  # another PC: (home, uid, gid) of the user there
+CT_FIND = ('c=${TERMINAL_CT:-}; [ -n "$c" ] || c=$(command -v terminal-ct) || c="$HOME/.local/bin/terminal-ct"; '
+           'set -f; ')  # terminal-ct on another PC, as VM_FIND finds terminal-vm
+
+
 class NodeRemote(NodeVM):
     """Containers of another PC: each engine call is run there by its agent (https://...) or over SSH (ssh://...).
     Its engine (podman or docker) was found by host add."""
@@ -824,6 +832,44 @@ class NodeRemote(NodeVM):
             return super().free_bytes(root)
         except SystemExit:  # shortcut: Docker Desktop (a Mac) keeps its store in its own VM, not on that PC: the
             return super().free_bytes("/")  # PC's own disk then; upgrade: read that VM's space (docker system df)
+
+    def _whoami(self):
+        """(home, uid, gid) of the user the central PC runs as there: its desktops are theirs. Asked once per PC."""
+        if self.name not in _REMOTE_USER:
+            out = self.sh('echo "$HOME" "$(id -u)" "$(id -g)"', timeout=30).split()
+            if len(out) != 3 or not out[0].startswith("/") or not out[1].isdigit() or not out[2].isdigit():
+                raise SystemExit(f"host {self.name}: unexpected answer for its user ({' '.join(out)[:80]})")
+            _REMOTE_USER[self.name] = out[0], int(out[1]), int(out[2])
+        return _REMOTE_USER[self.name]
+
+    def store(self):
+        """Where this PC keeps what its containers need beside them (a desktop's screen socket): in that user's home,
+        apart from a terminal-ct of their own."""
+        return self._whoami()[0] + "/.local/share/terminal-ct/central"
+
+    def ids(self):
+        return self._whoami()[1:]
+
+    def act(self, name, tool, a):
+        """act() run by terminal-ct on that PC, next to the desktop's socket: installed there, never copied (an agent
+        names itself in TERMINAL_CT)."""
+        t = int(float(a.get("timeout", 30))) + 60 if tool in ("wait", "ready") else 60
+        try:
+            r = self._exec(["env", f"TERMINAL_CT_HOME={self.store()}", f"TERMINAL_CT_ENGINE={self.engine}",
+                            "sh", "-lc", CT_FIND + 'exec $c "$@"', "terminal-ct", "_act", name, tool, json.dumps(a)], t)
+        except (RuntimeError, subprocess.TimeoutExpired) as e:
+            raise RuntimeError(f"host {self.name}: {e}") from None
+        if r.get("exit") == 127 and "terminal-ct" in (r.get("stderr") or ""):
+            raise RuntimeError(f"{name}'s desktop is on {self.name}, where terminal-ct is not installed: install it "
+                               "there (its install.sh), or add that PC by its agent")
+        if r.get("exit"):
+            err = (r.get("stderr") or "").strip().splitlines()
+            raise RuntimeError(err[-1] if err else f"host {self.name}: {tool} failed")
+        try:
+            out = json.loads(r["stdout"])
+            return (base64.b64decode(out["png"]), tuple(out["size"])) if tool == "screenshot" else out["result"]
+        except (ValueError, KeyError, TypeError) as e:
+            raise RuntimeError(f"host {self.name}: unreadable reply to {tool} ({e})") from None
 
     def address(self):
         """This PC's address as the central PC reaches it (its agent's, or the SSH host's): where its containers'
@@ -1520,8 +1566,6 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     recover(name)  # an interrupted remake's container is still NAME's: never create over it
     if node().run(["inspect", "--type", "container", PREFIX + name], check=False).returncode == 0:
         raise SystemExit(f"{name!r} already exists (engine name {PREFIX}{name})")
-    if isinstance(node(), NodeRemote) and desktop:
-        raise SystemExit(f"a container on another PC ({node().name}): no desktop there yet")
     if desktop:
         # shortcut: the VNC unix socket does not cross into Windows, and a node's paths would be Windows ones;
         # run terminal-ct inside WSL there
@@ -1577,11 +1621,14 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
     if spec.get("desktop"):
         image = image if spec.get("prebuilt") else desktop_image(image)  # prebuilt: a committed desktop
         # LANG: without UTF-8, xterm wrote é as Latin-1
+        # another PC: in its user's store there (its terminal-ct reads the socket); else this STORE's path
+        run_dir = f"{node().store()}/{name}/run" if isinstance(node(), NodeRemote) else os.path.join(ct_dir(name), "run")
         extra += ["-e", "LANG=C.UTF-8", "-e", f"TCT_WIDTH={spec['width']}", "-e", f"TCT_HEIGHT={spec['height']}",
-                  "-v", f"{os.path.join(ct_dir(name), 'run')}:/run/tct"]
+                  "-v", f"{run_dir}:/run/tct"]
         if isinstance(node(), NodeVM):  # there, the engine would make it as root: the desktop's user could not write
-            uid, gid = (1000, 1000) if WINDOWS else (os.getuid(), os.getgid())
-            run = shlex.quote(os.path.join(ct_dir(name), "run"))
+            uid, gid = node().ids() if isinstance(node(), NodeRemote) else \
+                (1000, 1000) if WINDOWS else (os.getuid(), os.getgid())
+            run = shlex.quote(run_dir)
             node().sh(f"mkdir -p {run} && chown {uid}:{gid} {run} && chmod 700 {run}", timeout=30)
         cmd = ["sh", "-c", DESKTOP_RUN]
     else:  # (below) a container on networks of nodes: their DNS, and its ports on the node's address of each
@@ -1592,7 +1639,8 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
     # desktops and sandboxes run as the host user (podman: same uid inside): the VNC socket is the user's alone, and
     # a sandbox is not root even inside; /data is their home
     as_user = spec.get("desktop") or sandbox
-    uid, gid = (1000, 1000) if WINDOWS else (os.getuid(), os.getgid())  # shortcut: no uid on Windows, typical one
+    uid, gid = node().ids() if as_user and isinstance(node(), NodeRemote) else \
+        (1000, 1000) if WINDOWS else (os.getuid(), os.getgid())  # shortcut: no uid on Windows, typical one
     if as_user:
         keep_id = podman and getattr(node(), "rootless", True)  # a rootful Podman refuses keep-id
         extra += [*(["--userns=keep-id"] if keep_id else []), "--user", f"{uid}:{gid}", "-e", "HOME=/data"]
@@ -1818,7 +1866,7 @@ def stop(name, timeout=10):
 
 
 def rm(name):
-    find(name)
+    info = find(name)
     node().run(["rm", "-f", PREFIX + name])
     node().run(["rm", "-f", PREFIX + name + "-OLD"], check=False)  # it would keep the volume in use
     node().run(["volume", "rm", f"{PREFIX}{name}-data"], check=False)  # absent if never created
@@ -1826,6 +1874,9 @@ def rm(name):
     for tag in snapshots(name):
         node().run(["image", "rm", f"{SNAP}{name}:{tag}"], check=False)
     shutil.rmtree(os.path.join(STORE, name), ignore_errors=True)
+    if isinstance(node(), NodeRemote) and labels_of(info).get(f"{LABEL}.desktop") == "1":
+        with contextlib.suppress(SystemExit):  # its screen's folder there
+            node().sh(f"rm -rf {shlex.quote(node().store() + '/' + name)}", timeout=30)
     if isinstance(node(), NodeVM):
         place(name, None)
     set_description("container", name, "")  # a new container of this name says nothing it did not say itself
@@ -2611,8 +2662,6 @@ def check_stack(s):
             check_name(n)
         if c.get("node") is not None:
             check_name(c["node"])
-            if is_host(c["node"]) and c.get("desktop"):
-                raise SystemExit(f"service {svc}: {c['node']} is another PC: no desktop there yet")
         if c.get("spread") not in (None, "nodes"):
             raise SystemExit(f'service {svc}: spread is "nodes" (its replicas across the nodes)')
         if c.get("node") and c.get("spread"):
@@ -5204,8 +5253,6 @@ def desktop(name):
 
 def act(name, tool, a):
     """Shared by the CLI and MCP. Coordinates are pixels of the latest screenshot."""
-    if isinstance(node(), NodeRemote):  # never terminal-ct copied onto someone's PC
-        raise RuntimeError(f"{name} is on another PC ({node().name}): no desktop there yet")
     if isinstance(node(), NodeVM):  # the desktop's socket is in the node: terminal-ct there does it
         return node().act(name, tool, a)
     if tool == "ready":

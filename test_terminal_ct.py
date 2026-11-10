@@ -2033,6 +2033,12 @@ class Hosts(unittest.TestCase):
                 raise RuntimeError("agent https://pc: connection refused")
             if argv == ["uname", "-s", "-r"]:
                 return {"exit": 0, "stdout": self.uname.get(node.name, "Linux 6.1.0") + "\n", "stderr": ""}
+            if argv[:2] == ["sh", "-c"] and "id -u" in argv[2]:  # its user: home, uid, gid
+                return {"exit": 0, "stdout": "/home/me 1000 1000\n", "stderr": ""}
+            if "_act" in argv:  # terminal-ct there, for a desktop's screen
+                if node.name in getattr(self, "no_ct", ()):
+                    return {"exit": 127, "stdout": "", "stderr": "sh: 1: terminal-ct: not found"}
+                return {"exit": 0, "stdout": json.dumps({"png": "UE5H", "size": [8, 6]}), "stderr": ""}
             if argv[:2] == ["sh", "-c"] and "podman-wsl.conf" in argv[2]:  # host add's WSL setting there
                 self.pc_files[node.name + ":podman-wsl.conf"] = argv[-1]
                 return {"exit": 0, "stdout": "/home/me/.config/terminal-ct/podman-wsl.conf\n", "stderr": ""}
@@ -2178,8 +2184,6 @@ class Hosts(unittest.TestCase):
         self.assertEqual(self.engines["pc1"].objects["tct-web"]["State"]["Status"], "running")
         rows = {c["name"]: c.get("node") for c in self.cli("ls")}
         self.assertEqual(rows, {"web": "pc1"})
-        with self.assertRaisesRegex(SystemExit, "no desktop there yet"):
-            self.cli("--host", "pc1", "create", "d", "--desktop")
         with self.assertRaisesRegex(SystemExit, "no network 'lab'|net create lab"):  # its networks are its own
             self.cli("--host", "pc1", "create", "n", "--net", "lab")
         self.cli("--host", "pc1", "net", "create", "lab")
@@ -2192,13 +2196,17 @@ class Hosts(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "its networks are its own"):
             self.cli("node", "join", "pc1", "lab")
         ct.NODE = None
-        with ct.on_node("pc1"), self.assertRaisesRegex(RuntimeError, "another PC"):  # no terminal-ct copied there
+        with ct.on_node("pc1"):                                                # terminal-ct there does the screen
+            self.assertEqual(ct.act("web", "screenshot", {}), (b"PNG", (8, 6)))
+        act = next(a for _, a in self.execs if "_act" in a)
+        self.assertEqual(act[:3], ["env", "TERMINAL_CT_HOME=/home/me/.local/share/terminal-ct/central",
+                                   "TERMINAL_CT_ENGINE=docker"])
+        self.assertIn(ct.CT_FIND, act[5])
+        self.assertFalse([a for _, a in self.execs if ct.NODE_CT in " ".join(a)])  # never copied there
+        self.no_ct = {"pc1"}
+        with ct.on_node("pc1"), self.assertRaisesRegex(RuntimeError, "terminal-ct is not installed"):
             ct.act("web", "screenshot", {})
         ct.NODE = self.local
-        self.assertFalse([a for _, a in self.execs if "_act" in a or "mkdir" in " ".join(a)])
-        with self.assertRaisesRegex(SystemExit, "no desktop there yet"):
-            ct.apply({"stack": "d", "services": {"s": {"image": "alpine:3.20", "node": "pc1",
-                                                                             "desktop": True}}})
         self.down.add("pc1")                                                   # that PC gone: left out of ls
         self.assertEqual(self.cli("ls"), [])
         self.assertEqual(self.cli("host", "ls")[0]["status"], "unreachable")
