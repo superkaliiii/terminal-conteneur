@@ -220,7 +220,7 @@ The web dashboard can be opened by other people or agents, each with its own tok
   the local port + 10; terminal-vm 7182), with a certificate for that IP whose fingerprint `web user add` prints with
   the user's URL. 127.0.0.1 keeps serving the owner over HTTP. `web --listen off` stops sharing. Never 0.0.0.0.
 - The page shows who is there (each user's tab reports itself every 30 s: "with bob (read)"), and every action, refusal
-  and failure goes to `STORE/web/actions.log` (who, from where, what). Bad tokens from the network are not logged.
+  and failure goes to `STORE/.web/actions.log` (who, from where, what). Bad tokens from the network are not logged.
 - Two `web user` commands run at the same moment may lose one of the two changes: run them one after the other.
 
 ## Desktops
