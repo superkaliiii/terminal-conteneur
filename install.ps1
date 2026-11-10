@@ -15,23 +15,27 @@ $WinPython = $false  # it runs in its WSL distribution
 $Opts = $env:TERMINAL_CT_INSTALL
 $Distro = if ($env:TERMINAL_CT_DISTRO) { $env:TERMINAL_CT_DISTRO } else { "terminal-ct" }
 $Alpine = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64"
+$Launcher = "/root/.local/bin/$Tool"  # (PowerShell names ignore case: not $inside below)
 
 function Distro-Exists { return ((& wsl.exe --list --quiet 2>$null) -replace "`0", "" | Where-Object { $_.Trim() -eq $Distro }) -ne $null }
-
+function Has-Wsl { & wsl.exe --status 2>$null | Out-Null; return ($LASTEXITCODE -eq 0) }
+function Deps-Missing {
+    if (Has-Wsl) { return @() }
+    return @("WSL (administrator; then restart Windows and run this installer again)")
+}
 function Install-Deps {
-    # WSL itself: once per PC, with administrator rights and a restart
-    & wsl.exe --status 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        if (Ask "terminal-ct runs in WSL, not installed here. Install WSL now (administrator; then restart Windows)?") {
-            Start-Process wsl.exe -Verb RunAs -Wait -ArgumentList "--install --no-distribution"
-        }
-        $script:Restart = $true
+    # the features WSL 2 needs, through DISM: present on every Windows 10/11 (the inbox wsl.exe of older builds has
+    # no --no-distribution, and a plain wsl --install would add an Ubuntu nobody asked for)
+    if (-not (Has-Wsl)) {
+        $dism = "/c dism /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart && " +
+                "dism /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart"
+        if (Run-Elevated $dism "cmd.exe") { $script:Restart = $true }
     }
 }
 
 function Install-Tool($src) {
-    if ($script:Restart) {
-        Say "installation not finished: restart Windows, then run this installer again (it goes on from here)"
+    if ($script:Restart -or -not (Has-Wsl)) {
+        Say "installation not finished: WSL is needed$(if ($script:Restart) { '; restart Windows' }), then run this installer again (it goes on from here)"
         return $null
     }
     New-Item -ItemType Directory -Force $Lib | Out-Null
@@ -52,17 +56,25 @@ function Install-Tool($src) {
         Remove-Item $tar
         if (-not (Distro-Exists)) { throw "wsl --import $Distro failed" }
     }
-    # the tool inside, through its own installer (Python, Podman, openssl from Alpine's packages)
-    $inside = (& wsl.exe -d $Distro -- wslpath -a ($src -replace "\\", "/")) -replace "`0", ""
+    # the tool inside, through its own installer (Python, Podman, openssl, iptables from Alpine's packages: the
+    # distribution is terminal-ct's own, so that is part of this install); --exec: no shell re-reads the arguments
+    $srcInWsl = (& wsl.exe -d $Distro --exec wslpath -a ($src -replace "\\", "/")) -replace "`0", ""
     $flags = @("--no-mcp") + $(if ($NoDeps) { @("--no-deps") } else { @("--yes") })
-    & wsl.exe -d $Distro --cd / -- sh "$inside/install.sh" @flags | Out-Host
+    & wsl.exe -d $Distro --cd / --exec sh "$srcInWsl/install.sh" @flags | Out-Host
     if ($LASTEXITCODE -ne 0) { Say "the installation inside $Distro stopped: run this installer again"; return $null }
     $cmd = Join-Path $Lib "$Tool.cmd"
-    Set-Content -Encoding ascii $cmd "@wsl.exe -d $Distro --cd ~ -- /root/.local/bin/$Tool %*"
+    Write-Oem $cmd "@wsl.exe -d $Distro --cd ~ --exec $Launcher %*"
     return $cmd
 }
 
-function Mcp-Command { return @("wsl.exe", "-d", $Distro, "--", "/root/.local/bin/$Tool", "mcp") }  # stdio, no network
+function Mcp-Command { return @("wsl.exe", "-d", $Distro, "--exec", $Launcher, "mcp") }  # stdio, no network
+
+function Install-Skill($src) {  # for Claude Code on Windows: its skills folder is Windows' own
+    $dest = Join-Path $HOME ".claude\skills\$Tool"
+    New-Item -ItemType Directory -Force $dest | Out-Null
+    Copy-Item (Join-Path $src $Skill) (Join-Path $dest "SKILL.md") -Force
+    return $true
+}
 
 function Uninstall-Extra {
     if (Distro-Exists) {
@@ -86,25 +98,39 @@ function Ask($q) {
     $a = Read-Host "$q [Y/n]"
     return ($a -eq "" -or $a -match "^(y|yes|o|oui)$")
 }
+function Write-Oem($path, $text) {  # what cmd.exe reads a .cmd in: the console's OEM code page
+    $oem = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+    [IO.File]::WriteAllText($path, $text + "`r`n", $oem)
+}
+function Run-Elevated($arguments, $exe = "powershell") {  # one UAC prompt; false when refused or failed
+    try { $p = Start-Process $exe -Verb RunAs -Wait -PassThru -ArgumentList $arguments } catch { Say "not done: administrator rights refused"; return $false }
+    if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Say "not done: $exe exited with $($p.ExitCode)"; return $false }
+    return $true  # 3010: done, a restart finishes it
+}
 function Winget-Install($id) {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { Say "winget not found: install $id yourself"; return }
     & winget install --id $id -e --silent --accept-source-agreements --accept-package-agreements | Out-Host
-    # what it put on the PATH, for this session too
     $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
 }
 function Find-Python {
     foreach ($c in @(@("py", "-3"), @("python"), @("python3"))) {
         if (-not (Get-Command $c[0] -ErrorAction SilentlyContinue)) { continue }
-        $exe = & $c[0] @($c[1..9] | Where-Object { $_ }) -c "import sys; print(sys.executable if sys.version_info >= (3, $PyMin) else '')" 2>$null
+        $pre = @($c | Select-Object -Skip 1)
+        $exe = & $c[0] @pre -c "import sys; print(sys.executable if sys.version_info >= (3, $PyMin) else '')" 2>$null
         if ($LASTEXITCODE -eq 0 -and $exe -and (Test-Path $exe)) { return $exe }  # not the Store's empty alias
     }
     return $null
 }
 function User-Path($add, $remove) {
-    $p = [Environment]::GetEnvironmentVariable("Path", "User")
-    $parts = @(($p -split ";") | Where-Object { $_ -and $_ -ne $remove -and $_ -ne $add })
+    # the user's PATH as stored (REG_EXPAND_SZ: %USERPROFILE%\... stays a variable), then a broadcast for new windows
+    $key = Get-Item "HKCU:\Environment"
+    $raw = [string]$key.GetValue("Path", "", "DoNotExpandEnvironmentNames")
+    $parts = @(($raw -split ";") | Where-Object { $_ -and $_ -ne $remove -and $_ -ne $add })
     if ($add) { $parts += $add }
-    [Environment]::SetEnvironmentVariable("Path", ($parts -join ";"), "User")
+    $kind = if ($raw -match "%" -or -not $raw) { "ExpandString" } else { $key.GetValueKind("Path") }  # as it was
+    Set-ItemProperty "HKCU:\Environment" -Name Path -Value ($parts -join ";") -Type $kind
+    [Environment]::SetEnvironmentVariable("TERMINAL_INSTALL_REFRESH", "1", "User")  # sends WM_SETTINGCHANGE
+    [Environment]::SetEnvironmentVariable("TERMINAL_INSTALL_REFRESH", $null, "User")
 }
 
 if ($Uninstall) {
@@ -119,19 +145,21 @@ if ($Uninstall) {
     return
 }
 
-# 1. what it needs
+# 1. what it needs: one question for all of it
 $Python = if ($WinPython) { Find-Python } else { $null }
 if (-not $NoDeps) {
-    if ($WinPython -and -not $Python -and (Ask "$Tool needs Python 3.$PyMin or later. Install it now (winget)?")) {
-        Winget-Install "Python.Python.3.12"
-        $Python = Find-Python
-    }
-    Install-Deps
+    $missing = @(Deps-Missing)
+    if ($WinPython -and -not $Python) { $missing = @("Python 3.$PyMin+ (winget)") + $missing }
+    if ($missing.Count -and (Ask "$Tool needs: $($missing -join ', '). Install now?")) {
+        if ($WinPython -and -not $Python) { Winget-Install "Python.Python.3.12"; $Python = Find-Python }
+        Install-Deps
+    } elseif ($missing.Count) { Say "not installed: $($missing -join ', ') ($Tool doctor says how)" }
 }
 if ($WinPython -and -not $Python) { throw "Python 3.$PyMin or later is required (winget install Python.Python.3.12)" }
 
 # 2. the tool: from this folder when it holds it, else downloaded
 $src = if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot $File))) { $PSScriptRoot } else { $null }
+$tmp = $null
 if (-not $src) {
     $tmp = Join-Path ([IO.Path]::GetTempPath()) "$Tool-$PID"
     New-Item -ItemType Directory -Force $tmp | Out-Null
@@ -139,35 +167,38 @@ if (-not $src) {
     Invoke-WebRequest -UseBasicParsing $Archive -OutFile "$tmp\a.zip"
     Expand-Archive "$tmp\a.zip" $tmp -Force
     $found = Get-ChildItem -Recurse -Path $tmp -Filter $File | Where-Object { (Split-Path $_.DirectoryName -Leaf) -eq $SubDir -or -not $SubDir } | Select-Object -First 1
-    if (-not $found) { throw "the download holds no $File" }
+    if (-not $found) { Remove-Item -Recurse -Force $tmp; throw "the download holds no $File" }
     $src = $found.DirectoryName
 }
-$Cmd = Install-Tool $src
-if (-not $Cmd) { return }  # not finished (a restart first): said why
-Say "installed: $Cmd"
+try {
+    $Cmd = Install-Tool $src
+    if (-not $Cmd) { return }  # not finished (a restart first): said why
+    Say "installed: $Cmd"
 
-# 3. on the PATH (the user's: no administrator)
-if (-not (($env:Path -split ";") -contains (Split-Path $Cmd))) {
-    User-Path (Split-Path $Cmd) $null
-    $env:Path += ";" + (Split-Path $Cmd)
-    Say "added $(Split-Path $Cmd) to your PATH: open a new terminal to use $Tool"
-}
+    # 3. on the PATH (the user's: no administrator)
+    if (-not (($env:Path -split ";") -contains (Split-Path $Cmd))) {
+        User-Path (Split-Path $Cmd) $null
+        $env:Path += ";" + (Split-Path $Cmd)
+        Say "added $(Split-Path $Cmd) to your PATH: open a new terminal to use $Tool"
+    }
 
-# 4. the agent: Claude Code's MCP server and skill
-$Mcp = if (Get-Command Mcp-Command -ErrorAction SilentlyContinue) { Mcp-Command } else { @($Cmd, "mcp") }
-if (-not $NoMcp -and (Get-Command claude -ErrorAction SilentlyContinue)) {
-    & claude mcp remove $Tool -s user 2>$null | Out-Null  # an update: the path may have changed
-    & claude mcp add -s user $Tool -- @Mcp | Out-Null
-    if ($LASTEXITCODE -eq 0) { Say "MCP server $Tool declared in Claude Code" }
-    else { Say "could not declare the MCP server: claude mcp add -s user $Tool -- $($Mcp -join ' ')" }
-    & $Cmd skills install 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { Say "skill installed in ~\.claude\skills\$Tool" }
-} else {
-    Say "for an agent: MCP server = $($Mcp -join ' ')"
+    # 4. the agent: Claude Code's MCP server and skill
+    $Mcp = Mcp-Command
+    if (-not $NoMcp -and (Get-Command claude -ErrorAction SilentlyContinue)) {
+        & claude mcp remove $Tool -s user 2>$null | Out-Null  # an update: the path may have changed
+        & claude mcp add -s user $Tool -- @Mcp | Out-Null
+        if ($LASTEXITCODE -eq 0) { Say "MCP server $Tool declared in Claude Code" }
+        else { Say "could not declare the MCP server: claude mcp add -s user $Tool -- $($Mcp -join ' ')" }
+        if (Install-Skill $src) { Say "skill installed in ~\.claude\skills\$Tool" }
+    } else {
+        Say "for an agent: MCP server = $($Mcp -join ' ')"
+    }
+} finally {
+    if ($tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
 }
 
 # 5. what is left to fix, if anything
 Say ""
 & $Cmd doctor
 if ($LASTEXITCODE -ne 0) { Say "doctor found something to fix: each line above gives the command" }
-if ($script:Restart) { Say "restart Windows to finish turning on the Windows Hypervisor Platform" }
+if ($script:Restart) { Say "restart Windows to finish (the Windows Hypervisor Platform, or WSL)" }

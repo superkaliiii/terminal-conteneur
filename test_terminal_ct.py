@@ -1530,6 +1530,12 @@ class Doctor(unittest.TestCase):
             self.assertNotIn(gone, out)
         self.assertIn("~/x", out)
         self.assertIn("microsoft-standard-WSL2", out)                     # not a secret: kept
+        more = ("MYSQL_PWD=s3cr postgres://bob:hunter2@db:5432/x Authorization: Bearer abc.def --token tok123 "
+                "pass=zz /mnt/c/Users/Elodie/x " + json.dumps({"p": "C:\\Users\\Elodie\\AppData"}) + " C:/Users/Elodie/y")
+        out = ct.mask(more)
+        for gone in ("s3cr", "hunter2", "abc.def", "tok123", "zz", "Elodie"):
+            self.assertNotIn(gone, out)
+        self.assertIn("postgres://bob:<hidden>@db", out)
 
     def test_doctor_json_and_report(self):
         with open(os.path.join(ct.STORE, "web.token"), "w") as f:

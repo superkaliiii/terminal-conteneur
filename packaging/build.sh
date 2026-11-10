@@ -5,6 +5,7 @@
 # The tool is one Python file: the packages hold it, its skill and a launcher, and declare what it needs.
 set -eu
 TOOL=terminal-ct
+CLASS=TerminalCt                                # its Homebrew formula class
 FILE=terminal_ct.py
 SKILL=skills/terminal-ct/SKILL.md
 SUMMARY="Containers with a desktop and a shell, for people and computer-use agents (CLI + MCP server)"
@@ -19,7 +20,7 @@ BREW_DEPENDS='depends_on "python@3.12"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)        # where FILE is
 
 # ===== common to terminal-ct and terminal-vm's packaging/build.sh =====
-VERSION=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$ROOT/$FILE")
+VERSION=$(tr -d '\r' < "$ROOT/$FILE" | sed -n 's/^VERSION = "\(.*\)"$/\1/p')  # a CRLF checkout too
 [ -n "$VERSION" ] || { echo "no VERSION in $FILE" >&2; exit 1; }
 if [ "${1:-}" = "--brew" ]; then
   [ $# -ge 2 ] || { echo "--brew needs the release archive's URL" >&2; exit 2; }
@@ -31,9 +32,8 @@ if [ "${1:-}" = "--brew" ]; then
   fi
   if command -v sha256sum >/dev/null 2>&1; then sha=$(sha256sum "$tmp/a" | cut -d' ' -f1)
   else sha=$(shasum -a 256 "$tmp/a" | cut -d' ' -f1); fi
-  class=$(echo "$TOOL" | sed 's/-\(.\)/\U\1/; s/^\(.\)/\U\1/')
   cat <<EOF
-class $class < Formula
+class $CLASS < Formula
   desc "$SUMMARY"
   homepage "$HOMEPAGE"
   url "$url"

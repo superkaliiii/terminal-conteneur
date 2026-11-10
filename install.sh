@@ -37,14 +37,17 @@ while [ $# -gt 0 ]; do
   shift
 done
 case "$PREFIX" in /*) ;; *) echo "--prefix must be an absolute folder" >&2; exit 2 ;; esac
+if [ -n "${SUDO_USER:-}" ] && [ "$(id -u)" = 0 ]; then
+  echo "run it as yourself, not with sudo: it asks for administrator rights only to install packages" >&2; exit 2
+fi
 LIB="$PREFIX/lib/$TOOL" BIN="$PREFIX/bin/$TOOL" MARK="# added by $TOOL's installer"
 say() { printf '%s\n' "$*"; }
-ask() {  # ask "question": yes with --yes; no answer possible (no terminal): no
+ask() {  # ask "question": yes with --yes or after a first yes; no answer possible (no terminal): no
   [ "$YES" = 1 ] && return 0
   [ -r /dev/tty ] || { say "$1 [skipped: no terminal to ask; run again with --yes]"; return 1; }
   printf '%s [Y/n] ' "$1" > /dev/tty
   read -r a < /dev/tty || return 1
-  case "$a" in ""|y|Y|yes|o|O|oui) return 0 ;; *) return 1 ;; esac
+  case "$a" in ""|y|Y|yes|o|O|oui) YES=1; return 0 ;; *) return 1 ;; esac  # one confirmation per run
 }
 sudo_() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
 pkg_install() {  # pkg_install PACKAGES...: with this system's package manager
@@ -58,7 +61,11 @@ pkg_install() {  # pkg_install PACKAGES...: with this system's package manager
   fi
 }
 manager() { for m in apt-get dnf zypper pacman apk brew; do command -v $m >/dev/null 2>&1 && { echo $m; return; }; done; }
-profiles() { for f in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do if [ -f "$f" ]; then echo "$f"; fi; done; }
+profiles() {  # the shell start files that exist and can be written (a read-only one, e.g. Nix's, is left)
+  for f in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile"; do
+    if [ -f "$f" ] && [ -w "$f" ]; then echo "$f"; fi
+  done
+}
 
 if [ "$MODE" = uninstall ]; then
   if [ "$MCP" = 1 ] && command -v claude >/dev/null 2>&1; then
@@ -67,7 +74,10 @@ if [ "$MODE" = uninstall ]; then
   fi
   rm -rf "$LIB"; rm -f "$BIN"
   for f in $(profiles); do
-    if grep -qF "$MARK" "$f"; then grep -vF "$MARK" "$f" > "$f.tmp-$$" && cat "$f.tmp-$$" > "$f"; rm -f "$f.tmp-$$"; fi
+    if grep -qF "$MARK" "$f"; then
+      { grep -vF "$MARK" "$f" || true; } > "$f.tmp-$$" && cat "$f.tmp-$$" > "$f" || say "could not edit $f: remove its line '$MARK'"
+      rm -f "$f.tmp-$$"
+    fi
   done
   say "$TOOL removed. What it made stays (remove it first with $TOOL itself if you want it gone), and so does"
   say "its data folder: \$$STOREVAR, by default ~/.local/share/$TOOL."
@@ -91,7 +101,8 @@ fi
 py_ok || { say "Python 3.$PYMIN or later is required"; exit 1; }
 
 # 2. the tool: from this folder when it holds it, else downloaded
-SRC=$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")
+SRC=""
+case "$(basename "$0")" in install.sh) [ -f "$0" ] && SRC=$(cd "$(dirname "$0")" && pwd) ;; esac
 TMP=""
 if [ -z "$SRC" ] || [ ! -f "$SRC/$FILE" ]; then
   TMP=$(mktemp -d)
@@ -102,8 +113,9 @@ if [ -z "$SRC" ] || [ ! -f "$SRC/$FILE" ]; then
   else python3 -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' "$ARCHIVE" "$TMP/a.tgz"
   fi
   tar -xzf "$TMP/a.tgz" -C "$TMP"
-  SRC=$(dirname "$(find "$TMP" -path "*$SUBDIR/$FILE" | head -1)")
-  [ -f "$SRC/$FILE" ] || { say "the download holds no $FILE"; exit 1; }
+  found=$(find "$TMP" -path "*$SUBDIR/$FILE" | head -1)
+  [ -n "$found" ] || { say "the download holds no $FILE"; exit 1; }
+  SRC=$(dirname "$found")  # under $TMP: the downloaded copy, nothing else
 fi
 mkdir -p "$LIB/$(dirname "$SKILL")" "$PREFIX/bin"
 cp "$SRC/$FILE" "$LIB/$FILE.new" && mv "$LIB/$FILE.new" "$LIB/$FILE"
@@ -115,8 +127,12 @@ say "installed: $BIN ($("$BIN" version 2>/dev/null || echo "?"))"
 case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
   *) line="export PATH=\"$PREFIX/bin:\$PATH\"  $MARK"
-     files=$(profiles); [ -n "$files" ] || files="$HOME/.profile"
-     for f in $files; do grep -qF "$MARK" "$f" 2>/dev/null || printf '\n%s\n' "$line" >> "$f"; done
+     files=$(profiles)
+     case "${SHELL:-}" in *zsh) [ -f "$HOME/.zprofile" ] || [ -f "$HOME/.zshrc" ] || { : > "$HOME/.zprofile"; files="$files $HOME/.zprofile"; } ;; esac
+     [ -n "$files" ] || { : > "$HOME/.profile"; files="$HOME/.profile"; }
+     for f in $files; do
+       grep -qF "$MARK" "$f" 2>/dev/null || printf '\n%s\n' "$line" >> "$f" || say "could not edit $f"
+     done
      say "added $PREFIX/bin to your PATH: open a new terminal (or run: export PATH=\"$PREFIX/bin:\$PATH\")" ;;
 esac
 
