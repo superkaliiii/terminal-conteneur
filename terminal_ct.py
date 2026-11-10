@@ -621,6 +621,8 @@ class _AgentHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urllib.parse.urlsplit(self.path)
+        if u.path == "/relay":  # another PC's relay, with the token the central PC gave it: not the central's
+            return self._relay(dict(urllib.parse.parse_qsl(u.query)).get("port", ""))
         if not self._authorized():
             return
         if u.path == "/ping":
@@ -657,11 +659,14 @@ class _AgentHandler(http.server.BaseHTTPRequestHandler):
         if n < 0:
             self.close_connection = True
             return self._reply(411, {"error": "Content-Length needed"})
-        raw = self.rfile.read(n) if u.path == "/exec" and n <= AGENT_MAX_JSON else None  # read even when refused
+        raw = self.rfile.read(n) if u.path in ("/exec", "/relay-grant", "/relay-revoke") and n <= AGENT_MAX_JSON \
+            else None  # read even when refused
         if not self._authorized():
             return
         if u.path == "/push":
             return self._push(dict(urllib.parse.parse_qsl(u.query)).get("path", ""), n)
+        if u.path in ("/relay-grant", "/relay-revoke"):
+            return self._relay_grant(u.path == "/relay-grant", raw)
         if u.path != "/exec":
             return self._reply(404, {"error": "not found"})
         if raw is None:
@@ -691,6 +696,57 @@ class _AgentHandler(http.server.BaseHTTPRequestHandler):
             p.communicate()
             return self._reply(504, {"error": f"{argv[0]} timed out ({timeout:g} s)"})
         self._reply(200, {"exit": p.returncode, "stdout": out, "stderr": err})
+
+    def _relay_grant(self, grant, raw):
+        """The central PC lets another PC reach SERVICE's ports here (grant: a new token for it), or takes it back."""
+        try:
+            req = json.loads(raw or b"")
+            service, dest = req["service"], req["for"]
+            ports = [int(p) for p in req.get("ports") or []] if grant else []
+            if not (isinstance(service, str) and _NAME_RE.fullmatch(service) and isinstance(dest, str)
+                    and _NAME_RE.fullmatch(dest) and all(1 <= p <= 65535 for p in ports) and (ports or not grant)):
+                raise ValueError
+        except (ValueError, TypeError, KeyError):
+            return self._reply(400, {"error": "relay-grant wants {service, for, ports: [1-65535]}"})
+        token = secrets.token_urlsafe(32) if grant else None
+        with _RELAY_LOCK:
+            g = {k: v for k, v in _relay_grants().items() if (v.get("service"), v.get("for")) != (service, dest)}
+            if grant:
+                g[hashlib.sha256(token.encode()).hexdigest()] = {"service": service, "for": dest, "ports": ports}
+            _web_write(_agent_path("relays.json"), json.dumps(g), 0o600)
+        _agent_log(self.client_address[0], f"relay {'grant' if grant else 'revoke'} {service} for {dest}")
+        self._reply(200, {"token": token} if grant else {"revoked": service})
+
+    def _relay(self, port):
+        """A relay stream: its token (one service's ports), then raw bytes both ways with that port, published on
+        this agent's address. Long-lived: out of the central PC's call slots, under its own limit."""
+        given = self.headers.get("X-Relay-Token", "")
+        grant = _relay_grants().get(hashlib.sha256(given.encode("utf-8", "replace")).hexdigest()) if given else None
+        if not grant or not port.isdigit() or int(port) not in grant.get("ports", ()):
+            _agent_log(self.client_address[0], f"refused relay to port {port[:8]}", refusal=True)
+            time.sleep(0.5)
+            self.close_connection = True
+            return self._reply(403, {"error": "relay refused (terminal-ct relay add on the central PC)"})
+        if not _RELAYS.acquire(blocking=False):
+            self.close_connection = True
+            return self._reply(503, {"error": "too many relay streams"})
+        try:
+            self.server.free_slot(self.request)
+            try:
+                target = socket.create_connection((self.server.server_address[0], int(port)), 10)
+            except OSError as e:
+                self.close_connection = True
+                return self._reply(502, {"error": f"{grant['service']}:{port} not answering ({e.strerror or e})"})
+            _agent_log(self.client_address[0], f"relay {grant['service']}:{port}")
+            self.send_response(200)
+            self.end_headers()
+            self.close_connection = True
+            try:
+                _relay_pipe(self.request, target)
+            finally:
+                target.close()
+        finally:
+            _RELAYS.release()
 
     def _push(self, path, n):
         tmp = f"{path}.tct-{secrets.token_hex(4)}"  # whole or not at all: a cut connection leaves no half file
@@ -746,6 +802,141 @@ def agent(listen="127.0.0.1", port=None, rotate=False):
                       "on the central PC": f"terminal-ct host add NAME {url} --fingerprint {srv.fingerprint}  "
                                            "(then type or paste the token)"}, indent=1), flush=True)
     srv.serve_forever()
+
+
+# A relay: the relay container on one PC (RELAY_CODE, stdlib only, in python:3.12-alpine) listens on its network
+# under the service's name, and carries each connection to the service's PC agent over TLS (pinned certificate,
+# then a token for that service's ports alone, from the central PC); that agent joins it to the published port.
+RELAY_IMAGE = "python:3.12-alpine"
+RELAY_CODE = r"""
+import hashlib, select, socket, ssl, sys, threading
+
+
+def _relay_pipe(a, b):
+    a.settimeout(None); b.settimeout(None)
+    while True:  # TLS keeps decrypted bytes of its own: pending() first, else select() would wait on them
+        ready = [x for x in (a, b) if getattr(x, "pending", lambda: 0)()] or select.select([a, b], [], [], 3600)[0]
+        if not ready:
+            return
+        for x in ready:
+            data = x.recv(65536)
+            if not data:
+                return
+            (b if x is a else a).sendall(data)
+
+
+def relay_one(c, p, host, port, fp, token):
+    t = None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE  # trust: the pinned fingerprint, below
+        t = ctx.wrap_socket(socket.create_connection((host, port), 10))
+        if hashlib.sha256(t.getpeercert(True)).hexdigest() != fp:
+            return
+        t.sendall(("GET /relay?port=%d HTTP/1.1\r\nHost: relay\r\nX-Relay-Token: %s\r\n\r\n" % (p, token)).encode())
+        head = b""
+        while not head.endswith(b"\r\n\r\n"):  # a byte at a time: never read past the reply's head
+            d = t.recv(1)
+            if not d or len(head) > 4096:
+                return
+            head += d
+        if head.split(b" ")[1:2] == [b"200"]:
+            _relay_pipe(c, t)
+    except OSError:
+        pass
+    finally:
+        for x in (c, t):
+            if x is not None:
+                x.close()
+
+
+def relay_main(host, port, fp, token, name, *ports):
+    try:
+        bind = socket.gethostbyname(name)  # its own address on the service's network: not the internet bridge
+    except OSError:
+        bind = ""
+    def serve(p):
+        ls = socket.create_server((bind, p))
+        while True:
+            c, _ = ls.accept()
+            threading.Thread(target=relay_one, args=(c, p, host, int(port), fp, token), daemon=True).start()
+    for p in ports:
+        threading.Thread(target=serve, args=(int(p),), daemon=True).start()
+    threading.Event().wait()
+
+
+if __name__ == "__main__":
+    relay_main(*sys.argv[1:])
+"""
+_RELAY_NS = {"__name__": "terminal_ct_relay"}
+exec(RELAY_CODE, _RELAY_NS)  # one source: the agent's side of a stream uses the same pipe
+_relay_pipe = _RELAY_NS["_relay_pipe"]
+_RELAYS, _RELAY_LOCK = threading.BoundedSemaphore(256), threading.Lock()
+_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,62}")
+
+
+def _relay_grants():
+    try:
+        with open(_agent_path("relays.json")) as f:
+            g = json.load(f)
+        return g if isinstance(g, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def relay_add(service, on=None, net=None):
+    """SERVICE (a container of another PC, with ports, added by its agent) reachable by its name on network NET of
+    PC ON (this PC when None): a relay container there, the service's agent at the other end."""
+    check_name(service)
+    check_name(net or "")
+    src = _nodes()["placement"].get(service)
+    if not src or not is_host(src):
+        raise SystemExit(f"{service} is not on another PC: a relay brings a service of another PC to a network here "
+                         "or on a third PC (on one PC, its network reaches it by name)")
+    if on == src:
+        raise SystemExit(f"{service} is on {src} already: its networks there reach it by name")
+    h = _hosts().get(src) or {}
+    if not h.get("url", "").startswith("https://"):
+        raise SystemExit(f"{src} is reached over SSH: a relay needs its agent (terminal-ct agent there, then host add "
+                         "with its https:// address)")
+    with on_node(src):
+        ports = json.loads(labels_of(find(service)).get(f"{LABEL}.spec") or "{}").get("ports") or []
+    if not ports:
+        raise SystemExit(f"{service} publishes no port: recreate it with --ports")
+    dest = on or "here"
+    name = f"{service}-relay-{dest}"[:63]
+    try:
+        token = agent_request(h, "POST", "/relay-grant", {"service": service, "for": dest, "ports": ports})["token"]
+    except (RuntimeError, KeyError, TypeError) as e:
+        raise SystemExit(f"host {src}: {e}") from None
+    u = urllib.parse.urlsplit(h["url"])
+    with (on_node(on) if on else contextlib.nullcontext()):
+        quiet(create, name, image=RELAY_IMAGE, cpus=0.25, memory=0.125, internet=True, nets=[net],
+              cmd=["python3", "-c", RELAY_CODE, u.hostname, str(u.port or AGENT_PORT), h["fingerprint"], token,
+                   service, *map(str, ports)], labels={"relay": service, "relay_from": src})
+        # its name on NET is the service's too: the containers there ask for SERVICE, as on its own PC
+        node().run(["network", "disconnect", NET_PREFIX + net, PREFIX + name])
+        node().run(["network", "connect", "--alias", name, "--alias", service, NET_PREFIX + net, PREFIX + name])
+        quiet(start, name)
+    event("relay_added", None, detail=f"{service} from {src} on {dest} ({net})")
+    return {"relay": name, "service": service, "from": src, "on": dest, "network": net, "ports": ports}
+
+
+def relay_rm(service, on=None):
+    """The relay of SERVICE on PC ON gone, and its token taken back on the service's PC (if it answers)."""
+    check_name(service)
+    dest = on or "here"
+    name = f"{service}-relay-{dest}"[:63]
+    with (on_node(on) if on else contextlib.nullcontext()):
+        src = labels_of(find(name)).get(f"{LABEL}.relay_from")
+        quiet(rm, name)
+    h = _hosts().get(src or "") or {}
+    revoked = False
+    if h.get("url", "").startswith("https://"):
+        with contextlib.suppress(RuntimeError):
+            agent_request(h, "POST", "/relay-revoke", {"service": service, "for": dest})
+            revoked = True
+    return {"removed": name, "token_revoked": revoked}
 
 
 def agent_request(host, method, path, body=None, timeout=60, out=None, length=None):
@@ -4889,6 +5080,27 @@ AGENT_CONNECTIONS = 64
 class _AgentServer(_WebServer):
     """At most AGENT_CONNECTIONS clients at once (the dashboard server's cap): idle connections (15 s each) never
     use up threads or memory."""
+    def free_slot(self, request):
+        """A relay stream: given back its slot (and its address's count) now, as it may last hours."""
+        with self.lock:
+            a = self.origin.pop(id(request), None)
+            if a is None:
+                return
+            self.freed = getattr(self, "freed", set()) | {id(request)}
+            if self.by_address.get(a, 0) > 1:
+                self.by_address[a] -= 1
+            else:
+                self.by_address.pop(a, None)
+        self.slots.release()
+
+    def shutdown_request(self, request):
+        with self.lock:
+            freed = id(request) in getattr(self, "freed", ())
+            if freed:
+                self.freed.discard(id(request))
+        if freed:  # its slot was already given back
+            return socketserver.TCPServer.shutdown_request(self, request)
+        super().shutdown_request(request)
 
 
 class _AgentServer6(_AgentServer):
@@ -6707,6 +6919,10 @@ def main(argv=None):
     wb.add_argument("web_args", nargs="*", help="user add NAME | user ls | user rm NAME")
     wb.add_argument("--role", choices=["read", "full"], default="full"); wb.add_argument("--listen", help="IP or off")
     wb.add_argument("--port", type=int)
+    rl = sub.add_parser("relay", help="add|rm SERVICE --on PC --net NET: another PC's service by its name there")
+    rl.add_argument("relay_cmd", choices=["add", "rm"]); rl.add_argument("service")
+    rl.add_argument("--on", dest="relay_on", help="the PC whose network gets it (default: this PC)")
+    rl.add_argument("--net", dest="relay_net", help="add: the network there")
     ag = sub.add_parser("agent", help="serve this PC to a central PC (HTTPS, pinned certificate + token)")
     ag.add_argument("--listen", default="127.0.0.1"); ag.add_argument("--port", type=int); ag.add_argument("--rotate", action="store_true")
     ag.add_argument("--autostart", choices=["on", "off", "status"],
@@ -6879,6 +7095,11 @@ def main(argv=None):
             sys.stdout.reconfigure(errors="replace")  # a description in a script the console cannot show
         return show_json(m) if o.json else print(infra_text(m))
     if o.cmd == "web": return show_json(web_cli(o.web_args, o.role, not o.no_open, o.project, o.listen, o.port))
+    if o.cmd == "relay":
+        if o.relay_cmd == "add" and not o.relay_net:
+            raise SystemExit("relay add SERVICE --on PC --net NET")
+        return show_json(relay_add(o.service, o.relay_on, o.relay_net) if o.relay_cmd == "add"
+                         else relay_rm(o.service, o.relay_on))
     if o.cmd == "agent" and o.autostart:
         return show_json(agent_autostart(None if o.autostart == "status" else o.autostart == "on", o.listen, o.port))
     if o.cmd == "agent": return agent(o.listen, o.port, o.rotate)

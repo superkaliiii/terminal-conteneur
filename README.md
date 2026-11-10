@@ -214,7 +214,16 @@ runs what it is sent (engine calls, file copies, terminal-vm). Another PC is a n
   address the central PC reaches that PC by (its agent's, or the SSH host's), never on all of its interfaces. A
   stack service pinned there (`"node": "PC"`) takes networks too. Real run (WSL, over SSH, Docker there): a client
   reached `web` by name on that PC's network, and its published port answered on that address only. Containers of
-  different PCs reach each other through the relay (next).
+  different PCs reach each other through the relay:
+- **Relay**: `terminal-ct relay add SERVICE --net NET [--on PC]` makes SERVICE (a container with `--ports` on another
+  PC added by its agent) reachable by its name on network NET of PC (this PC by default): a small relay container
+  there (`python:3.12-alpine`, stdlib code, listening on its address on NET under the service's name) carries each
+  TCP connection to that PC's agent over TLS (pinned certificate) with a token the central PC asked for, good for
+  that service's ports only (kept hashed in `STORE/agent/relays.json`); the agent joins it to the published port.
+  The other PCs never get the central PC's token, and never learn each other but through the relay. `relay rm
+  SERVICE [--on PC]` removes the relay and takes the token back. TCP only; the service's PC needs its agent (SSH has
+  no door in). Real run (WSL; central Docker, the other PC an agent with Podman): a client on `lab` read `web`'s
+  answer by its name; after `relay rm`, nothing.
 - **Quota on another PC**: someone's computer, as this one is: by default cores - 1 and 75% of its memory;
   `terminal-ct --host PC quota --cpus N --memory GiB` sets it (`STORE/quota-PC.json`), never this PC's quota.
 - **Failover between PCs**: a stack service with `"spread": "nodes"` uses the other PCs that answer like VM nodes.

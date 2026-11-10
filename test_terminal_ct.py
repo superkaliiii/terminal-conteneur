@@ -2666,6 +2666,50 @@ class RemoteAgent(unittest.TestCase):
             self.assertEqual(os.stat(os.path.join(self.store, "agent", "cert.pem")).st_mode & 0o777, 0o600)
             self.assertEqual(os.stat(os.path.join(self.store, "agent", "token")).st_mode & 0o777, 0o600)
 
+    def test_relay(self):
+        """A relay: a token for one service's ports, bytes both ways with the port on the agent's address; a wrong
+        token, another port, or a revoked token gets nothing."""
+        echo = socket.create_server(("127.0.0.1", 0))
+        def serve():
+            while True:
+                try:
+                    c, _ = echo.accept()
+                except OSError:
+                    return
+                with c:
+                    while (d := c.recv(1024)):
+                        c.sendall(d.upper())
+        threading.Thread(target=serve, daemon=True).start()
+        port = echo.getsockname()[1]
+        grant = ct.agent_request(self.host, "POST", "/relay-grant", {"service": "web", "for": "pc2", "ports": [port]})
+        agent_port = self.srv.server_address[1]
+
+        def through(token, p=port):
+            a, b = socket.socketpair()
+            t = threading.Thread(target=ct._RELAY_NS["relay_one"],
+                                 args=(b, p, "127.0.0.1", agent_port, self.srv.fingerprint, token), daemon=True)
+            t.start()
+            a.settimeout(5)
+            try:
+                a.sendall(b"hello")
+                return a.recv(1024)
+            except OSError:
+                return b""
+            finally:
+                a.close()
+                t.join(5)
+        self.assertEqual(through(grant["token"]), b"HELLO")
+        self.assertEqual(through("x" * 43), b"")                            # a wrong token
+        self.assertEqual(through(grant["token"], port + 1 if port < 65535 else port - 1), b"")  # another port
+        with open(os.path.join(self.store, "agent", "relays.json")) as f:
+            self.assertNotIn(grant["token"], f.read())                        # kept hashed
+        ct.agent_request(self.host, "POST", "/relay-revoke", {"service": "web", "for": "pc2"})
+        self.assertEqual(through(grant["token"]), b"")                       # taken back
+        with self.assertRaisesRegex(RuntimeError, "401|wrong token"):        # grants are the central PC's alone
+            ct.agent_request(dict(self.host, token="y" * 43), "POST", "/relay-grant",
+                             {"service": "web", "for": "pc2", "ports": [port]})
+        echo.close()
+
     def test_ping_and_exec(self):
         self.assertEqual(ct.agent_request(self.host, "GET", "/ping")["tool"], "terminal-ct")
         n = ct.NodeRemote("pc1", self.host)
