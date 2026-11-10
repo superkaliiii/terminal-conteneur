@@ -1608,6 +1608,96 @@ class Installer(unittest.TestCase):
         with open(os.path.join(here, "pyproject.toml"), encoding="utf-8") as f:
             self.assertIn('version = { attr = "terminal_ct.VERSION" }', f.read())
 
+@unittest.skipIf(ct.WINDOWS, "unix sockets")
+class EngineApi(unittest.TestCase):
+    """K1: the hot engine calls through the Docker Engine API on a unix socket, the CLI for the rest."""
+    def setUp(self):
+        import http.server, socketserver
+        self.d = tempfile.mkdtemp()
+        self.sock = os.path.join(self.d, "e.sock")
+        self.seen = []
+        test = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def reply(self, code, body=None):
+                data = json.dumps(body).encode() if body is not None else b""
+                self.send_response(code)
+                if body is not None:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def do_GET(self):
+                test.seen.append(("GET", self.path))
+                p = self.path
+                if p == "/_ping":
+                    self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"OK")
+                elif p.startswith("/v1.41/containers/json"):
+                    self.reply(200, [{"Id": "aaa"}, {"Id": "bbb"}])
+                elif p.startswith("/v1.41/containers/aaa/json"):
+                    self.reply(200, {"Id": "aaa", "Name": "/tct-a", "SizeRw": 5 if "size=1" in p else None})
+                elif "/stats" in p:
+                    self.reply(200, {"cpu_stats": {"cpu_usage": {"total_usage": 10 ** 9 * (len(test.seen))}},
+                                     "memory_stats": {"usage": 3 * 2 ** 20, "limit": 2 ** 30, "stats": {"inactive_file": 2 ** 20}},
+                                     "pids_stats": {"current": 4}})
+                elif p.startswith("/v1.41/volumes"):
+                    self.reply(200, {"Volumes": [{"Name": "tct-a-data", "Mountpoint": "/v/a"}]})
+                else:
+                    self.reply(404, {"message": "No such object"})
+            def do_POST(self):
+                test.seen.append(("POST", self.path))
+                self.reply(204 if "/aaa/" in self.path else 404, None if "/aaa/" in self.path else {"message": "no such container"})
+            def do_DELETE(self):
+                test.seen.append(("DELETE", self.path))
+                self.reply(204)
+
+        class S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+        self.srv = S(self.sock, H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.env = unittest.mock.patch.dict(os.environ, {"DOCKER_HOST": "unix://" + self.sock})
+        self.env.start()
+        self.n = ct.Node("docker")
+        self.cli = unittest.mock.patch.object(ct.subprocess, "run", side_effect=AssertionError("no CLI expected"))
+
+    def tearDown(self):
+        self.env.stop(); self.srv.shutdown(); self.srv.server_close()
+
+    def test_hot_calls_go_through_the_api(self):
+        with self.cli:
+            self.assertEqual(self.n.run(["ps", "-a", "-q", "--filter", "label=terminal-ct.name"]).stdout.split(),
+                             ["aaa", "bbb"])
+            r = self.n.run(["inspect", "--type", "container", "--size", "aaa"])
+            self.assertEqual(json.loads(r.stdout)[0]["SizeRw"], 5)
+            self.assertIn("/v1.41/containers/aaa/json?size=1", [p for _, p in self.seen])
+            r = self.n.run(["inspect", "--type", "container", "aaa", "zzz"], check=False)  # one missing: like the CLI
+            self.assertEqual((r.returncode, len(json.loads(r.stdout))), (1, 1))
+            self.n.run(["start", "aaa"]); self.n.run(["stop", "-t", "3", "aaa"]); self.n.run(["rm", "-f", "aaa"])
+            self.assertIn(("POST", "/v1.41/containers/aaa/stop?t=3"), self.seen)
+            self.assertIn(("DELETE", "/v1.41/containers/aaa?force=1"), self.seen)
+            with self.assertRaisesRegex(SystemExit, "no such container"):
+                self.n.run(["start", "zzz"])
+            line = self.n.run(["stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}",
+                               "aaa"]).stdout.strip()
+            name, cpu, mem, pids = line.split("|")
+            self.assertEqual((name, pids, ct.parse_size(mem.split("/")[0])), ("aaa", "4", 2 * 2 ** 20))
+            self.assertGreater(float(cpu.rstrip("%")), 0)                  # two samples: a rate, not a total
+            self.assertEqual(self.n.run(["volume", "ls", "--format", "{{.Name}}\t{{.Mountpoint}}"]).stdout,
+                             "tct-a-data\t/v/a\n")
+
+    def test_anything_else_and_a_silent_socket_use_the_cli(self):
+        done = subprocess.CompletedProcess([], 0, "cli\n", "")
+        with unittest.mock.patch.object(ct.subprocess, "run", return_value=done) as run:
+            self.assertEqual(self.n.run(["exec", "aaa", "true"]).stdout, "cli\n")    # exec: the CLI's
+            self.srv.shutdown(); self.srv.server_close(); os.remove(self.sock)
+            self.assertEqual(self.n.run(["start", "aaa"]).stdout, "cli\n")        # the socket gone: the CLI
+        self.assertEqual(run.call_count, 2)
+        self.srv = type("Done", (), {"shutdown": lambda s: None, "server_close": lambda s: None})()
+        with unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_API": "0"}):
+            self.assertIsNone(ct.Node("docker").api())
+
+
 class ProjectsAndResume(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()

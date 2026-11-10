@@ -179,6 +179,110 @@
      "runs": 5
     }
    }
+  },
+  {
+   "tool": "terminal-ct 0.9.0",
+   "engine": "podman 5.4.2",
+   "host": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41 (WSL)",
+   "date": "2026-11-10",
+   "image": "alpine:3.20",
+   "results": {
+    "create": {
+     "median_ms": 1770.0,
+     "min_ms": 1686.0,
+     "max_ms": 1945.3,
+     "runs": 5
+    },
+    "start": {
+     "median_ms": 261.3,
+     "min_ms": 249.4,
+     "max_ms": 268.4,
+     "runs": 5
+    },
+    "exec_true": {
+     "median_ms": 709.5,
+     "min_ms": 671.3,
+     "max_ms": 757.9,
+     "runs": 5
+    },
+    "ls": {
+     "median_ms": 6.8,
+     "min_ms": 5.9,
+     "max_ms": 14.9,
+     "runs": 5
+    },
+    "dashboard_data": {
+     "median_ms": 660.0,
+     "min_ms": 477.0,
+     "max_ms": 781.4,
+     "runs": 5
+    },
+    "stop": {
+     "median_ms": 569.4,
+     "min_ms": 484.9,
+     "max_ms": 624.1,
+     "runs": 5
+    },
+    "rm": {
+     "median_ms": 1232.9,
+     "min_ms": 1181.2,
+     "max_ms": 1283.2,
+     "runs": 5
+    }
+   },
+   "note": "through the engine's API (K1); the CLI-only figures of the same day: TERMINAL_CT_API=0"
+  },
+  {
+   "tool": "terminal-ct 0.9.0",
+   "engine": "docker 26.1.5+dfsg1",
+   "host": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41 (WSL)",
+   "date": "2026-11-10",
+   "image": "alpine:3.20",
+   "results": {
+    "create": {
+     "median_ms": 527.7,
+     "min_ms": 519.4,
+     "max_ms": 550.2,
+     "runs": 5
+    },
+    "start": {
+     "median_ms": 344.2,
+     "min_ms": 331.8,
+     "max_ms": 388.6,
+     "runs": 5
+    },
+    "exec_true": {
+     "median_ms": 215.2,
+     "min_ms": 208.2,
+     "max_ms": 243.2,
+     "runs": 5
+    },
+    "ls": {
+     "median_ms": 2.4,
+     "min_ms": 1.6,
+     "max_ms": 3.4,
+     "runs": 5
+    },
+    "dashboard_data": {
+     "median_ms": 1656.1,
+     "min_ms": 1654.2,
+     "max_ms": 1666.2,
+     "runs": 5
+    },
+    "stop": {
+     "median_ms": 257.6,
+     "min_ms": 250.4,
+     "max_ms": 283.9,
+     "runs": 5
+    },
+    "rm": {
+     "median_ms": 334.3,
+     "min_ms": 318.0,
+     "max_ms": 345.4,
+     "runs": 5
+    }
+   },
+   "note": "through the engine's API (K1); the CLI-only figures of the same day: TERMINAL_CT_API=0"
   }
  ]
 }

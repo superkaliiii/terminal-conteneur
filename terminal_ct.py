@@ -87,6 +87,52 @@ def in_wsl():
         return False
 
 
+# ---------- the engine's API (K1): the hot calls over its unix socket, the CLI otherwise ----------
+# Each CLI call costs a process (0.3-0.7 s with Podman under WSL); the Docker Engine API, which Podman serves too,
+# answers the same in milliseconds. Node.run sends the calls below through it when a socket answers, and keeps the
+# CLI for everything else and whenever the API cannot be reached (any doubt: the CLI).
+API = "/v1.41"  # Docker 20.10+, Podman 3+ (its compatible API)
+
+
+class _UnixHTTP(http.client.HTTPConnection):
+    def __init__(self, path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self.path_ = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path_)
+
+
+def api_call(path, method, url, timeout=60, body=None):
+    """(status, decoded JSON or text) from the engine's API on that socket. OSError when it does not answer."""
+    c = _UnixHTTP(path, timeout)
+    try:
+        c.request(method, url, body=json.dumps(body) if body is not None else None,
+                  headers={"Content-Type": "application/json"} if body is not None else {})
+        r = c.getresponse()
+        data = r.read()
+        text = data.decode("utf-8", "replace")
+        if (r.getheader("Content-Type") or "").startswith("application/json") and data:
+            with contextlib.suppress(ValueError):
+                return r.status, json.loads(data)
+        return r.status, text
+    except (http.client.HTTPException, ValueError) as e:
+        raise OSError(f"engine API: {e}") from None
+    finally:
+        c.close()
+
+
+def _done(stdout="", code=0, stderr=""):
+    return subprocess.CompletedProcess([], code, stdout, stderr)
+
+
+def _api_error(status, reply, what):
+    msg = reply.get("message") if isinstance(reply, dict) else str(reply).strip()
+    return _done("", 1, f"Error: {msg or f'{what}: HTTP {status}'}")
+
+
 class Node:
     """Where containers run. v1: the local host; later a VM node (through its guest agent) or a remote machine,
     so every engine call goes through a node."""
@@ -120,7 +166,155 @@ class Node:
                 self._host = int(c), int(m) / 2 ** 30, root.strip()
         return self._host
 
+    def api(self):
+        """The engine's API socket when one answers (cached per Node), else None: then the CLI does everything."""
+        if "_api" not in self.__dict__:
+            self._api = None
+            if not WINDOWS and os.environ.get("TERMINAL_CT_API") != "0":
+                for path in self._api_sockets():
+                    with contextlib.suppress(OSError):
+                        if api_call(path, "GET", "/_ping", timeout=2)[0] == 200:
+                            self._api = path
+                            break
+        return self._api
+
+    def _api_sockets(self):
+        """Where this engine's API may be: what the user set, the usual sockets, else (Podman) a service of ours."""
+        var = os.environ.get("DOCKER_HOST" if self.engine == "docker" else "CONTAINER_HOST")
+        if var:  # theirs: only a unix one is ours to use (tcp, ssh: the CLI knows how)
+            return [var[len("unix://"):]] if var.startswith("unix://") else []
+        if self.engine == "docker":
+            return ["/var/run/docker.sock"]
+        run_dir = os.environ.get("XDG_RUNTIME_DIR") or ""
+        found = [p for p in (os.path.join(run_dir, "podman", "podman.sock") if run_dir else "",
+                             "/run/podman/podman.sock" if os.geteuid() == 0 else "") if p and os.path.exists(p)]
+        return found or [p for p in [self._podman_service(run_dir)] if p]
+
+    def _podman_service(self, run_dir):
+        """Start `podman system service` on a private socket (it stops itself after 10 idle minutes): rootless
+        Podman under WSL has no socket of its own. None when no private place for it."""
+        base = run_dir if run_dir and os.access(run_dir, os.W_OK) else STORE
+        path = os.path.join(base, f"tct-podman-{os.getuid()}.sock")
+        if len(path) > 100:  # a unix socket path's limit
+            return None
+        if not os.path.exists(path):
+            os.makedirs(base, exist_ok=True)
+            with contextlib.suppress(OSError):
+                subprocess.Popen([self.engine, "system", "service", "--time=600", f"unix://{path}"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+            for _ in range(30):
+                if os.path.exists(path):
+                    break
+                time.sleep(0.1)
+        return path
+
+    def _via_api(self, args, timeout):
+        """The reply of `ENGINE args` through the API, or None when it is not one of the calls handled here."""
+        sock = self.api()
+        if not sock:
+            return None
+        t = timeout or 60
+        q = urllib.parse.quote
+        if args[:4] == ["ps", "-a", "-q", "--filter"] and len(args) == 5 and args[4].startswith("label="):
+            filters = q(json.dumps({"label": [args[4][len("label="):]]}))
+            st, r = api_call(sock, "GET", f"{API}/containers/json?all=1&filters={filters}", t)
+            return _done("".join(c["Id"] + "\n" for c in r)) if st == 200 and isinstance(r, list) else None
+        if args[:3] == ["inspect", "--type", "container"]:
+            size = "--size" in args
+            names = [a for a in args[3:] if a != "--size"]
+            out, missing = [], []
+            for n in names:
+                st, r = api_call(sock, "GET", f"{API}/containers/{q(n, safe='')}/json" + ("?size=1" if size else ""), t)
+                if st == 200 and isinstance(r, dict):
+                    out.append(r)
+                elif st == 404:
+                    missing.append(n)
+                else:
+                    return None
+            return _done(json.dumps(out) if out else "[]", 1 if missing else 0,
+                         f"Error: no such container {', '.join(missing)}" if missing else "")
+        if args[0] in ("start", "stop") and (len(args) == 2 or args[1] == "-t" and len(args) == 4):
+            name, wait = args[-1], (args[2] if len(args) == 4 else None)
+            url = f"{API}/containers/{q(name, safe='')}/{args[0]}" + (f"?t={int(wait)}" if wait else "")
+            st, r = api_call(sock, "POST", url, t + (int(wait) if wait else 30))
+            return _done(name + "\n") if st in (204, 304) else _api_error(st, r, args[0]) if st in (404, 409, 500) else None
+        if args[:2] == ["rm", "-f"] and len(args) == 3:
+            st, r = api_call(sock, "DELETE", f"{API}/containers/{q(args[2], safe='')}?force=1", t)
+            return _done(args[2] + "\n") if st == 204 else _api_error(st, r, "rm") if st in (404, 409) else None
+        if args[:5] == ["network", "ls", "-q", "--filter", args[4] if len(args) == 5 else None] and \
+                args[4].startswith("label="):
+            filters = q(json.dumps({"label": [args[4][len("label="):]]}))
+            st, r = api_call(sock, "GET", f"{API}/networks?filters={filters}", t)
+            return _done("".join(n["Id"] + "\n" for n in r)) if st == 200 and isinstance(r, list) else None
+        if args[:2] == ["network", "inspect"] and len(args) > 2:
+            out = []
+            for n in args[2:]:
+                st, r = api_call(sock, "GET", f"{API}/networks/{q(n, safe='')}", t)
+                if st != 200 or not isinstance(r, dict):
+                    return None if st != 404 else _api_error(st, r, "network inspect")
+                out.append(r)
+            return _done(json.dumps(out))
+        if args == ["volume", "ls", "--format", "{{.Name}}\t{{.Mountpoint}}"]:
+            st, r = api_call(sock, "GET", f"{API}/volumes", t)
+            vols = (r or {}).get("Volumes") if st == 200 and isinstance(r, dict) else None
+            return _done("".join(f"{v['Name']}\t{v.get('Mountpoint', '')}\n" for v in vols or [])) \
+                if vols is not None else None
+        if args[:4] == ["stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}"]:
+            return self._api_stats(sock, args[4:], t)
+        if args[:2] in (["image", "inspect"], ["volume", "inspect"]) and len(args) == 3:
+            kind = "images" if args[0] == "image" else "volumes"
+            st, r = api_call(sock, "GET", f"{API}/{kind}/{q(args[2], safe='')}" + ("/json" if kind == "images" else ""), t)
+            if st == 200 and isinstance(r, dict):
+                return _done(json.dumps([r]))
+            return _api_error(st, r, f"{args[0]} inspect") if st == 404 else None
+        return None
+
+    def _api_stats(self, sock, names, timeout):
+        """`stats --no-stream` as the CLI prints it, from one-shot samples (no 1-2 s sampling wait): CPU % of one core
+        between two calls; a container first seen is sampled twice, 0.3 s apart."""
+        cpu = self.__dict__.setdefault("_cpu", {})
+        def sample(n):
+            st, r = api_call(sock, "GET", f"{API}/containers/{urllib.parse.quote(n, safe='')}/stats?stream=false&one-shot=true",
+                             timeout)
+            if st == 404:
+                return None
+            if st != 200 or not isinstance(r, dict):
+                raise OSError(f"stats: HTTP {st}")
+            return r, time.monotonic()
+        got = {n: sample(n) for n in names}
+        if any(r and n not in cpu for n, r in got.items()):  # no earlier sample to compare with
+            for n, r in got.items():
+                if r:
+                    cpu[n] = ((r[0].get("cpu_stats") or {}).get("cpu_usage") or {}).get("total_usage"), r[1]
+            time.sleep(0.3)
+            got = {n: sample(n) if r else None for n, r in got.items()}
+        lines = []
+        for n, r in got.items():
+            if not r:
+                continue
+            r, now = r
+            total = ((r.get("cpu_stats") or {}).get("cpu_usage") or {}).get("total_usage")
+            prev, cpu[n] = cpu.get(n), (total, now)
+            pct = (total - prev[0]) / ((now - prev[1]) * 1e9) * 100 \
+                if prev and prev[0] is not None and total is not None and now > prev[1] else 0.0
+            mem = r.get("memory_stats") or {}
+            inner = mem.get("stats") or {}
+            used = max(0, (mem.get("usage") or 0) - (inner.get("inactive_file") or inner.get("cache") or 0))
+            lines.append(f"{n}|{max(pct, 0):.2f}%|{used}B / {mem.get('limit') or 0}B|"
+                         f"{(r.get('pids_stats') or {}).get('current', '')}")
+        return _done("".join(l + "\n" for l in lines))
+
     def run(self, args, check=True, timeout=None, capture=True):
+        if capture and type(self) is Node:  # this PC's engine (a node or another PC has its own way in)
+            try:
+                r = self._via_api(list(args), timeout)
+            except OSError:  # the socket went away: the CLI, and no API for this Node from now on
+                self._api, r = None, None
+            if r is not None:
+                if check and r.returncode:
+                    raise SystemExit((r.stderr or f"{self.engine} {args[0]} failed").strip())
+                return r
         # uncaptured output (pull, build progress) goes to stderr: stdout is the JSON reply, or the MCP channel
         r = subprocess.run([self.engine, *args], text=True, timeout=timeout, encoding="utf-8", errors="replace",
                            **({"capture_output": True} if capture else {"stdout": sys.stderr}), **NO_WINDOW)
@@ -5990,6 +6184,9 @@ def doctor_checks():
             n = node()
             n.run(["ps", "-q"], timeout=60)
             check("engine", True, f"{n.engine} answers")
+            sock = n.api() if type(n) is Node else None
+            check("engine API", sock, f"through {sock}: calls in milliseconds" if sock else
+                  "not reachable: each call starts the CLI (slower)", required=False)
         except (SystemExit, subprocess.TimeoutExpired) as e:
             msg, fix = str(e), None
             low = msg.lower()
