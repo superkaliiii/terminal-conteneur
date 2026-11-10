@@ -837,6 +837,8 @@ class NodeRemote(NodeVM):
         if self.remote["url"].startswith("https://"):
             return agent_request(self.remote, "POST", "/exec", {"argv": argv, "timeout": timeout}, timeout + 30)
         cmd, target = self._ssh()
+        if self.remote.get("podman_conf"):  # a WSL there: Podman's iptables driver, as Node sets it here
+            argv = ["env", "CONTAINERS_CONF_OVERRIDE=" + self.remote["podman_conf"], *argv]
         try:
             r = subprocess.run([*cmd, "--", target, " ".join(shlex.quote(a) for a in argv)], capture_output=True,
                                text=True, encoding="utf-8", errors="replace", timeout=timeout + 30,
@@ -986,8 +988,8 @@ def host_add(name, url, fingerprint=None, token=None, engine=None):
                          f"not {url!r}") from None
     n = NodeRemote(name, h, 30)
     try:
-        r = n._exec(["uname", "-s"], 30)
-        kind = r["stdout"].strip()
+        r = n._exec(["uname", "-s", "-r"], 30)
+        kind, release = (r["stdout"].split() + ["", ""])[:2]
         if r["exit"] or kind not in ("Linux", "Darwin"):  # its commands are POSIX: sh, tar, /tmp
             raise SystemExit(f"host {name}: Linux or macOS only (found {kind or r['stderr'].strip()[:100]}); on "
                              "Windows run the agent inside WSL")
@@ -1013,6 +1015,15 @@ def host_add(name, url, fingerprint=None, token=None, engine=None):
             tried.append(f"{eng}: {(v.get('stderr') or 'no answer').strip()[:120]}")
         else:
             raise SystemExit(f"host {name}: no container engine works there ({'; '.join(tried)})")
+        if h["engine"] == "podman" and "microsoft" in release.lower() and h["url"].startswith("ssh://"):
+            # WSL's kernel lacks nftables pieces: every bridge container failed to start there over SSH (an agent
+            # sets this itself). A file of ours in that user's config, named on each call: their podman unchanged.
+            c = n._exec(["sh", "-c", 'd="$HOME/.config/terminal-ct" && mkdir -p "$d" && printf %s "$1" > '
+                         '"$d/podman-wsl.conf" && echo "$d/podman-wsl.conf"', "sh",
+                         '[network]\nfirewall_driver = "iptables"\n'], 30)
+            if c["exit"] or not c["stdout"].strip().startswith("/"):
+                raise SystemExit(f"host {name}: cannot write its Podman setting for WSL ({c['stderr'].strip()[:120]})")
+            h["podman_conf"] = c["stdout"].strip()
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         raise SystemExit(f"host {name}: {e}") from None
     with quota_lock("nodes"):

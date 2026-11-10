@@ -2,6 +2,8 @@ import base64, contextlib, hashlib, io, re, json, os, shutil, socket, ssl, struc
 
 import terminal_ct as ct
 
+REAL_REMOTE_EXEC = ct.NodeRemote._exec  # kept before the fakes replace it
+
 # the real tests' engines (TERMINAL_CT_REAL_ENGINES="docker" where Podman cannot set limits, e.g. a CI runner)
 REAL_ENGINES = tuple(os.environ.get("TERMINAL_CT_REAL_ENGINES", "podman docker").split())
 
@@ -1982,8 +1984,11 @@ class Hosts(unittest.TestCase):
             self.execs.append((node.name, argv))
             if node.name in self.down:
                 raise RuntimeError("agent https://pc: connection refused")
-            if argv == ["uname", "-s"]:
-                return {"exit": 0, "stdout": self.uname.get(node.name, "Linux") + "\n", "stderr": ""}
+            if argv == ["uname", "-s", "-r"]:
+                return {"exit": 0, "stdout": self.uname.get(node.name, "Linux 6.1.0") + "\n", "stderr": ""}
+            if argv[:2] == ["sh", "-c"] and "podman-wsl.conf" in argv[2]:  # host add's WSL setting there
+                self.pc_files[node.name + ":podman-wsl.conf"] = argv[-1]
+                return {"exit": 0, "stdout": "/home/me/.config/terminal-ct/podman-wsl.conf\n", "stderr": ""}
             if argv == ["true"]:
                 return {"exit": 0, "stdout": "", "stderr": ""}
             if argv[:2] == ["sh", "-lc"] and argv[3] == "terminal-vm" and ct.VM_FIND in argv[2]:  # terminal-vm there
@@ -2091,7 +2096,7 @@ class Hosts(unittest.TestCase):
         self.down.add("off")
         with self.assertRaisesRegex(SystemExit, "connection refused"):
             self.add("off")
-        self.assertIn(("win", ["uname", "-s"]), self.execs)
+        self.assertIn(("win", ["uname", "-s", "-r"]), self.execs)
         self.assertEqual(ct._nodes()["nodes"], {})  # nothing registered by a failed add
         with self.assertRaisesRegex(SystemExit, "host add NAME"):
             self.cli("host", "add", "pc1")
@@ -2243,6 +2248,26 @@ class Hosts(unittest.TestCase):
                      ["--host", "pc1", "stack", "ls"]):
             with self.assertRaisesRegex(SystemExit, "does not apply to"):
                 ct.main(argv)
+
+    def test_podman_in_wsl_over_ssh(self):
+        """Another PC's WSL with Podman, over SSH: its bridge containers need the iptables driver (as here)."""
+        self.podman |= {"wsl", "lin"}
+        self.uname["wsl"] = "Linux 6.6.87.2-microsoft-standard-WSL2"
+        self.cli("host", "add", "wsl", "ssh://me@wsl")
+        self.cli("host", "add", "lin", "ssh://me@lin")
+        hosts = ct._hosts()
+        self.assertEqual(hosts["wsl"]["podman_conf"], "/home/me/.config/terminal-ct/podman-wsl.conf")
+        self.assertIn('firewall_driver = "iptables"', self.pc_files["wsl:podman-wsl.conf"])
+        self.assertNotIn("podman_conf", hosts["lin"])  # a plain Linux: nothing written there
+        seen = []
+        with unittest.mock.patch.object(ct.NodeRemote, "_exec", REAL_REMOTE_EXEC), \
+                unittest.mock.patch.object(ct.subprocess, "run", lambda cmd, **k: seen.append(cmd) or
+                                           subprocess.CompletedProcess(cmd, 0, "", "")):
+            ct.NodeRemote("wsl", hosts["wsl"])._exec(["podman", "start", "tct-a"], 30)
+            ct.NodeRemote("lin", hosts["lin"])._exec(["podman", "start", "tct-a"], 30)
+        self.assertEqual(seen[0][-1], "env CONTAINERS_CONF_OVERRIDE=/home/me/.config/terminal-ct/podman-wsl.conf "
+                                      "podman start tct-a")
+        self.assertEqual(seen[1][-1], "podman start tct-a")
 
     def test_engine_of_another_pc(self):
         self.podman.add("pod")
