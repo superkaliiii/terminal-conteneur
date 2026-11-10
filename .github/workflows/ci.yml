@@ -76,6 +76,14 @@ jobs:
           npm install -g --prefix "$RUNNER_TEMP/npm" "$RUNNER_TEMP"/terminal-ct-*.tgz
           "$RUNNER_TEMP/npm/bin/terminal-ct" version
           test -f "$("$RUNNER_TEMP/npm/bin/terminal-ct" skills path)"
+      - name: System packages
+        run: |
+          sudo apt-get install -y -qq rpm >/dev/null
+          sh packaging/build.sh "$RUNNER_TEMP/pkgs"
+          sudo apt-get install -y -qq "$RUNNER_TEMP"/pkgs/*.deb >/dev/null
+          /usr/bin/terminal-ct version
+          test -f "$(/usr/bin/terminal-ct skills path)"
+          ls "$RUNNER_TEMP"/pkgs/*.rpm
       - name: Install script
         run: |
           sh install.sh --no-deps --no-mcp --prefix "$RUNNER_TEMP/sh"

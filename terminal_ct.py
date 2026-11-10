@@ -6015,6 +6015,10 @@ def doctor_checks():
     check("python", sys.version_info >= (3, 9), sys.version.split()[0], _pkg("python3"))
     if in_wsl():
         if engines["podman"]:
+            if os.path.exists("/etc/fedora-release") or os.path.exists("/etc/redhat-release"):
+                check("wsl distribution", False, "Fedora's Podman networking fails under WSL (its netavark has no "
+                      "iptables driver, and WSL's kernel refuses its nftables rules)", "use a Debian, Ubuntu or Alpine "
+                      "WSL distribution (terminal-ct's Windows installer makes an Alpine one)")
             ipt = shutil.which("iptables") or os.path.exists("/usr/sbin/iptables") or os.path.exists("/sbin/iptables")
             check("iptables", ipt, "for Podman's firewall driver under WSL" if ipt else
                   "not found: Podman under WSL cannot start a container with a network", _pkg("iptables"))

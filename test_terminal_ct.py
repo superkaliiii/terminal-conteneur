@@ -1582,6 +1582,9 @@ class Installer(unittest.TestCase):
         ps1 = "# ===== common to terminal-ct and terminal-vm's install.ps1 ====="
         mine, theirs = self.SH.replace("install.sh", "install.ps1"), other.replace("install.sh", "install.ps1")
         self.assertEqual(body(mine, ps1), body(theirs, ps1), "the Windows installers' common part differs")
+        pk = "# ===== common to terminal-ct and terminal-vm's packaging/build.sh ====="
+        mine, theirs = (os.path.join(os.path.dirname(p), "packaging", "build.sh") for p in (self.SH, other))
+        self.assertEqual(body(mine, pk), body(theirs, pk), "packaging/build.sh's common part differs")
 
     @unittest.skipUnless(ct.WINDOWS and shutil.which("powershell"), "Windows PowerShell")
     def test_ps1_parses(self):
