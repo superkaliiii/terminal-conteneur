@@ -175,7 +175,7 @@ runs what it is sent (engine calls, file copies, terminal-vm). Another PC is a n
   serves it over HTTPS (port 7173, `TERMINAL_CT_AGENT_PORT`) with a certificate made once (openssl, kept in
   `STORE/agent/`) and a token (owner only). It prints the URL, the certificate's SHA-256 and the token, and the
   `host add` line to type on the central PC. Only an IP is accepted for `--listen` (default 127.0.0.1: nothing on the
-  network). It runs commands as its user (argv, no shell), at most a few connections at once, and logs each one to
+  network). It runs commands as its user (argv, no shell), 4 connections at once per address (64 in all), and logs each one to
   `STORE/agent/agent.log` (bounded). `--rotate` makes a new token: restart a running agent for it to take effect,
   then `host rm` + `host add` on the central PC. The token is printed: when the agent runs as a service, its log
   holds it.

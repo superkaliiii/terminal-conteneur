@@ -40,7 +40,7 @@ Global: --engine docker|podman (default: TERMINAL_CT_ENGINE, else podman if inst
 """
 import argparse, base64, calendar, collections, contextlib, hashlib, http.server, io, json, os, platform, queue, re, secrets, \
     shlex, shutil, socket, socketserver, struct, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, webbrowser, zlib
-import importlib.util, ipaddress, http.client, ssl
+import importlib.util, ipaddress, http.client, signal, ssl
 
 VERSION = "0.9.0"
 WINDOWS = os.name == "nt"
@@ -300,8 +300,9 @@ class NodeVM(Node):
                         _tar(src, base, os.path.join(t, "x.tar"))
                         self.copy("push", os.path.join(t, "x.tar"), f"{tmp}/x.tar")  # beside in/: any name is free
                     self.sh(f"tar -xf {tmp}/x.tar -C {tmp}/in", timeout=600)
-                else:
-                    self.copy("push", src, f"{tmp}/in/{base}")
+                else:  # a fixed name across scp (an old scp lets the remote shell read the path), then its own
+                    self.copy("push", src, f"{tmp}/f")
+                    self.sh(f"mv {tmp}/f {q(f'{tmp}/in/{base}')}", timeout=30)
                 self.sh(f"{self.engine} cp -a {q(f'{tmp}/in/{base}')} {q(f'{container}:{dest}')}", timeout=600)
                 return
             self.sh(f"{self.engine} cp {q(f'{container}:{src}')} {tmp}/out", timeout=600)
@@ -464,14 +465,21 @@ class _AgentHandler(http.server.BaseHTTPRequestHandler):
         except (ValueError, TypeError, KeyError):
             return self._reply(400, {"error": "exec wants {argv: [strings], timeout: 1-3600 s, stdin?: string}"})
         _agent_log(self.client_address[0], "exec " + " ".join(argv)[:200])
+        group = {"start_new_session": True} if hasattr(os, "killpg") else {}  # a timeout ends its children too
         try:
-            r = subprocess.run(argv, input=stdin, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                               timeout=timeout, stdin=None if stdin is not None else subprocess.DEVNULL, **NO_WINDOW)
-        except subprocess.TimeoutExpired:
-            return self._reply(504, {"error": f"{argv[0]} timed out ({timeout:g} s)"})
+            p = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                 errors="replace", **group, **NO_WINDOW)
         except OSError as e:
             return self._reply(200, {"exit": 127, "stdout": "", "stderr": f"{argv[0]}: {e.strerror or e}"})
-        self._reply(200, {"exit": r.returncode, "stdout": r.stdout, "stderr": r.stderr})
+        try:
+            out, err = p.communicate(stdin, timeout=timeout)
+        except subprocess.TimeoutExpired:  # sh -c "tar ... && podman build": the build must not go on alone
+            with contextlib.suppress(OSError):
+                os.killpg(p.pid, signal.SIGKILL) if group else p.kill()
+            p.communicate()
+            return self._reply(504, {"error": f"{argv[0]} timed out ({timeout:g} s)"})
+        self._reply(200, {"exit": p.returncode, "stdout": out, "stderr": err})
 
     def _push(self, path, n):
         tmp = f"{path}.tct-{secrets.token_hex(4)}"  # whole or not at all: a cut connection leaves no half file
@@ -505,6 +513,7 @@ def agent_serve(listen="127.0.0.1", port=None):
     srv = (_AgentServer6 if ip.version == 6 else _AgentServer)((str(ip), AGENT_PORT if port is None else port),
                                                                _AgentHandler)
     srv.slots = threading.BoundedSemaphore(AGENT_CONNECTIONS)
+    srv.per_address = 4  # one host on the network cannot take every slot and starve the central PC's calls
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
     srv.token, srv.fingerprint = token, fp
     return srv
@@ -605,7 +614,10 @@ class NodeRemote(NodeVM):
             return super().free_bytes("/")  # PC's own disk then; upgrade: read that VM's space (docker system df)
 
     def _ssh(self, scp=False):
-        u, port = ssh_target(self.remote["url"])
+        try:
+            u, port = ssh_target(self.remote["url"])
+        except (ValueError, KeyError):  # a hosts.json edited by hand: an unreachable PC, as for NodeVM
+            raise RuntimeError(f"{self.name}: bad address in hosts.json (host rm, then host add)") from None
         port = ["-P" if scp else "-p", str(port)] if port else []
         return ["scp" if scp else "ssh", "-q" if scp else "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                 *port], (f"{u.username}@{u.hostname}" if u.username else u.hostname)
@@ -2095,6 +2107,7 @@ SERVICE_KEYS = {"image", "cmd", "replicas", "cpus", "memory_gb", "desktop", "wid
 RECREATE_KEYS = ("image", "cmd", "desktop", "width", "height", "sandbox", "internet", "networks", "ports")  # cpus, memory: live
 RESTARTS = ("always", "on-failure", "never")
 TICK = 3  # seconds between the daemon's passes
+PASS = [None]  # when the daemon's current pass began (None outside the daemon: each reconcile is its own pass)
 BACKOFF_MAX = 300
 
 
@@ -2456,7 +2469,16 @@ def _reconcile(s, st, now):
     on_nodes = any(c.get("node") or c.get("spread") for c in s["services"].values()) or \
         any(k.startswith(name + "-") for k in placement)  # it uses nodes, or did
     up = nodes_up() if on_nodes else {}
-    fails = st.setdefault("-nodes", {})  # failed listings in a row per node ("-": never a container's name)
+    fails = st.setdefault("-nodes", {})  # failed passes in a row per node ("-": never a container's name)
+    tick = PASS[0] or now  # the daemon's pass: every stack of one pass sees the same failure, counted once
+
+    def miss(n):
+        v = fails.get(n)
+        count, at = v if isinstance(v, list) else [v or 0, None]
+        if at != tick:
+            count += 1
+        fails[n] = [count, tick]
+        return count
     for n, ok in up.items():
         if ok:
             try:
@@ -2466,11 +2488,9 @@ def _reconcile(s, st, now):
                 for k, c in found.items():
                     have[k].append((c, n))
             except SystemExit:  # VM running, its agent or Docker not answering: a hiccup, or frozen
-                fails[n] = fails.get(n, 0) + 1
-                up[n] = False if fails[n] >= 3 else None  # None: left as it is this pass; down from the third
+                up[n] = False if miss(n) >= 3 else None  # None: left as it is this pass; down from the third
         elif ok is False and is_host(n):  # another PC not answering: Wi-Fi, sleep, an agent restarting, until the
-            fails[n] = fails.get(n, 0) + 1  # third pass in a row (moving a replica starts it with an empty /data)
-            up[n] = False if fails[n] >= 3 else None
+            up[n] = False if miss(n) >= 3 else None  # third pass in a row (moving a replica starts it with an empty /data)
     hosts = {n for n, i in _nodes()["nodes"].items() if i.get("kind") == "host"}
     may = up if owner != "agent" else {n: v for n, v in up.items()  # an agent: other PCs the user approved only
                                        if n not in hosts or n in s.get("approved_hosts", ())}
@@ -2858,6 +2878,7 @@ def daemon(cmd="status"):
         threading.Thread(target=web_serve, daemon=True).start()
         event("daemon_started", detail=f"pid {os.getpid()}")
         while not os.path.exists(_daemon_file("stop")):
+            PASS[0] = time.time()
             for name in stacks():
                 try:
                     s = load_stack(name)
@@ -3808,10 +3829,6 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             if method == "GET" and u.path == "/api/session":
                 return self._send(200, "application/json", web_session(who))
             ctype, out = web_api(method, u.path, dict(urllib.parse.parse_qsl(u.query)), body)
-            if who[1] == "read" and isinstance(out, dict) and isinstance(out.get("desired"), dict):
-                out = dict(out, desired=dict(out["desired"], services={  # a stack's env holds secrets: full only
-                    k: {**v, "env": "(hidden: read only)"} if isinstance(v, dict) and v.get("env") else v
-                    for k, v in (out["desired"].get("services") or {}).items()}))
             if method == "POST":
                 _web_act_log(who[0], addr, u.path, body)
             self._send(200, ctype, out)
@@ -5833,6 +5850,9 @@ def main(argv=None):
         raise SystemExit("--engine or --node, not both (a node runs Docker)")
     if o.engine:
         NODE = Node(pick_engine(o.engine))
+    elif o.node and o.cmd in ("apply", "stack", "scale"):  # a stack places its replicas itself (node, spread)
+        raise SystemExit(f'--node/--host does not apply to {o.cmd}: put "node": "{o.node}" (or "spread": "nodes") '
+                         "on the stack's services")
     elif o.node and o.cmd != "host":
         NODE = node_named(o.node)
     elif o.cmd != "node" and isinstance(getattr(o, "name", None), str) and o.name in _nodes()["placement"]:

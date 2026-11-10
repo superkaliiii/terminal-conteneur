@@ -787,7 +787,7 @@ class Phase8(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "7e5a6d078fad6b5a27d96b0dcc889ea461941444dc39d7d642a5ff2ce69268eb"
+    SHARED_SHA = "387455b4b6b8816aeb0bf16492484b9f6a60a0c710062f2abb0d2ac2fde86662"
 
     @staticmethod
     def block(path):
@@ -1160,7 +1160,8 @@ class Nodes(unittest.TestCase):
             f.write(b"hello")
         self.cli("push", "web", src, "/data/")                                   # routed to n1 by its placement
         pushed = [c for c in self.vm_calls if c[0] == "push"][-1]
-        self.assertRegex(pushed[3], r"^/tmp/tct-\w+/in/notes\.txt$")                # inside the private folder
+        self.assertRegex(pushed[3], r"^/tmp/tct-\w+/f$")                 # inside the private folder, a fixed name
+        self.assertTrue(any(re.match(r"mv /tmp/tct-\w+/f /tmp/tct-\w+/in/notes\.txt$", c) for c in self.shell))
         self.assertTrue(any(re.match(r"docker cp -a /tmp/tct-\w+/in/notes\.txt tct-web:/data/$", c) for c in self.shell))
         self.cli("pull", "web", "/data/notes.txt", back)
         with open(back, "rb") as f:
@@ -1855,6 +1856,36 @@ class Hosts(unittest.TestCase):
         ct.apply({"stack": "desk", "services": {"d": {"image": "alpine:3.20", "spread": "nodes", "desktop": True}}})
         self.assertNotIn("desk-d-1", ct._nodes()["placement"])  # never sent to another PC
 
+    def test_one_silent_pc_counts_once_per_daemon_pass(self):
+        """Review: each stack of a pass saw the same silent PC and added one miss: 3 stacks failed over at once."""
+        self.add("pc1"); self.add("pc2", "https://192.168.1.21:7173")
+        names = ["a", "b", "c"]
+        for n in names:
+            ct.apply({"stack": n, "services": {"w": {"image": "alpine:3.20", "replicas": 2, "spread": "nodes"}}})
+        on_pc2 = lambda: sorted(k for k, v in ct._nodes()["placement"].items() if v == "pc2")
+        before = on_pc2()
+        self.assertEqual(len(before), 3)
+        self.down.add("pc2")
+        try:
+            for p in (1, 2):  # two daemon passes over the three stacks: a hiccup, nothing moves
+                ct.PASS[0] = 1000.0 + p
+                for n in names:
+                    ct.reconcile(n)
+                self.assertEqual(on_pc2(), before, f"pass {p}")
+            ct.PASS[0] = 1003.0
+            for n in names:
+                ct.reconcile(n)
+            self.assertEqual(on_pc2(), [])                                       # the third pass: all moved
+        finally:
+            ct.PASS[0] = None
+
+    def test_stacks_refuse_node_option(self):
+        self.add("pc1")
+        for argv in (["--host", "pc1", "apply", "x.json"], ["--node", "pc1", "scale", "s", "w", "2"],
+                     ["--host", "pc1", "stack", "ls"]):
+            with self.assertRaisesRegex(SystemExit, "does not apply to"):
+                ct.main(argv)
+
     def test_engine_of_another_pc(self):
         self.podman.add("pod")
         self.assertEqual(self.add("pod", "https://10.0.0.7:7173")["engine"], "podman")   # Podman first, as here
@@ -2081,12 +2112,8 @@ class WebSession(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "web user add NAME"):
             ct.web_cli(["users"])
 
-    def test_read_role_sees_no_secret_and_forges_no_log_line(self):
+    def test_read_role_forges_no_log_line(self):  # a stack has no env field: read sees it all, as documented
         bob, ann = ct.web_user("add", "bob", role="read"), ct.web_user("add", "ann", role="full")
-        s, r = self.call(bob["token"], path="/api/stack?name=s")
-        self.assertEqual(r["desired"]["services"], {"db": {"env": "(hidden: read only)"}, "web": {"image": "nginx"}})
-        self.assertEqual(self.call(ann["token"], path="/api/stack?name=s")[1]["desired"]["services"]["db"]["env"],
-                         {"PW": "secret"})                                     # full: as it is
         forged = "x\n2026-11-10T10:00:00  owner  127.0.0.1  rm  db" + "y" * 5000
         self.call(bob["token"], "POST", "/api/do", {"op": "stop", "name": forged})
         a = ct.web_actions(1)[0]
