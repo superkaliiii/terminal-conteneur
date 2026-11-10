@@ -1,0 +1,28 @@
+{
+  "name": "terminal-ct",
+  "version": "0.9.0",
+  "description": "Containers with a desktop and a shell, for people and computer-use agents: a CLI and an MCP server.",
+  "bin": {
+    "terminal-ct": "npm/terminal-ct.js"
+  },
+  "files": [
+    "terminal_ct.py",
+    "skills/terminal-ct/SKILL.md",
+    "npm/terminal-ct.js",
+    "README.md"
+  ],
+  "keywords": [
+    "containers",
+    "podman",
+    "docker",
+    "mcp",
+    "agents",
+    "computer-use",
+    "desktop"
+  ],
+  "homepage": "https://github.com/superkaliiii/terminal-conteneur",
+  "author": "superkaliiii",
+  "engines": {
+    "node": ">=16"
+  }
+}

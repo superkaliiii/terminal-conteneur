@@ -48,5 +48,36 @@ jobs:
         run: |
           python terminal_ct.py --engine docker quota --cpus 8 --memory 8 --containers 16
           python terminal_ct.py --engine docker bench --runs 5
+  packages:
+    # the PyPI and npm packages: built, installed apart, run (published only at a release)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: PyPI package
+        run: |
+          python -m pip install -q build
+          python -m build --outdir "$RUNNER_TEMP/dist" .
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q "$RUNNER_TEMP"/dist/*.whl
+          "$RUNNER_TEMP/venv/bin/terminal-ct" version
+          test -f "$("$RUNNER_TEMP/venv/bin/terminal-ct" skills path)"
+      - name: npm package
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP"
+          npm install -g --prefix "$RUNNER_TEMP/npm" "$RUNNER_TEMP"/terminal-ct-*.tgz
+          "$RUNNER_TEMP/npm/bin/terminal-ct" version
+          test -f "$("$RUNNER_TEMP/npm/bin/terminal-ct" skills path)"
       - name: Install script
-        run: sh install.sh --prefix "$RUNNER_TEMP/tct" && "$RUNNER_TEMP/tct/bin/terminal-ct" skills path
+        run: |
+          sh install.sh --no-deps --no-mcp --prefix "$RUNNER_TEMP/sh"
+          "$RUNNER_TEMP/sh/bin/terminal-ct" version
+          sh install.sh --uninstall --no-mcp --prefix "$RUNNER_TEMP/sh"

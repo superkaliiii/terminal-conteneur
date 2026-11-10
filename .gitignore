@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .omc/
+*.egg-info/
+build/
+dist/
+*.tgz

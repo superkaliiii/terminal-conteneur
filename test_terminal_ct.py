@@ -1592,6 +1592,13 @@ class Installer(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "0", r.stdout + r.stderr)
 
 
+    def test_packages_carry_the_tools_version(self):
+        here = os.path.dirname(os.path.abspath(ct.__file__))
+        with open(os.path.join(here, "package.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["version"], ct.VERSION, "set package.json's version to VERSION")
+        with open(os.path.join(here, "pyproject.toml"), encoding="utf-8") as f:
+            self.assertIn('version = { attr = "terminal_ct.VERSION" }', f.read())
+
 class ProjectsAndResume(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()

@@ -5924,7 +5924,9 @@ def bench(runs=10, desktop=False):
             "results": {k: _summary(v) for k, v in times.items()}, **extra}
 
 
-SKILL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "terminal-ct", "SKILL.md")
+SKILL = next((p for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "terminal-ct", "SKILL.md"),
+                          os.path.join(sys.prefix, "share", "terminal-ct", "skills", "terminal-ct", "SKILL.md"))  # a pip/pipx/uvx install
+              if os.path.isfile(p)), os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills", "terminal-ct", "SKILL.md"))
 
 
 def skills(cmd, dest=None):

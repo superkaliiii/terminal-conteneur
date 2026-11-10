@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terminal-ct"
+dynamic = ["version"]
+description = "Containers with a desktop and a shell, for people and computer-use agents: a CLI and an MCP server."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "superkaliiii" }]
+keywords = ["containers", "podman", "docker", "mcp", "agents", "computer-use", "desktop"]
+classifiers = ["Programming Language :: Python :: 3", "Environment :: Console", "Topic :: System :: Emulators"]
+
+[project.urls]
+Homepage = "https://github.com/superkaliiii/terminal-conteneur"
+
+[project.scripts]
+terminal-ct = "terminal_ct:main"
+
+[tool.setuptools]
+py-modules = ["terminal_ct"]
+
+[tool.setuptools.dynamic]
+version = { attr = "terminal_ct.VERSION" }
+
+[tool.setuptools.data-files]  # where the tool looks for its skill when installed by pip, pipx or uvx
+"share/terminal-ct/skills/terminal-ct" = ["skills/terminal-ct/SKILL.md"]
