@@ -1,0 +1,2 @@
+# shell scripts run in WSL from a Windows checkout too: never CRLF
+*.sh text eol=lf
