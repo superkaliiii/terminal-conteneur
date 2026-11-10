@@ -1408,6 +1408,80 @@ class SnapshotsAndClones(unittest.TestCase):
                           lambda m, c: (_ for _ in ()).throw(RuntimeError(c)))
 
 
+class Descriptions(unittest.TestCase):
+    """Phase 12: one line on each object, central, changeable; the agent's own free, the user's with approval."""
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
+        self.asked = []
+        self.approve = AgentAuthority.approve.__get__(self)
+        self.refuse = AgentAuthority.refuse.__get__(self)
+        p = unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test")  # no background process
+        p.start(); self.addCleanup(p.stop)
+
+    def cli(self, *argv):
+        with contextlib.redirect_stdout(io.StringIO()):
+            ct.main(list(argv))
+
+    def test_cli_sets_shows_and_rm_forgets(self):
+        self.cli("create", "web", "--description", "nginx for the docs site")
+        self.assertEqual(ct.normalize(ct.find("web"))["description"], "nginx for the docs site")
+        self.cli("net", "create", "lab", "--description", "test bench")
+        self.assertEqual(ct.networks()["lab"]["description"], "test bench")
+        self.cli("describe", "container", "web", "serves the docs")
+        self.assertEqual(ct.dashboard_data()["rows"][0]["description"], "serves the docs")
+        self.assertIn("serves the docs", ct.dashboard_text(ct.dashboard_data(), width=200))
+        self.cli("describe", "project", "default", "the docs")
+        self.assertEqual(ct.project_status()["description"], "the docs")
+        for bad in ("two\nlines", "x" * 201):
+            with self.assertRaisesRegex(SystemExit, "one line of at most 200"):
+                ct.main(["create", "bad", "--description", bad])
+        self.assertNotIn("tct-bad", self.n.objects)                       # refused before anything was made
+        with self.assertRaisesRegex(SystemExit, "no network 'nope'"):
+            ct.describe("net", "nope", "x")
+        with self.assertRaisesRegex(SystemExit, "no node named 'n1'"):
+            ct.describe("node", "n1", "x")
+        quiet(ct.rm, "web"); ct.net_rm("lab")
+        self.assertEqual(ct.descriptions(), {"project:default": "the docs"})
+        quiet(ct.create, "web")                                           # a new one of that name says nothing
+        self.assertNotIn("description", ct.normalize(ct.find("web")))
+
+    def test_stack_service_description_recreates_nothing(self):
+        st = {"stack": "s", "services": {"api": {"image": "debian:stable-slim", "description": "the API"}}}
+        ct.apply(st); ct.reconcile("s")
+        before = ct.find("s-api-1")["Id"]
+        self.assertEqual(ct.normalize(ct.find("s-api-1"))["description"], "the API")
+        st["services"]["api"]["description"] = "the public API"
+        ct.apply(st); ct.reconcile("s")
+        self.assertEqual(ct.find("s-api-1")["Id"], before)
+        self.assertEqual(ct.stack_show("s")["services"]["api"]["description"], "the public API")
+        with self.assertRaisesRegex(SystemExit, "one line"):
+            ct.check_stack({"stack": "s", "services": {"api": {"description": 5}}})
+
+    def test_agent_free_on_its_own_asks_for_the_users(self):
+        ct.agent_call("ct_create", {"name": "job", "description": "a build"}, self.refuse)
+        ct.agent_call("net_create", {"net": "mine", "description": "my bench"}, self.refuse)
+        ct.agent_call("describe", {"kind": "container", "name": "job", "description": "the build"}, self.refuse)
+        ct.agent_call("describe", {"kind": "net", "name": "mine", "description": ""}, self.refuse)
+        self.assertEqual(self.asked, [])
+        self.assertEqual(ct.descriptions(), {"container:job": "the build"})
+        quiet(ct.create, "theirs"); ct.net_create("ours")
+        with self.assertRaisesRegex(RuntimeError, "terminal-ct describe container theirs 'the db'"):
+            ct.agent_call("describe", {"kind": "container", "name": "theirs", "description": "the db"}, self.refuse)
+        for kind, name in (("container", "theirs"), ("net", "ours"), ("project", "default")):
+            ct.agent_call("describe", {"kind": kind, "name": name, "description": "x"}, self.approve)
+        self.assertEqual(len(self.asked), 3)
+        ct.agent_call("describe", {"kind": "project", "name": "lab/web", "description": "mine"}, self.refuse,
+                      project="lab")                                      # its server's project: its own
+        quiet(ct.create, "other", project="beta")
+        with self.assertRaisesRegex(SystemExit, "no container named 'other'"):
+            ct.agent_call("describe", {"kind": "container", "name": "other", "description": "x"}, self.approve,
+                          project="lab")
+        with self.assertRaisesRegex(SystemExit, "not this agent's project"):
+            ct.agent_call("describe", {"kind": "project", "name": "beta", "description": "x"}, self.approve,
+                          project="lab")
+
+
 class ProjectsAndResume(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
@@ -1841,6 +1915,20 @@ class Hosts(unittest.TestCase):
         self.assertEqual((ct._hosts(), ct._nodes()["nodes"]), ({}, {}))
         with self.assertRaisesRegex(SystemExit, "no host named"):
             self.cli("host", "rm", "pc1")
+
+    def test_descriptions_of_pcs_and_their_containers(self):
+        with unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_AGENT_TOKEN": "t" * 43}):
+            self.cli("host", "add", "pc1", "https://192.168.1.20:7173", "--fingerprint", self.FP,
+                     "--description", "the lab PC upstairs")
+        self.cli("--host", "pc1", "create", "web", "--description", "built on pc1")
+        self.assertEqual(self.cli("host", "ls")[0]["description"], "the lab PC upstairs")
+        self.assertEqual({c["name"]: c.get("description") for c in self.cli("ls")}, {"web": "built on pc1"})
+        self.cli("describe", "container", "web", "routed to pc1")               # by its placement
+        self.assertEqual(ct.description("container", "web"), "routed to pc1")
+        with self.assertRaisesRegex(SystemExit, "no node named 'pc1'"):
+            ct.describe("node", "pc1", "x")                                     # a PC, not a node
+        self.cli("host", "rm", "pc1", "--force")
+        self.assertEqual(ct.descriptions(), {})
 
     def test_spread_counts_other_pcs(self):
         self.add("pc1"); self.add("pc2", "https://192.168.1.21:7173")
