@@ -1695,8 +1695,8 @@ def volume_sizes():
     return {p[0]: parse_size(" ".join(p[2:])) for p in (r.split() for r in rows) if len(p) >= 3}
 
 
-def quota_usage(disk=True):
-    infos = raw_containers(size=disk)
+def quota_usage(disk=True, infos=None):
+    infos = raw_containers(size=disk) if infos is None else infos
     use = dict.fromkeys(QUOTA_KEYS, 0)
     for c in infos:
         if running(c):
@@ -1782,8 +1782,8 @@ def quota_check(add):
                          "or the user raises the quota: terminal-ct quota --cpus/--memory/--disk/--containers")
 
 
-def quota(set_=None):
-    """Show the quota and its use, or (user only) change it."""
+def quota(set_=None, infos=None):
+    """Show the quota and its use, or (user only) change it. infos: raw_containers(size=True), already read."""
     if set_ and any(v is not None for v in set_.values()):
         if type(node()) is NodeVM:
             raise SystemExit("a VM node's quota is its size (terminal-vm); set the quota of this PC, or of another "
@@ -1795,7 +1795,7 @@ def quota(set_=None):
             stored.update({k: v for k, v in set_.items() if v is not None})
             with open(_quota_path(), "w") as f:
                 json.dump(stored, f)
-    use = quota_usage()
+    use = quota_usage(infos=infos)
     lim, chosen = quota_limits(use)
     return {k: {"limit": lim[k], "used": round(use[k], 2), "free": round(lim[k] - use[k], 2),
                 "source": "user" if chosen[k] else "host default"} for k in QUOTA_KEYS}
@@ -3138,6 +3138,121 @@ def _poll_keys(timeout=0.2):
     if not select.select([fd], [], [], timeout)[0]:
         return []
     return parse_input(os.read(fd, 1024).decode("utf-8", "replace"))
+
+
+# ---------- infra: the map an agent reads first (phase 12) ----------
+INFRA_RULES = ("managed: true marks what the agent runs without asking (its own containers, sandboxes the user left "
+               "offline). Anything else needs the user's approval: the user's containers, networks, nodes and PCs, "
+               "internet, an image not here yet, another PC for an agent's stack (approved_for). Containers on a "
+               "network reach each other by name; on nodes' networks a stack's service also answers as SERVICE and "
+               "SERVICE.NET.")
+
+
+def infra(project=None):
+    """Every PC and node (reachable or not, its quota: limit, used, free), what runs where with its ceiling and
+    use, its networks, ports, description, project and creator; networks and the names that reach their members;
+    terminal-vm's VMs; projects. project: only that project's objects (PCs and nodes stay listed: where it may go)."""
+    mine = lambda p: under(p or DEFAULT_PROJECT, project)
+    d, up = _nodes(), nodes_up()
+    approved = {}  # PC: the agent's stacks allowed on it
+    for sn in stacks():
+        with contextlib.suppress(SystemExit, OSError, ValueError):
+            s = load_stack(sn)
+            if mine(s.get("project")):
+                for h in s.get("approved_hosts", ()):
+                    approved.setdefault(h, []).append(sn)
+    places = [{"name": "this PC", "kind": "local", "engine": node().engine, "reachable": True}]
+    for n, info in sorted(d["nodes"].items()):
+        host = info.get("kind") == "host"
+        places.append({"name": n, "kind": "host" if host else "node", "reachable": bool(up.get(n)),
+                       **({"url": info.get("url"), "engine": info.get("engine", "docker")} if host else
+                          {"image": info.get("image")}),
+                       **({"description": t} if (t := description("host" if host else "node", n)) else {}),
+                       **({"approved_for": approved[n]} if n in approved else {})})
+    rows = []
+    for pl in places:
+        if not pl["reachable"]:
+            continue
+        where = None if pl["kind"] == "local" else pl["name"]
+        try:
+            with on_node(where, LOOK_TIMEOUT) if where else contextlib.nullcontext():
+                every = raw_containers(size=True)  # one listing for the quota and the rows
+                cs = [c for c in every if mine(labels_of(c).get(f"{LABEL}.project"))]
+                stats = _stats([c for c in cs if running(c)])
+                pl["quota"] = quota(infos=every)
+        except (SystemExit, RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+            pl.update(reachable=False, error=str(e)[:200])
+            continue
+        for c in cs:
+            n, lab, ports = normalize(c), labels_of(c), None
+            with contextlib.suppress(ValueError, TypeError, AttributeError):
+                ports = json.loads(lab.get(f"{LABEL}.spec") or "{}").get("ports")
+            rows.append({"name": n["name"], "on": pl["name"], "status": n["status"], "project": n["project"],
+                         "created_by": n["created_by"], "managed": managed(c),
+                         **({"description": n["description"]} if n.get("description") else {}),
+                         "cpus": n["cpus"], "memory_gb": n["memory_gb"],
+                         **({"use": stats[k]} if (k := c.get("Name", "").lstrip("/")) in stats else {}),
+                         "internet": n["internet"], "networks": n["networks"], **({"ports": ports} if ports else {}),
+                         **{k: True for k in ("desktop", "sandbox") if n.get(k)},
+                         **({"stack": "/".join(lab.get(f"{LABEL}.{k}", "") for k in ("stack", "service", "replica"))}
+                            if lab.get(f"{LABEL}.stack") else {})})
+    nets = {k: dict(v, members=[]) for k, v in networks().items() if mine(v["project"])}  # members: from rows,
+    for r in rows:                                                                         # this project's only
+        for net in r["networks"]:
+            if net not in nets:  # a network of nodes (a stack's): it lives in each node's engine
+                nets[net] = {"project": r["project"], "created_by": "agent" if r["created_by"] == "agent" else "user",
+                             "members": [], **({"description": t} if (t := description("net", net)) else {})}
+            e = nets[net]
+            if r["name"] not in e["members"]:
+                e["members"].append(r["name"])
+            names = e.setdefault("names", [])
+            svc = r.get("stack", "").split("/")[1:2]
+            for nm in [r["name"]] + ([svc[0], f"{svc[0]}.{net}"] if svc and r["on"] != "this PC" else []):
+                if nm not in names:
+                    names.append(nm)
+    vms = vm_state(project)
+    for v in vms.get("vms", []):
+        if v.get("name") in d["nodes"]:
+            v["node"] = True  # a node of terminal-ct (its containers above)
+    names = {DEFAULT_PROJECT} | {r["project"] for r in rows} | {v["project"] for v in nets.values()}
+    if os.path.isdir(os.path.join(STORE, "projects")):  # as projects() finds them, without listing everything again
+        names |= {d.replace("+", "/") for d in os.listdir(os.path.join(STORE, "projects"))}
+    projs = [{"project": p, **({"description": t} if (t := description("project", p)) else {})}
+             for p in sorted(names) if mine(p)]
+    return {"project": project, "rules": INFRA_RULES, "pcs_and_nodes": places,
+            "containers": sorted(rows, key=lambda r: (r["on"], r["name"])), "networks": nets,
+            "vms": vms.get("vms", []), **({"vm_note": vms["note"]} if vms.get("note") else {}), "projects": projs}
+
+
+def infra_text(m):
+    """infra for a person: one line per place, container, network and VM."""
+    gb = lambda v: v if isinstance(v, str) else f"{v:g}"
+    out = [f"terminal-ct {VERSION}" + (f"  project {m['project']}" if m.get("project") else "")]
+    for p in m["pcs_and_nodes"]:
+        q = p.get("quota") or {}
+        res = "  ".join(f"{k.replace('_gb', '')} {gb(v['used'])}/{gb(v['limit'])}" for k, v in q.items())
+        out.append(f"{p['kind']:<6} {p['name']:<14} {'up' if p['reachable'] else 'DOWN':<4} {res}"
+                   + (f"  — {p['description']}" if p.get("description") else ""))
+    out.append("")
+    for r in m["containers"]:
+        flags = "".join(f for f, on in (("D", r.get("desktop")), ("S", r.get("sandbox")), ("I", r["internet"]),
+                                        ("M", r["managed"])) if on)
+        out.append(f"  {r['name']:<22} {r['on']:<12} {r['status']:<8} {flags:<4} {r['project']:<12}"
+                   + (f" nets {','.join(r['networks'])}" if r["networks"] else "")
+                   + (f" ports {','.join(map(str, r['ports']))}" if r.get("ports") else "")
+                   + (f"  — {r['description']}" if r.get("description") else ""))
+    if not m["containers"]:
+        out.append("  (no containers)")
+    for k, v in sorted(m["networks"].items()):
+        out.append(f"net {k}: {', '.join(v.get('names') or v['members']) or '(empty)'}"
+                   + (f"  — {v['description']}" if v.get("description") else ""))
+    for v in m["vms"]:
+        out.append(f"vm  {v['name']:<22} {v.get('status', '-'):<8} {v.get('project', '-')}"
+                   + (" (node)" if v.get("node") else "") + (f"  — {v['description']}" if v.get("description") else ""))
+    if m.get("vm_note"):
+        out.append(f"vm  {m['vm_note']}")
+    out.append("flags: D desktop, S sandbox, I internet, M the agent runs it without asking")
+    return "\n".join(out)
 
 
 def dash(project=None, refresh=2.0):
@@ -5249,7 +5364,12 @@ AGENT_TOOLS = [
                   "quota, the latest events. What the user sees with terminal-ct dash.", _schema({})),
     ("ct_logs", "The last lines a container printed (stdout and stderr); n: how many (default 100).",
      _schema({**_NAME, "n": {"type": "integer"}}, ["name"])),
-    ("project_status", "Start here: the project's containers and networks as they are now (want: what each should "
+    ("infra", "Start here: the map of the whole infrastructure in one call. Each PC and node (reachable or not, "
+              "its quota: limit, used, free), every container with where it runs, its ceiling and use, networks, "
+              "ports, description, project, creator and managed (what you may run without asking), each network "
+              "with the names that reach its members, terminal-vm's VMs, the projects. Then project_status for "
+              "your notes and recent actions.", _schema({})),
+    ("project_status", "Then this: the project's containers and networks as they are now (want: what each should "
                        "be doing), the notes left by earlier sessions, and the latest actions with their errors.",
      _schema({"project": {"type": "string", "description": "Only when this server has no project of its own"}})),
     ("notes_write", "Keep notes for the next session (what is set up, what is left to do): appended with the date, "
@@ -5257,8 +5377,9 @@ AGENT_TOOLS = [
      _schema({"text": {"type": "string"}, "mode": {"type": "string", "enum": ["append", "replace"]},
               "project": {"type": "string"}}, ["text"])),
 ]
-INSTRUCTIONS = ("terminal-ct: containers with a desktop and a shell. Call project_status first: it says what this "
-                "project already has and what earlier sessions did and noted. Before you stop, record with "
+INSTRUCTIONS = ("terminal-ct: containers with a desktop and a shell. Call infra first: the map of who runs what "
+                "where, with what resources and descriptions. Then project_status: what this project has and what "
+                "earlier sessions did and noted. Describe what you create (description, or describe). Before you stop, record with "
                 "notes_write what you set up and what is left, so the next session can pick up from there.")
 AGENT_NAMES = {n for n, _, _ in AGENT_TOOLS}
 PROJECT_ARG_TOOLS = {"ct_create", "ct_clone", "ct_apply", "net_create", "project_status", "notes_write"}  # take `project` without one of their own
@@ -5431,6 +5552,8 @@ def agent_call(tool, a, approve, project=None):
         return autostart(a.get("on"))
     if tool == "project_status":
         return project_status(where)
+    if tool == "infra":
+        return infra(project)
     if tool == "notes_write":
         return notes_write(where, a["text"], a.get("mode", "append"))
     if tool == "net_list":
@@ -5957,6 +6080,8 @@ def main(argv=None):
     sub.add_parser("daemon").add_argument("daemon_cmd", choices=["run", "start", "stop", "status"])
     sub.add_parser("prune")
     da = sub.add_parser("dash"); da.add_argument("--project"); da.add_argument("--json", action="store_true")
+    inf = sub.add_parser("infra", help="the map: PCs and nodes, what runs where, networks and names, VMs, projects")
+    inf.add_argument("--project"); inf.add_argument("--json", action="store_true")
     bn = sub.add_parser("bench"); bn.add_argument("--runs", type=int, default=10); bn.add_argument("--desktop", action="store_true")
     sk_ = sub.add_parser("skills"); sk_.add_argument("skill_cmd", choices=["get", "path", "install"]); sk_.add_argument("--dir")
     wb = sub.add_parser("web"); wb.add_argument("--project"); wb.add_argument("--no-open", action="store_true")
@@ -6112,6 +6237,9 @@ def main(argv=None):
         if o.json:  # what the web dashboard shows (terminal-vm's dashboard reads it)
             return print(json.dumps(web_api("GET", "/api/state", {"project": o.project or ""})[1]))
         return dash(o.project)
+    if o.cmd == "infra":
+        m = infra(check_project(o.project) if o.project else None)
+        return show_json(m) if o.json else print(infra_text(m))
     if o.cmd == "web": return show_json(web_cli(o.web_args, o.role, not o.no_open, o.project, o.listen, o.port))
     if o.cmd == "agent": return agent(o.listen, o.port, o.rotate)
     if o.cmd == "bench": return show_json(bench(max(1, o.runs), o.desktop))

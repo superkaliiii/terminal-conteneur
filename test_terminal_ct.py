@@ -1515,7 +1515,8 @@ class ProjectsAndResume(unittest.TestCase):
         with unittest.mock.patch("sys.stdin", stdin), contextlib.redirect_stdout(stdout):
             ct.mcp(project="site")
         replies = [json.loads(l) for l in stdout.getvalue().splitlines()]
-        self.assertIn("project_status first", replies[0]["result"]["instructions"])
+        self.assertIn("Call infra first", replies[0]["result"]["instructions"])
+        self.assertIn("Then project_status", replies[0]["result"]["instructions"])
         st = json.loads(replies[2]["result"]["content"][0]["text"])
         self.assertEqual([(c["name"], c["status"], c["want"]) for c in st["containers"]], [("web", "running", "running")])
         self.assertIn("nginx to install", st["notes"])
@@ -1915,6 +1916,40 @@ class Hosts(unittest.TestCase):
         self.assertEqual((ct._hosts(), ct._nodes()["nodes"]), ({}, {}))
         with self.assertRaisesRegex(SystemExit, "no host named"):
             self.cli("host", "rm", "pc1")
+
+    def test_infra_maps_every_pc_and_what_runs_there(self):
+        self.add("pc1"); self.add("pc2", "https://192.168.1.21:7173")
+        ct.describe("host", "pc1", "the lab PC")
+        quiet(ct.create, "mine", nets=())                                       # the user's, on this PC
+        ct.net_create("lab", project="alpha"); ct.describe("net", "lab", "alpha's bench")
+        quiet(ct.create, "db", project="alpha", nets=["lab"]); quiet(ct.create, "api", project="alpha", nets=["lab"])
+        with ct.on_node("pc1"):
+            quiet(ct.create, "job", created_by="agent", sandbox=True, project="alpha")
+        ct.place("job", "pc1")
+        ct.apply({"stack": "s", "project": "alpha", "services": {"w": {"image": "alpine:3.20"}}},
+                 created_by="agent", approved_hosts=["pc2"])
+        self.down.add("pc2")
+        ct._UP.clear()
+        vms = {"vms": [{"name": "deb", "status": "stopped", "project": "alpha", "description": "a desktop"}]}
+        with unittest.mock.patch.object(ct, "vm_state", lambda project=None: vms):
+            m = ct.infra()
+            text = ct.infra_text(m)
+            scoped = ct.infra("alpha")
+        places = {p["name"]: p for p in m["pcs_and_nodes"]}
+        self.assertEqual({k: p["reachable"] for k, p in places.items()}, {"this PC": True, "pc1": True, "pc2": False})
+        self.assertEqual((places["pc1"]["description"], places["pc2"]["approved_for"]), ("the lab PC", ["s"]))
+        self.assertIn("free", places["pc1"]["quota"]["cpus"])                  # each PC's own quota, with room left
+        rows = {r["name"]: r for r in m["containers"]}
+        self.assertEqual(rows["job"]["on"], "pc1")
+        self.assertEqual((rows["job"]["managed"], rows["mine"]["managed"]), (True, False))
+        self.assertEqual(m["networks"]["lab"]["description"], "alpha's bench")
+        self.assertEqual(sorted(m["networks"]["lab"]["names"]), ["api", "db"])
+        self.assertEqual(m["vms"][0]["description"], "a desktop")
+        for s in ("pc2", "DOWN", "the lab PC", "net lab: ", "a desktop"):
+            self.assertIn(s, text)
+        self.assertEqual(sorted(r["name"] for r in scoped["containers"]), ["api", "db", "job", "s-w-1"])  # alpha's only
+        self.assertEqual([p["project"] for p in scoped["projects"]], ["alpha"])
+        self.assertEqual(len(scoped["pcs_and_nodes"]), 3)                       # where it may go stays listed
 
     def test_descriptions_of_pcs_and_their_containers(self):
         with unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_AGENT_TOKEN": "t" * 43}):
