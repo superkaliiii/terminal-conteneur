@@ -1548,6 +1548,39 @@ class Doctor(unittest.TestCase):
         self.assertIn("== events.log", report)
 
 
+class Installer(unittest.TestCase):
+    """Phase 13.2: install.sh into a throwaway HOME (no packages, no agent), update, uninstall."""
+    SH = os.path.join(os.path.dirname(os.path.abspath(ct.__file__)), "install.sh")
+    COMMON = "# ===== common to terminal-ct and terminal-vm's install.sh ====="
+
+    @unittest.skipIf(ct.WINDOWS or not shutil.which("sh"), "a POSIX shell")
+    def test_install_update_uninstall(self):
+        home = tempfile.mkdtemp()
+        with open(os.path.join(home, ".bashrc"), "w") as f:
+            f.write("echo mine\n")
+        env = dict(os.environ, HOME=home, PATH="/usr/bin:/bin")
+        run = lambda *a: subprocess.run(["sh", self.SH, *a, "--no-deps", "--no-mcp"], env=env, capture_output=True,
+                                        text=True, stdin=subprocess.DEVNULL, timeout=120)
+        r = run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        tool = os.path.join(home, ".local", "bin", "terminal-ct")
+        self.assertEqual(subprocess.run([tool, "version"], capture_output=True, text=True).stdout.strip(), ct.VERSION)
+        self.assertEqual(run("--update").returncode, 0)
+        with open(os.path.join(home, ".bashrc")) as f:
+            self.assertEqual(f.read().count("added by terminal-ct"), 1)        # once, update or not
+        self.assertEqual(run("--uninstall").returncode, 0)
+        self.assertFalse(os.path.exists(tool))
+        with open(os.path.join(home, ".bashrc")) as f:
+            self.assertNotIn("terminal-ct", f.read())
+
+    def test_common_part_is_terminal_vms(self):
+        other = os.path.join(os.path.dirname(self.SH), "..", "terminal-mac-src", "terminal-vm", "install.sh")
+        if not os.path.isfile(other):
+            self.skipTest("terminal-vm not checked out alongside")
+        body = lambda p: open(p, encoding="utf-8").read().replace("\r\n", "\n").split(self.COMMON)[1]
+        self.assertEqual(body(self.SH), body(other), "the installers' common part differs: copy it to both")
+
+
 class ProjectsAndResume(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
