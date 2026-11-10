@@ -216,9 +216,18 @@ runs what it is sent (engine calls, file copies, terminal-vm). Another PC is a n
 - **VMs of other PCs**: when terminal-vm is installed there (on its login PATH, `~/.local/bin`, or `TERMINAL_VM` in
   the agent's environment), the web dashboard lists its VMs as `VM@PC` (start, stop, force stop, screenshots) and
   `terminal-ct --host PC vm ls` (any terminal-vm command, `-- CMD` for `exec`) runs it there; its output shows at the
-  end (not interactive). Real run (WSL): 5 VMs listed in 0.7 s, a screenshot in 0.45 s.
+  end (not interactive); `vm action VM screenshot --output FILE` brings the picture to this PC. terminal-vm's MCP
+  server reaches them as `vm: "VM@PC"` (screen tools, `exec`, start, stop; the user's VMs there after their
+  approval). Real run (WSL): 5 VMs listed in 0.7 s, a screenshot in 0.45 s; an MCP session over an agent (screenshot,
+  status, click, exec, stop, start) all right.
 - Measured (WSL, central Podman, agent Docker): `host add` 0.5 s, `create` 1.9 s, `exec` 0.7 s, `ls` 1.2 s; a
   stopped agent shows as not answering and `ls` goes on without it.
+- **SSH**: `host add NAME ssh://[user@]host[:port]` runs plain `ssh`/`scp` (key login, `BatchMode`): nothing of
+  terminal-ct runs there. Real run (WSL, an sshd on port 2222, Docker there): host add, create, start, exec, push,
+  pull (a file and a folder), logs, infra, stop, rm all right; sshd stopped: the PC shows as not answering at once.
+  A WSL with Podman reached over SSH gets Podman's iptables firewall driver (WSL's kernel lacks nftables pieces):
+  `host add` writes it in that user's `~/.config/terminal-ct/podman-wsl.conf` and each call names it, their own
+  `podman` unchanged.
 - Antivirus: some (Avast) re-sign HTTPS even on 127.0.0.1 on Windows; the pinned fingerprint then refuses the
   connection on purpose, and the error says so. Run the central PC in WSL, or exclude the agent's port.
 

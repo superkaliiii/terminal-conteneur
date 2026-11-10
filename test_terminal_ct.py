@@ -2013,7 +2013,7 @@ class Hosts(unittest.TestCase):
                     return {"exit": 0, "stdout": json.dumps({args[0]: args[1]})}
                 if args[:3] == ["action", "deb", "screenshot"]:
                     self.pc_files[args[-1]] = b"PNG of deb"
-                    return {"exit": 0, "stdout": "{}"}
+                    return {"exit": 0, "stdout": json.dumps({"path": args[-1]}) + "\n"}
                 if args[:2] == ["action", "win"]:
                     return {"exit": 1, "stdout": "", "stderr": json.dumps({"error": "win is not running"})}
                 if args[:2] == ["exec", "deb"] and "missing" in args:              # the guest's own 127
@@ -2388,6 +2388,14 @@ class Hosts(unittest.TestCase):
         ct.NODE = self.local
         self.assertEqual((e.exception.code, out.getvalue()), (0, "plain text\n"))
         self.assertEqual(self.vm_runs[-1], ("pc1", ["exec", "deb", "--", "uname", "-a"]))
+        local = os.path.join(ct.STORE, "shot.png")
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit):
+            ct.main(["--host", "pc1", "vm", "action", "deb", "screenshot", "--output", local])  # lands here
+        ct.NODE = self.local
+        with open(local, "rb") as f:
+            self.assertEqual(f.read(), b"PNG of deb")
+        self.assertEqual(json.loads(out.getvalue())["path"], local)
+        self.assertTrue(self.vm_runs[-1][1][-1].startswith("/tmp/tct-"))         # written in a private folder there
         with self.assertRaisesRegex(SystemExit, "another PC"):
             self.cli("vm", "ls")
         with unittest.mock.patch.object(ct, "vm_cli", lambda: None):

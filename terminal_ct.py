@@ -6637,10 +6637,23 @@ def main(argv=None):
                              "terminal-vm itself)")
         if not o.vm_args:
             raise SystemExit("terminal-ct --host PC vm ARGS (e.g. vm ls)")
+        args, local, tmp = list(o.vm_args), None, None
+        if args[:1] == ["action"] and "--output" in args[:-1]:  # a screenshot lands here, not on that PC
+            i = args.index("--output") + 1
+            local, tmp = os.path.abspath(args[i]), f"/tmp/tct-{secrets.token_hex(6)}"
+            args[i] = f"{tmp}/s.png"
+            NODE.sh(f"mkdir -m 700 {tmp}", timeout=30)  # private: a PC has other users
         try:
-            r = NODE._exec([*VM_ON_PC, *o.vm_args, *(["--", *cmd_args] if cmd_args else [])], 3600)
+            r = NODE._exec([*VM_ON_PC, *args, *(["--", *cmd_args] if cmd_args else [])], 3600)
+            if local and not r.get("exit"):
+                NODE.copy("pull", f"{tmp}/s.png", local, timeout=60)
+                r["stdout"] = (r.get("stdout") or "").replace(json.dumps(f"{tmp}/s.png"), json.dumps(local))
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             raise SystemExit(f"host {NODE.name}: {e}") from None
+        finally:
+            if tmp:
+                with contextlib.suppress(SystemExit):
+                    NODE.sh(f"rm -rf {tmp}", timeout=30)
         for stream, text in ((sys.stdout, r.get("stdout")), (sys.stderr, r.get("stderr"))):
             stream.flush()  # its bytes as they came: a Windows console code page cannot refuse them
             (stream.buffer.write(text.encode("utf-8")) if hasattr(stream, "buffer") else stream.write(text)) \
