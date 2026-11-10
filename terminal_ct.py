@@ -92,6 +92,7 @@ def in_wsl():
 # answers the same in milliseconds. Node.run sends the calls below through it when a socket answers, and keeps the
 # CLI for everything else and whenever the API cannot be reached (any doubt: the CLI).
 API = "/v1.41"  # Docker 20.10+, Podman 3+ (its compatible API)
+IN_DAEMON = [False]  # set by daemon run
 
 
 class _UnixHTTP(http.client.HTTPConnection):
@@ -170,7 +171,8 @@ class Node:
         """The engine's API socket when one answers (cached per Node), else None: then the CLI does everything."""
         if "_api" not in self.__dict__:
             self._api = None
-            if not WINDOWS and os.environ.get("TERMINAL_CT_API") != "0":
+            # the daemon calls every few seconds: Podman's service would never stop, and drift (see _podman_service)
+            if not WINDOWS and os.environ.get("TERMINAL_CT_API") != "0" and not (self.engine == "podman" and IN_DAEMON[0]):
                 for path in self._api_sockets():
                     with contextlib.suppress(OSError):
                         if api_call(path, "GET", "/_ping", timeout=2)[0] == 200:
@@ -191,16 +193,23 @@ class Node:
         return found or [p for p in [self._podman_service(run_dir)] if p]
 
     def _podman_service(self, run_dir):
-        """Start `podman system service` on a private socket (it stops itself after 10 idle minutes): rootless
-        Podman under WSL has no socket of its own. None when no private place for it."""
+        """Start `podman system service` on a private socket for a burst of calls (it stops after 5 idle seconds,
+        as systemd's podman.socket does): a long-lived one was seen to miss containers and images other podman
+        processes made. Rootless Podman under WSL has no socket of its own. None when no private place for it."""
         base = run_dir if run_dir and os.access(run_dir, os.W_OK) else STORE
         path = os.path.join(base, f"tct-podman-{os.getuid()}.sock")
         if len(path) > 100:  # a unix socket path's limit
             return None
+        if os.path.exists(path):  # a service killed leaves its socket: a dead one is replaced, never trusted
+            try:
+                api_call(path, "GET", "/_ping", timeout=1)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.remove(path)
         if not os.path.exists(path):
             os.makedirs(base, exist_ok=True)
             with contextlib.suppress(OSError):
-                subprocess.Popen([self.engine, "system", "service", "--time=600", f"unix://{path}"],
+                subprocess.Popen([self.engine, "system", "service", "--time=5", f"unix://{path}"],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True)
             for _ in range(30):
@@ -262,9 +271,11 @@ class Node:
                 if vols is not None else None
         if args[:4] == ["stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}"]:
             return self._api_stats(sock, args[4:], t)
-        if args[:2] in (["image", "inspect"], ["volume", "inspect"]) and len(args) == 3:
-            kind = "images" if args[0] == "image" else "volumes"
-            st, r = api_call(sock, "GET", f"{API}/{kind}/{q(args[2], safe='')}" + ("/json" if kind == "images" else ""), t)
+        # not images: a long-lived Podman service missed images pulled or removed by other podman processes
+        # (it answered 404 for an image the CLI had just pulled); once per create, the CLI is cheap enough there
+        if args[:2] == ["volume", "inspect"] and len(args) == 3:
+            kind = "volumes"
+            st, r = api_call(sock, "GET", f"{API}/volumes/{q(args[2], safe='')}", t)
             if st == 200 and isinstance(r, dict):
                 return _done(json.dumps([r]))
             return _api_error(st, r, f"{args[0]} inspect") if st == 404 else None
@@ -3192,6 +3203,7 @@ def daemon(cmd="status"):
         return "started"
     if cmd != "run":
         raise SystemExit("daemon run|start|stop|status")
+    IN_DAEMON[0] = True
     with quota_lock("daemon"):  # a second daemon waits, then gives up: one per store
 
         def beat():  # its own thread: a long pass (a desktop image build) must not make the daemon look dead
@@ -3855,6 +3867,30 @@ def on_stack_engine(stack):
         _LOCAL.node = None
 
 
+_STATE_CACHE, _STATE_LOCK = {}, threading.Lock()  # project: (time, state); emptied by every action
+
+
+def dash_state(project=None, max_age=2):
+    """/api/state: what the dashboard shows. Tabs and users polling at once share one computation every max_age s
+    (50 at once took 8 s, each one listing everything)."""
+    with _STATE_LOCK:  # one round at a time: the others wait for it and take its answer
+        hit = _STATE_CACHE.get(project)
+        if hit and time.time() - hit[0] < max_age:
+            return hit[1]
+        d = dashboard_data(project, with_quota=False)  # the quota measures the disk (seconds): /api/quota
+        d["tool"], d["stacks"] = TOOL, []
+        for n in stacks():
+            with contextlib.suppress(SystemExit):
+                s = load_stack(n)
+                if under(s.get("project") or DEFAULT_PROJECT, project):
+                    d["stacks"].append({"stack": n, "project": s.get("project") or DEFAULT_PROJECT,
+                                        "created_by": s.get("created_by", "user"),
+                                        "services": {k: {"replicas": v.get("replicas", 1), "image": v.get("image")}
+                                                     for k, v in s["services"].items()}})
+        _STATE_CACHE[project] = (time.time(), d)
+        return d
+
+
 def web_api(method, path, q, body=None):
     """One dashboard call, on the engine of the container it names (its node, if it lives in one)."""
     name = q.get("name") or (body.get("name") if isinstance(body, dict) else None)
@@ -3869,17 +3905,7 @@ def _web_api(method, path, q, body=None):
     if project:
         check_project(project)
     if method == "GET" and path == "/api/state":
-        d = dashboard_data(project, with_quota=False)  # the quota measures the disk (seconds): /api/quota
-        d["tool"], d["stacks"] = TOOL, []
-        for n in stacks():
-            with contextlib.suppress(SystemExit):
-                s = load_stack(n)
-                if under(s.get("project") or DEFAULT_PROJECT, project):
-                    d["stacks"].append({"stack": n, "project": s.get("project") or DEFAULT_PROJECT,
-                                        "created_by": s.get("created_by", "user"),
-                                        "services": {k: {"replicas": v.get("replicas", 1), "image": v.get("image")}
-                                                     for k, v in s["services"].items()}})
-        return "application/json", d
+        return "application/json", dash_state(project)
     if method == "GET" and path == "/api/quota":
         infos = raw_containers()
         names = {DEFAULT_PROJECT} | {labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT for c in infos}
@@ -3904,6 +3930,7 @@ def _web_api(method, path, q, body=None):
     if method == "GET" and path == "/api/events":
         return "application/json", events(q.get("stack") or None, int(q.get("n") or 50), project)
     if method == "POST" and path == "/api/do":
+        _STATE_CACHE.clear()  # an action shows at the next refresh, not after the cache's 2 s
         if not isinstance(body, dict):
             raise ValueError("a JSON object")
         op, name = body.get("op"), body.get("name") or ""
