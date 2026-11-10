@@ -736,6 +736,7 @@ def agent(listen="127.0.0.1", port=None, rotate=False):
     if rotate:
         agent_credentials(rotate=True)
     srv = agent_serve(listen, port)
+    _web_write(_agent_path("pid"), str(os.getpid()), 0o600)  # agent --autostart off stops this one
     host = f"[{listen}]" if ":" in listen else listen
     url = f"https://{host}:{srv.server_address[1]}"
     print(json.dumps({"url": url, "fingerprint": srv.fingerprint, "token": srv.token,
@@ -2223,55 +2224,130 @@ AUTOSTART = "terminal-ct-resume"
 
 
 def autostart(on=None):
-    """Run `resume` at each logon: a Windows scheduled task (for WSL: wsl.exe running it inside the distribution,
-    kept alive while containers run), else a systemd user service on Linux."""
-    me = [sys.executable, os.path.abspath(__file__)]
-    unit = os.path.expanduser(f"~/.config/systemd/user/{AUTOSTART}.service")
-    env = {k: os.environ[k] for k in ("TERMINAL_CT_HOME", "XDG_DATA_HOME") if os.environ.get(k)}  # where STORE is
+    """Run `resume` at each logon: the user's Run key on Windows (for WSL: wsl.exe running it inside the
+    distribution, kept alive while containers run), a launchd agent on macOS, else a systemd user service."""
     if on:  # containers running now, from before `want` was kept (0.2): they are to come back too
         for _ in each_engine():
             for c in raw_containers():
                 n = labels_of(c).get(f"{LABEL}.name")
                 if running(c) and not os.path.isfile(os.path.join(STORE, n, "want")):
                     want(n, "running")
+    return _at_logon(AUTOSTART, ["resume", "--stay"] if in_wsl() else ["resume"], on,
+                     "start again the containers that were running")
+
+
+AGENT_TASK = "terminal-ct-agent"
+
+
+def agent_autostart(on=None, listen="127.0.0.1", port=None):
+    """This PC's agent started at each logon and kept running (restarted if it ends), so a central PC finds it
+    after a restart. Its address and port as given; its certificate and token stay the same."""
+    if WINDOWS:
+        raise SystemExit("on Windows the agent runs inside WSL: terminal-ct agent there (install.ps1 sets it up)")
+    args = ["agent", "--listen", str(ipaddress.ip_address(listen)), *(["--port", str(port)] if port else [])]
+    out = _at_logon(AGENT_TASK, args, on, "this PC's agent for a central PC", server=True)
+    if on:
+        fp, token = agent_credentials()
+        host = f"[{listen}]" if ":" in listen else listen
+        url = f"https://{host}:{port or AGENT_PORT}"
+        out.update(url=url, fingerprint=fp, token=token,
+                   **{"on the central PC": f"terminal-ct host add NAME {url} --fingerprint {fp}  (then type or paste "
+                                           "the token)"})
+    return out
+
+
+def _stop_agent():
+    """Stop this store's agent (its pid file) when it runs: a WSL logon start has no service manager to ask."""
+    try:
+        with open(_agent_path("pid")) as f:
+            pid = int(f.read())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"agent" not in f.read():  # that number taken again by another program
+                return
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+
+
+def _at_logon(task, args, on, what, server=False):
+    """terminal-ct ARGS run at each logon of this user (on=None: whether it is set). On Windows the user's Run key
+    (for WSL: wsl.exe running it inside the distribution), a launchd agent on macOS, else a systemd user service.
+    server: a process that keeps running: started now too, and again when it ends."""
+    me = [sys.executable, os.path.abspath(__file__)]
+    env = {k: os.environ[k] for k in ("TERMINAL_CT_HOME", "XDG_DATA_HOME") if os.environ.get(k)}  # where STORE is
     if WINDOWS or in_wsl():
-        schtasks = "schtasks.exe" if in_wsl() else "schtasks"
+        # the user's Run key, not a scheduled task: an ONLOGON task needs an elevated (administrator) process
+        reg, key = "reg.exe" if in_wsl() else "reg", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
         if on is None:
-            return {"autostart": subprocess.run([schtasks, "/Query", "/TN", AUTOSTART], capture_output=True).returncode == 0}
+            return {"autostart": subprocess.run([reg, "query", key, "/v", task], capture_output=True).returncode == 0}
         if not on:
-            subprocess.run([schtasks, "/Delete", "/TN", AUTOSTART, "/F"], capture_output=True)
+            subprocess.run([reg, "delete", key, "/v", task, "/f"], capture_output=True)
+            subprocess.run(["schtasks.exe" if in_wsl() else "schtasks", "/Delete", "/TN", task, "/F"],
+                           capture_output=True)  # what versions before 2026-11 made (as an administrator)
+            if server:  # the one running now stops too
+                _stop_agent()
             return {"autostart": False}
         if in_wsl():  # conhost --headless: no console window at logon; wsl.exe reads a Windows command line
-            cmd = "conhost.exe --headless " + subprocess.list2cmdline(
-                ["wsl.exe", "-d", os.environ.get("WSL_DISTRO_NAME", "Debian"), "--exec", "env",
-                 *(f"{k}={v}" for k, v in env.items()), *me, "resume", "--stay"])
+            argv = ["conhost.exe", "--headless", "wsl.exe", "-d", os.environ.get("WSL_DISTRO_NAME", "Debian"),
+                    "--exec", "env", *(f"{k}={v}" for k, v in env.items()), *me, *args]
         else:
             if env:  # shortcut: a task's command line sets no variables; set them as user variables to use this
                 raise SystemExit(f"autostart on Windows uses the default store; unset {', '.join(env)} first")
-            cmd = subprocess.list2cmdline(me + ["resume"])
-        if len(cmd) > 261:  # schtasks /TR limit
-            raise SystemExit(f"the task's command line is {len(cmd)} characters, schtasks takes 261: {cmd}")
-        r = subprocess.run([schtasks, "/Create", "/TN", AUTOSTART, "/SC", "ONLOGON", "/TR", cmd, "/F"],
-                           capture_output=True, text=True)
+            argv = me + args
+        cmd = subprocess.list2cmdline(argv)
+        if len(cmd) > 260:  # what the Run key starts
+            raise SystemExit(f"the logon command line is {len(cmd)} characters, Windows takes 260: {cmd}")
+        r = subprocess.run([reg, "add", key, "/v", task, "/t", "REG_SZ", "/d", cmd, "/f"], capture_output=True,
+                           text=True, errors="replace")  # its messages are in the console's code page
         if r.returncode:
             raise SystemExit((r.stderr or r.stdout).strip())
-        return {"autostart": True, "task": AUTOSTART, "runs": cmd}
+        if server and in_wsl():  # now too, as at logon: a Windows process keeps WSL (and the agent) running; from
+            # inside WSL, conhost --headless ends at once unless Windows itself starts it (as Explorer does at logon)
+            ps = (f"Start-Process {argv[0]} -WindowStyle Hidden -ArgumentList '"
+                  + subprocess.list2cmdline(argv[1:]).replace("'", "''") + "'")
+            subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                           stdin=subprocess.DEVNULL, cwd="/mnt/c/" if os.path.isdir("/mnt/c") else None)
+        return {"autostart": True, "runs": cmd}
+    if sys.platform == "darwin":
+        plist = os.path.expanduser(f"~/Library/LaunchAgents/io.github.terminal-ct.{task}.plist")
+        if on is None:
+            return {"autostart": os.path.isfile(plist)}
+        subprocess.run(["launchctl", "unload", plist], capture_output=True)
+        if not on:
+            with contextlib.suppress(OSError):
+                os.remove(plist)
+            return {"autostart": False}
+        import plistlib  # macOS only
+        os.makedirs(os.path.dirname(plist), exist_ok=True)
+        with open(plist, "wb") as f:
+            plistlib.dump({"Label": f"io.github.terminal-ct.{task}", "ProgramArguments": me + args,
+                           "EnvironmentVariables": env, "RunAtLoad": True, "KeepAlive": server}, f)
+        r = subprocess.run(["launchctl", "load", "-w", plist], capture_output=True, text=True)
+        if r.returncode:
+            raise SystemExit((r.stderr or r.stdout).strip())
+        return {"autostart": True, "plist": plist}
+    unit = os.path.expanduser(f"~/.config/systemd/user/{task}.service")
     if on is None:
         return {"autostart": os.path.isfile(unit)}
     if not on:
-        subprocess.run(["systemctl", "--user", "disable", f"{AUTOSTART}.service"], capture_output=True)
+        subprocess.run(["systemctl", "--user", "disable", "--now" if server else "--quiet", f"{task}.service"],
+                       capture_output=True)
         with contextlib.suppress(OSError):
             os.remove(unit)
         return {"autostart": False}
     os.makedirs(os.path.dirname(unit), exist_ok=True)
     with open(unit, "w") as f:
         # no After=default.target: WantedBy already orders it, and both made an ordering cycle
-        f.write(f"[Unit]\nDescription=terminal-ct: start again the containers that were running\n\n"
-                # resume exits at once: without these, systemd would kill what it started (same cgroup: podman's
-                # conmon) as the unit ends
-                f"[Service]\nType=oneshot\nRemainAfterExit=yes\nKillMode=process\n" +"".join(f"Environment={shlex.quote(f'{k}={v}')}\n" for k, v in env.items())
-                + f"ExecStart={shlex.join(me + ['resume'])}\n\n[Install]\nWantedBy=default.target\n")
-    r = subprocess.run(["systemctl", "--user", "enable", f"{AUTOSTART}.service"], capture_output=True, text=True)
+        f.write(f"[Unit]\nDescription=terminal-ct: {what}\n\n[Service]\n" +
+                ("Type=simple\nRestart=on-failure\nRestartSec=5\n" if server else
+                 # resume exits at once: without these, systemd would kill what it started (same cgroup: podman's
+                 # conmon) as the unit ends
+                 "Type=oneshot\nRemainAfterExit=yes\nKillMode=process\n") +
+                "".join(f"Environment={shlex.quote(f'{k}={v}')}\n" for k, v in env.items())
+                + f"ExecStart={shlex.join(me + args)}\n\n[Install]\nWantedBy=default.target\n")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    r = subprocess.run(["systemctl", "--user", "enable", *(["--now"] if server else []), f"{task}.service"],
+                       capture_output=True, text=True)
     if r.returncode:
         raise SystemExit((r.stderr or r.stdout).strip())
     return {"autostart": True, "unit": unit,
@@ -6271,7 +6347,7 @@ def doctor_checks():
                   "kernel lacks nftables pieces); for your own podman: add [network] firewall_driver = \"iptables\" "
                   "to ~/.config/containers/containers.conf", required=False)
         check("wsl", False, "WSL stops this distribution when no Windows program uses it, and its containers with it",
-              "terminal-ct autostart on   (a logon task keeps it running while containers want to run)",
+              "terminal-ct autostart on   (started at each logon, it keeps WSL running while containers want to run)",
               required=False)
     standby = _standby_minutes()
     if standby is not None:
@@ -6571,6 +6647,8 @@ def main(argv=None):
     wb.add_argument("--port", type=int)
     ag = sub.add_parser("agent", help="serve this PC to a central PC (HTTPS, pinned certificate + token)")
     ag.add_argument("--listen", default="127.0.0.1"); ag.add_argument("--port", type=int); ag.add_argument("--rotate", action="store_true")
+    ag.add_argument("--autostart", choices=["on", "off", "status"],
+                    help="start it at each logon and keep it running (with this --listen and --port)")
     lg = sub.add_parser("logs"); lg.add_argument("name"); lg.add_argument("-n", type=int, default=100)
     sn = sub.add_parser("snapshot"); sn.add_argument("name"); sn.add_argument("snap_cmd", choices=["save", "load", "rm", "ls"])
     sn.add_argument("tag", nargs="?")
@@ -6739,6 +6817,8 @@ def main(argv=None):
             sys.stdout.reconfigure(errors="replace")  # a description in a script the console cannot show
         return show_json(m) if o.json else print(infra_text(m))
     if o.cmd == "web": return show_json(web_cli(o.web_args, o.role, not o.no_open, o.project, o.listen, o.port))
+    if o.cmd == "agent" and o.autostart:
+        return show_json(agent_autostart(None if o.autostart == "status" else o.autostart == "on", o.listen, o.port))
     if o.cmd == "agent": return agent(o.listen, o.port, o.rotate)
     if o.cmd == "bench": return show_json(bench(max(1, o.runs), o.desktop))
     if o.cmd == "skills": return skills(o.skill_cmd, o.dir)

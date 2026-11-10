@@ -1,8 +1,9 @@
-import base64, contextlib, hashlib, io, re, json, os, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, unittest, unittest.mock, zlib
+import base64, contextlib, shlex, hashlib, io, re, json, os, shutil, socket, ssl, struct, subprocess, sys, tempfile, threading, time, unittest, unittest.mock, zlib
 
 import terminal_ct as ct
 
 REAL_REMOTE_EXEC = ct.NodeRemote._exec  # kept before the fakes replace it
+RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 
 # the real tests' engines (TERMINAL_CT_REAL_ENGINES="docker" where Podman cannot set limits, e.g. a CI runner)
 REAL_ENGINES = tuple(os.environ.get("TERMINAL_CT_REAL_ENGINES", "podman docker").split())
@@ -1868,9 +1869,55 @@ class ProjectsAndResume(unittest.TestCase):
         with unittest.mock.patch.object(ct.subprocess, "run", run), unittest.mock.patch.object(ct, "in_wsl", lambda: True), \
                 unittest.mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "Debian"}):
             out = ct.autostart(True)
-        self.assertEqual(calls[0][:5], ["schtasks.exe", "/Create", "/TN", "terminal-ct-resume", "/SC"])
+        self.assertEqual(calls[0][:5], ["reg.exe", "add", RUN_KEY, "/v", "terminal-ct-resume"])
         self.assertTrue(out["runs"].startswith("conhost.exe --headless wsl.exe -d Debian --exec "))
         self.assertTrue(out["runs"].endswith(" resume --stay"))
+
+    def test_agent_autostart(self):
+        """The agent at each logon, kept running: a WSL task started now too, a systemd service, a launchd agent."""
+        calls, home = [], tempfile.mkdtemp()
+        def run(args, **k):
+            calls.append(args); return subprocess.CompletedProcess(args, 0, "", "")
+        creds = unittest.mock.patch.object(ct, "agent_credentials", lambda rotate=False: ("ab" * 32, "t" * 43))
+        with unittest.mock.patch.object(ct.subprocess, "run", run), creds, \
+                unittest.mock.patch.object(ct, "WINDOWS", False), unittest.mock.patch.object(ct, "in_wsl", lambda: True), \
+                unittest.mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "Debian"}):
+            out = ct.agent_autostart(True, "10.0.0.5", 7173)
+            with self.assertRaises(ValueError):
+                ct.agent_autostart(True, "pc.lan")                              # an address, never a name
+        self.assertEqual(calls[0][:5], ["reg.exe", "add", RUN_KEY, "/v", "terminal-ct-agent"])
+        self.assertTrue(out["runs"].endswith(" agent --listen 10.0.0.5 --port 7173"))
+        now = calls[1][-1]                                                     # started now too, by Windows
+        self.assertEqual(calls[1][0], "powershell.exe")
+        self.assertTrue(now.startswith("Start-Process conhost.exe -WindowStyle Hidden -ArgumentList '--headless wsl.exe "))
+        self.assertTrue(now.endswith(" agent --listen 10.0.0.5 --port 7173'"))
+        self.assertEqual((out["url"], out["fingerprint"]), ("https://10.0.0.5:7173", "ab" * 32))
+        for platform in ("linux", "darwin"):
+            calls.clear()
+            with unittest.mock.patch.object(ct.subprocess, "run", run), creds, \
+                    unittest.mock.patch.object(ct, "WINDOWS", False), \
+                    unittest.mock.patch.object(ct, "in_wsl", lambda: False), \
+                    unittest.mock.patch.object(ct.sys, "platform", platform), \
+                    unittest.mock.patch.object(ct.os.path, "expanduser", lambda p: p.replace("~", home, 1)), \
+                    unittest.mock.patch.dict(os.environ, {"TERMINAL_CT_HOME": "/s"}):
+                out = ct.agent_autostart(True, "192.168.1.4")
+                self.assertTrue(ct.agent_autostart(None, "192.168.1.4")["autostart"])
+                if platform == "linux":
+                    with open(out["unit"]) as f:
+                        unit = f.read()
+                    self.assertIn("Type=simple\nRestart=on-failure", unit)
+                    self.assertIn("Environment=TERMINAL_CT_HOME=/s", unit)
+                    self.assertEqual(shlex.split(unit.split("ExecStart=")[1].splitlines()[0])[:1], [sys.executable])
+                    self.assertTrue(unit.split("ExecStart=")[1].splitlines()[0].endswith("agent --listen 192.168.1.4"))
+                    self.assertIn(["systemctl", "--user", "enable", "--now", "terminal-ct-agent.service"], calls)
+                else:
+                    import plistlib
+                    with open(out["plist"], "rb") as f:
+                        pl = plistlib.load(f)
+                    self.assertEqual((pl["ProgramArguments"][-3:], pl["KeepAlive"], pl["EnvironmentVariables"]),
+                                     (["agent", "--listen", "192.168.1.4"], True, {"TERMINAL_CT_HOME": "/s"}))
+                self.assertEqual(ct.agent_autostart(False), {"autostart": False})
+                self.assertFalse(ct.agent_autostart(None)["autostart"])
 
 
 @unittest.skipIf(ct.WINDOWS, "desktop containers need a Linux host or WSL")

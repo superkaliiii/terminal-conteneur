@@ -430,10 +430,15 @@ An agent arriving in the infrastructure learns who does what in one call:
 - `start` and `stop` record what each container should be doing (`STORE/NAME/want`). After the PC (or WSL)
   restarts, `resume` starts again what was running (within the quota; a sandbox fresh) and leaves alone what was
   stopped on purpose.
-- `autostart on` runs it at each logon: on Windows (also from WSL) a scheduled task `terminal-ct-resume`
-  (from WSL: `conhost --headless wsl.exe ... resume --stay`, which keeps WSL up while containers run); on Linux a
-  systemd user service (at login; `loginctl enable-linger` for boot without login). `autostart off` removes it,
-  `autostart` alone tells whether it is on. To turn it on:
+- `autostart on` runs it at each logon: on Windows (also from WSL) the user's Run key `terminal-ct-resume` (no
+  administrator needed; from WSL: `conhost --headless wsl.exe ... resume --stay`, which keeps WSL up while
+  containers run); on Linux a systemd user service (at login; `loginctl enable-linger` for boot without login).
+  `autostart off` removes it, `autostart` alone tells whether it is on.
+- `agent --listen IP [--port N] --autostart on` does the same for this PC's agent, kept running (restarted when
+  it ends: systemd `Restart=on-failure`, launchd `KeepAlive` on macOS) and started now too; it prints the
+  `host add` line for the central PC. `--autostart off` removes it and stops the agent; `--autostart status`.
+  Real run (WSL): the agent answered 1 s after `on`, `host add` from a central store, `off` stopped it.
+  To turn `autostart` on:
 
   ```sh
   # from Windows, terminal-ct in WSL (Claude Code: prefix with ! to run it in the session)
