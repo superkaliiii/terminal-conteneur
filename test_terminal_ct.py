@@ -1810,7 +1810,7 @@ class ProjectsAndResume(unittest.TestCase):
         def run(args, **k):
             calls.append(args); return subprocess.CompletedProcess(args, 0, "", "")
         home = tempfile.mkdtemp()
-        with unittest.mock.patch.object(ct.subprocess, "run", run), unittest.mock.patch.object(ct, "in_wsl", lambda: False), \
+        with unittest.mock.patch.object(ct.subprocess, "run", run), unittest.mock.patch.object(ct, "in_wsl", lambda: False), unittest.mock.patch.object(ct.sys, "platform", "linux"), \
                 unittest.mock.patch.object(ct, "WINDOWS", False), unittest.mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home, "TERMINAL_CT_HOME": "/s t"}):
             out = ct.autostart(True)
         with open(out["unit"]) as f:
