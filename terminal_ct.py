@@ -6098,12 +6098,12 @@ def doctor_report():
     """doctor --report: versions, checks, state and the end of the logs, masked; written to a file to attach."""
     parts = [f"terminal-ct {VERSION}", f"python {sys.version.split()[0]} on {platform.platform()}"
              + (" (WSL)" if in_wsl() else ""), "", "== checks", json.dumps(doctor_checks(), indent=1)]
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(Exception, SystemExit):
         parts += ["", "== nodes and PCs", json.dumps([{k: n.get(k) for k in ("node", "kind", "status", "engine")}
                                                       for n in node_ls()], indent=1)]
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(Exception, SystemExit):
         parts += ["", "== quota", json.dumps(quota(), indent=1)]
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(Exception, SystemExit):
         parts += ["", "== daemon", json.dumps({"running": daemon_alive(), "stacks": stacks()})]
     for name in ("events.log", "daemon.log", os.path.join(WEB_DIR, "actions.log")):
         with contextlib.suppress(OSError):

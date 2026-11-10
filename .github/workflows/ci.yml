@@ -78,6 +78,7 @@ jobs:
           test -f "$("$RUNNER_TEMP/npm/bin/terminal-ct" skills path)"
       - name: System packages
         run: |
+          sudo apt-get update -qq
           sudo apt-get install -y -qq rpm >/dev/null
           sh packaging/build.sh "$RUNNER_TEMP/pkgs"
           sudo apt-get install -y -qq "$RUNNER_TEMP"/pkgs/*.deb >/dev/null
