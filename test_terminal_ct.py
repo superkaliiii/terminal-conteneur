@@ -787,7 +787,7 @@ class Phase8(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "387455b4b6b8816aeb0bf16492484b9f6a60a0c710062f2abb0d2ac2fde86662"
+    SHARED_SHA = "9e5cc401b4e9f239cd5e7c3461117645a0fd33d8f9bff7fc8ef37b2acb8d06a3"
 
     @staticmethod
     def block(path):

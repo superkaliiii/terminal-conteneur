@@ -4186,7 +4186,8 @@ function renderCts(d) {
         r.flags.includes("D") && run ? shotButton("ct", r.name) : null,
         button("rm", {op: "rm", name: r.name}, "Remove " + r.name + " and its /data?" + (r.stack ? " (a stack replica: the daemon makes it again, with an empty /data)" : ""), "danger")]);
     tb.append(keyed(r.name, {acts}, h("td", null, h("b", {textContent: r.name}),
-      r.node ? h("span", {className: "mute", textContent: " @" + r.node, title: "in node " + r.node}) : null), h("td", {className: r.status, textContent: r.status}),
+      r.node ? h("span", {className: "mute", textContent: " @" + r.node, title: "in node " + r.node}) : null,
+      r.description ? h("div", {className: "mute", textContent: r.description}) : null), h("td", {className: r.status, textContent: r.status}),
       h("td", {className: r.health.split(" ")[0], textContent: r.health}), h("td", {textContent: r.project}), h("td", {textContent: r.stack || "-"}),
       h("td", null, spark(hh.cpu, Math.max(100, cpuMax), css("--cpu")), r.cpu_percent == null ? "-" : r.cpu_percent + "%"),
       h("td", null, spark(hh.mem, memMax, css("--mem")), (r.used_memory_gb == null ? "-" : r.used_memory_gb) + " / " + (r.memory_gb || "-") + " GiB"),
@@ -4246,7 +4247,8 @@ function renderVms(v) {
       m.engine ? null : run ? button("stop", {kind: "vm", op: "stop", name: m.name}, "Stop VM " + m.name + "?")
         : button("start", {kind: "vm", op: "start", name: m.name}), run ? shotButton("vm", m.name) : null,
       run && !m.engine ? button("force stop", {kind: "vm", op: "force_stop", name: m.name}, "Power off VM " + m.name + " at once (like pulling the plug)?", "danger") : null]);
-    tb.append(keyed(m.name, {acts}, h("td", null, h("b", {textContent: m.name})), h("td", {textContent: m.os || "-"}),
+    tb.append(keyed(m.name, {acts}, h("td", null, h("b", {textContent: m.name}),
+      m.description ? h("div", {className: "mute", textContent: m.description}) : null), h("td", {textContent: m.os || "-"}),
       h("td", {className: run ? "running" : "exited", textContent: m.status || "-"}), h("td", {textContent: m.project || "-"}),
       h("td", {textContent: m.cpu_percent == null ? "-" : m.cpu_percent + "%"}),
       h("td", {textContent: (m.host_memory_gb == null ? "-" : m.host_memory_gb) + " / " + (m.memory_gb || "-") + " GiB"}),
