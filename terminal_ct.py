@@ -2906,7 +2906,8 @@ def _reconcile(s, st, now):
         any(k.startswith(name + "-") for k in placement)  # it uses nodes, or did
     up = nodes_up() if on_nodes else {}
     fails = st.setdefault("-nodes", {})  # failed passes in a row per node ("-": never a container's name)
-    tick = PASS[0] or now  # the daemon's pass: every stack of one pass sees the same failure, counted once
+    # the daemon's pass: every stack of one pass sees the same failure, counted once; else each call is its own pass
+    tick = PASS[0] or secrets.token_hex(6)  # not now: two calls within one tick of a coarse clock (Windows) are two
 
     def miss(n):
         v = fails.get(n)
