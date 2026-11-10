@@ -666,7 +666,7 @@ class Web(unittest.TestCase):
             self.assertEqual([(m["name"], m.get("cpu_percent")) for m in v["vms"]], [("wn", 7), ("deb", None)])
             self.assertEqual([m["name"] for m in ct.vm_state("lab")["vms"]], ["deb"])
             self.assertEqual(ct.web_api("GET", "/api/shot", {"kind": "vm", "name": "wn"}), ("image/png", b"PNGVM"))
-            self.assertEqual(os.listdir(os.path.join(ct.STORE, "web")), [])                 # temporary file removed
+            self.assertEqual(os.listdir(os.path.join(ct.STORE, ".web")), [])                 # temporary file removed
             self.assertEqual(ct.web_api("POST", "/api/do", {}, {"kind": "vm", "op": "start", "name": "wn"})[1],
                              {"started": "wn"})                                              # progress lines skipped
             self.assertEqual(ct.web_api("POST", "/api/do", {}, {"kind": "vm", "op": "force_stop", "name": "wn"})[1],
@@ -787,7 +787,7 @@ class Phase8(unittest.TestCase):
 class SharedDashboard(unittest.TestCase):
     """The web dashboard's code is one block, identical in terminal-ct and terminal-vm: change it in both, then set
     SHARED_SHA in both tests to the new value."""
-    SHARED_SHA = "9e5cc401b4e9f239cd5e7c3461117645a0fd33d8f9bff7fc8ef37b2acb8d06a3"
+    SHARED_SHA = "1438c234262934d5b591839c36d218bb09d2204f8bc14b6e2a6d0666630ab50f"
 
     @staticmethod
     def block(path):
@@ -1445,6 +1445,39 @@ class Descriptions(unittest.TestCase):
         self.assertEqual(ct.descriptions(), {"project:default": "the docs"})
         quiet(ct.create, "web")                                           # a new one of that name says nothing
         self.assertNotIn("description", ct.normalize(ct.find("web")))
+
+    def test_review_fixes(self):
+        for bad in ("descriptions.json", "stacks", "projects", "daemon.beat", "x.log"):  # STORE/NAME is its folder
+            with self.assertRaisesRegex(SystemExit, "reserved"):
+                ct.check_name(bad)
+        self.assertEqual(ct.check_name("web"), "web")                                 # a common name stays free
+        old = os.path.join(ct.STORE, "web"); os.makedirs(old)
+        with open(os.path.join(old, "actions.log"), "w") as f:
+            f.write("{}\n")
+        open(os.path.join(old, "run"), "w").close()                                   # a container web's own
+        self.assertTrue(os.path.isfile(os.path.join(ct._web_dir(), "actions.log")))   # the audit log moved out
+        self.assertEqual(os.listdir(old), ["run"])
+        ct.apply({"stack": "s", "project": "alpha", "services": {"api": {"image": "debian:stable-slim",
+                                                                         "networks": ["back"], "node": "n9"}}},
+                 created_by="agent")
+        with self.assertRaisesRegex(SystemExit, "no network 'back'"):                 # another project's: unseen,
+            ct.agent_call("describe", {"kind": "net", "name": "back", "description": "x"}, self.approve,
+                          project="beta")                                             # and nothing asked
+        self.assertEqual(self.asked, [])
+        ct.agent_call("describe", {"kind": "net", "name": "back", "description": "api's"}, self.refuse,
+                      project="alpha")                                                # its own stack's: free
+        st = {"stack": "u", "services": {"db": {"image": "debian:stable-slim"}}}
+        ct.apply(st); ct.reconcile("u")
+        with self.assertRaisesRegex(SystemExit, "description on its service"):
+            ct.describe("container", "u-db-1", "x")
+        with self.assertRaisesRegex(SystemExit, "no node named 'n1'"):               # checked before asking
+            ct.agent_call("describe", {"kind": "node", "name": "n1", "description": "x"}, self.refuse)
+        ct.stack_rm("s")
+        self.assertNotIn("net:back", ct.descriptions())                               # gone with the only stack
+        quiet(ct.create, "big", project="beta")
+        with unittest.mock.patch.object(ct, "vm_state", lambda project=None: {"vms": []}):
+            q = ct.infra("alpha")["pcs_and_nodes"][0]["quota"]
+        self.assertEqual(set(q["cpus"]), {"limit", "free", "used"})                   # alpha's use, not beta's
 
     def test_stack_service_description_recreates_nothing(self):
         st = {"stack": "s", "services": {"api": {"image": "debian:stable-slim", "description": "the API"}}}
@@ -2133,7 +2166,7 @@ class Hosts(unittest.TestCase):
         with unittest.mock.patch.object(ct, "vm_cli", lambda: None):
             with self.assertRaisesRegex(RuntimeError, "not running"):          # failed there: nothing left
                 ct.web_api("GET", "/api/shot", {"kind": "vm", "name": "win@pc1"}, None)
-            self.assertEqual(os.listdir(os.path.join(ct.STORE, "web")), [])
+            self.assertEqual(os.listdir(os.path.join(ct.STORE, ".web")), [])
             with self.assertRaises(ValueError):
                 ct.vm_where("deb@")
             self.pc_vms["pc2"] = "garbled"                                     # one PC answering badly

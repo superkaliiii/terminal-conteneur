@@ -57,9 +57,14 @@ KEEP_ALIVE = ["tail", "-f", "/dev/null"]  # for images whose default command is 
 SHELLS = {"sh", "bash", "ash", "zsh", "/bin/sh", "/bin/bash", "/bin/ash", "/bin/zsh"}
 
 
+STORE_OWN = ("projects", "stacks", "build", "agent")  # STORE/NAME is a container's folder: never these
+
+
 def check_name(name):
     if not re.fullmatch(r"[a-z0-9]([a-z0-9_.-]{0,46}[a-z0-9])?", name or ""):
         raise SystemExit(f"invalid name: {name!r} (lowercase letters, digits, _ . -)")
+    if name in STORE_OWN or name.startswith("daemon.") or name.endswith((".json", ".log", ".token", ".conf", ".lock")):
+        raise SystemExit(f"{name!r} is reserved for terminal-ct's own files: choose another name")
     return name
 
 
@@ -1850,8 +1855,8 @@ def top():
 # Internet is the engine's default bridge: a container is plugged into it or not. Changes apply to stopped
 # containers (Podman's DNS inside a running one kept the old setup).
 
-def networks():
-    """terminal-ct's networks: {name: {"created_by", "members"}}."""
+def networks(members=True):
+    """terminal-ct's networks: {name: {"created_by", "members"}}. members=False: not listed (one engine call less)."""
     ids = node().run(["network", "ls", "-q", "--filter", f"label={LABEL}.net"]).stdout.split()
     out = {}
     for n in node().json(["network", "inspect", *ids]) if ids else []:
@@ -1861,7 +1866,7 @@ def networks():
             out[lab[f"{LABEL}.net"]] = {"created_by": lab.get(f"{LABEL}.created_by", "user"),
                                         "project": lab.get(f"{LABEL}.project") or DEFAULT_PROJECT, "members": [],
                                         **({"description": desc} if desc else {})}
-    if out:
+    if out and members:
         for c in raw_containers():
             for k in networks_of(c):
                 if k.startswith(NET_PREFIX) and k[len(NET_PREFIX):] in out:
@@ -2118,13 +2123,15 @@ def descriptions():
     path = os.path.join(STORE, "descriptions.json")
     try:
         st = os.stat(path)
-        key = (path, st.st_mtime_ns, st.st_size)
-        if key not in _DESC:
+        key = (path, st.st_ino, st.st_mtime_ns, st.st_size)
+        d = _DESC.get(key)
+        if d is None:
             with open(path, encoding="utf-8") as f:
                 d = json.load(f)
-            _DESC.clear()
-            _DESC[key] = d if isinstance(d, dict) else {}
-        return _DESC[key]
+            d = d if isinstance(d, dict) else {}
+            _DESC.clear()  # one file: the last read only (threads of the web dashboard may race here, harmlessly)
+            _DESC[key] = d
+        return d
     except (OSError, ValueError):
         return {}
 
@@ -2137,6 +2144,7 @@ def set_description(kind, name, text):
     """Set NAME's description; "" clears it. No check that NAME exists (describe does): rm uses it to forget."""
     text = check_description(text)
     with quota_lock("descriptions"):
+        _DESC.clear()  # under the lock, from the file itself: never merged into a stale copy
         d = dict(descriptions())
         if text:
             d[f"{kind}:{name}"] = text
@@ -2157,15 +2165,22 @@ def service_description(stack, svc):
     return ""
 
 
-def known_net(net):
-    """A network of this engine, or one a stack puts on nodes (it lives in each node's engine)."""
-    if net in networks():
-        return True
+def stack_net_owner(net, project=None):
+    """Who made the stacks (of project, None: all) that put NET on nodes: "agent" when only agents' stacks use it,
+    "user" when one of the user's does, None when none does."""
+    owners = set()
     for s in stacks():
         with contextlib.suppress(SystemExit, OSError, ValueError):
-            if any(net in (c.get("networks") or []) for c in load_stack(s)["services"].values()):
-                return True
-    return False
+            st = load_stack(s)
+            if under(st.get("project") or DEFAULT_PROJECT, project) and \
+                    any(net in (c.get("networks") or []) for c in st["services"].values()):
+                owners.add(st.get("created_by", "user"))
+    return None if not owners else "agent" if owners == {"agent"} else "user"
+
+
+def known_net(net):
+    """A network of this engine, or one a stack puts on nodes (it lives in each node's engine)."""
+    return net in networks() or stack_net_owner(net) is not None
 
 
 def describe(kind, name, text):
@@ -2183,7 +2198,10 @@ def describe(kind, name, text):
     else:
         where = _nodes()["placement"].get(check_name(name))
         with on_node(where) if where else contextlib.nullcontext():
-            find(name)
+            stack = labels_of(find(name)).get(f"{LABEL}.stack")
+        if stack:  # the daemon remakes replicas: the description goes with the service
+            raise SystemExit(f"{name} is a replica of stack {stack}: put a description on its service in the stack "
+                             "file, then apply it")
     return set_description(kind, name, text)
 
 
@@ -2880,7 +2898,7 @@ def stack_show(name):
 def stack_rm(name):
     """Remove a stack: its desired state, then its containers with their /data (networks stay: other stacks may
     use them)."""
-    load_stack(name)
+    nets = {n for c in load_stack(name)["services"].values() for n in c.get("networks") or []}
     with quota_lock("stacks"), quota_lock("reconcile"):
         st, gone = _state(), []
         for where, cs in everywhere():  # first: an unreachable engine keeps the stack, not orphan containers
@@ -2895,6 +2913,9 @@ def stack_rm(name):
                     gone.append(n)
         _save_state(st)
         os.remove(os.path.join(stacks_dir(), name + ".json"))
+    for n in nets:
+        if not known_net(n):
+            set_description("net", n, "")
     left = sorted(f"{c} (node {n})" for c, n in _nodes()["placement"].items() if c.startswith(name + "-"))
     event("stack_removed", name, detail=f"{len(gone)} containers" + (f"; left on nodes down: {', '.join(left)}"
                                                                     if left else ""))
@@ -3054,9 +3075,9 @@ def dashboard_data(project=None, with_quota=True):
             "quota": q, "events": events(n=8, project=project)}
 
 
-def project_quota(project, infos):
-    """The quota; for a project (infos: its containers), its own use next to what is left all told."""
-    q = quota()
+def project_quota(project, infos, q=None):
+    """The quota (q: already read); for a project (infos: its containers), its own use next to what is left."""
+    q = q or quota()
     if project:
         use = {"cpus": 0, "memory_gb": 0, "containers": 0}
         for c in infos:
@@ -3169,20 +3190,42 @@ def infra(project=None):
                           {"image": info.get("image")}),
                        **({"description": t} if (t := description("host" if host else "node", n)) else {}),
                        **({"approved_for": approved[n]} if n in approved else {})})
-    rows = []
-    for pl in places:
-        if not pl["reachable"]:
-            continue
+    rows, seen = [], {}
+    engine = getattr(_LOCAL, "node", None)  # this command's engine (--engine): each thread starts from it
+
+    def look(pl):
+        _LOCAL.node = engine
         where = None if pl["kind"] == "local" else pl["name"]
         try:
             with on_node(where, LOOK_TIMEOUT) if where else contextlib.nullcontext():
                 every = raw_containers(size=True)  # one listing for the quota and the rows
                 cs = [c for c in every if mine(labels_of(c).get(f"{LABEL}.project"))]
-                stats = _stats([c for c in cs if running(c)])
-                pl["quota"] = quota(infos=every)
+                seen[pl["name"]] = (cs, _stats([c for c in cs if running(c)]))
+                pl["quota"] = project_quota(project, cs, quota(infos=every))
         except (SystemExit, RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as e:
             pl.update(reachable=False, error=str(e)[:200])
+
+    side = {}
+
+    def aside(key, f):  # this PC's networks and terminal-vm's VMs, read while the places answer
+        _LOCAL.node = engine
+        with contextlib.suppress(SystemExit, RuntimeError, OSError, ValueError, subprocess.TimeoutExpired):
+            side[key] = f()
+
+    threads = [threading.Thread(target=look, args=(pl,), daemon=True) for pl in places if pl["reachable"]] + \
+        [threading.Thread(target=aside, args=("nets", lambda: networks(members=False)), daemon=True),
+         threading.Thread(target=aside, args=("vms", lambda: vm_state(project)), daemon=True)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(LOOK_TIMEOUT * 4)  # shortcut: a place still answering after that is left out, not waited for
+    for pl in places:
+        if pl["reachable"] and pl["name"] not in seen:
+            pl.update(reachable=False, error=pl.get("error") or "no answer in time")
             continue
+        if not pl["reachable"]:
+            continue
+        cs, stats = seen[pl["name"]]
         for c in cs:
             n, lab, ports = normalize(c), labels_of(c), None
             with contextlib.suppress(ValueError, TypeError, AttributeError):
@@ -3196,7 +3239,7 @@ def infra(project=None):
                          **{k: True for k in ("desktop", "sandbox") if n.get(k)},
                          **({"stack": "/".join(lab.get(f"{LABEL}.{k}", "") for k in ("stack", "service", "replica"))}
                             if lab.get(f"{LABEL}.stack") else {})})
-    nets = {k: dict(v, members=[]) for k, v in networks().items() if mine(v["project"])}  # members: from rows,
+    nets = {k: dict(v, members=[]) for k, v in side.get("nets", {}).items() if mine(v["project"])}  # from rows,
     for r in rows:                                                                         # this project's only
         for net in r["networks"]:
             if net not in nets:  # a network of nodes (a stack's): it lives in each node's engine
@@ -3210,7 +3253,7 @@ def infra(project=None):
             for nm in [r["name"]] + ([svc[0], f"{svc[0]}.{net}"] if svc and r["on"] != "this PC" else []):
                 if nm not in names:
                     names.append(nm)
-    vms = vm_state(project)
+    vms = side.get("vms") or {"vms": [], "note": "terminal-vm did not answer in time"}
     for v in vms.get("vms", []):
         if v.get("name") in d["nodes"]:
             v["node"] = True  # a node of terminal-ct (its containers above)
@@ -3568,8 +3611,7 @@ def _vm_state(project=None):
 
 def vm_screenshot(name):
     vm, host = vm_where(name)
-    os.makedirs(os.path.join(STORE, "web"), mode=0o700, exist_ok=True)
-    path = os.path.join(STORE, "web", f"vm-{vm}.{threading.get_ident()}.png")  # one per request: two tabs at once
+    path = os.path.join(_web_dir(), f"vm-{vm}.{threading.get_ident()}.png")  # one per request: two tabs at once
     try:
         if not host:
             vm_call(["action", vm, "screenshot", "--no-wake", "--output", path], timeout=20)  # looking is no use
@@ -3796,9 +3838,18 @@ WEB_ROLES = ("read", "full")  # read: look (every GET); full: act too (POST)
 WEB_SEEN = {}  # user: (time of its latest call, role): who is on the dashboard now
 
 
+WEB_DIR = ".web"  # a name no container or VM can take (STORE/NAME is theirs)
+
+
 def _web_dir():
-    d = os.path.join(STORE, "web")
-    os.makedirs(d, mode=0o700, exist_ok=True)
+    d = os.path.join(STORE, WEB_DIR)
+    if not os.path.isdir(d):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        old = os.path.join(STORE, "web")  # where they were: a container or VM named web shared (and rm'd) it
+        for f in (os.listdir(old) if os.path.isdir(old) else []):
+            if f == "actions.log" or f.startswith("cert-") and f.endswith(".pem"):  # the audit log, pinned certs
+                with contextlib.suppress(OSError):
+                    os.replace(os.path.join(old, f), os.path.join(d, f))
     return d
 
 
@@ -3910,7 +3961,7 @@ def _web_act_log(user, addr, path, body, error=None):
 def web_actions(n=20):
     """The latest actions done through the dashboard, newest first."""
     try:
-        with open(os.path.join(STORE, "web", "actions.log"), encoding="utf-8") as f:
+        with open(os.path.join(_web_dir(), "actions.log"), encoding="utf-8") as f:
             lines = f.readlines()[-n:]
     except OSError:
         return []
@@ -5322,7 +5373,7 @@ AGENT_TOOLS = [
              ["name", "action"])),
     ("ct_clone", "A new container from one as it is now (file system and a copy of /data), in seconds. Cloning one "
                  "of the user's containers needs their approval, and the clone starts offline.",
-     _schema({**_NAME, "new": {"type": "string"}, "project": {"type": "string"}}, ["name", "new"])),
+     _schema({**_NAME, "new": {"type": "string"}, "project": {"type": "string"}, **_DESC_ARG}, ["name", "new"])),
     ("ct_apply", "Apply a desired state: {\"stack\": NAME, \"services\": {SERVICE: {image, replicas, cpus, memory_gb, "
                  "desktop, sandbox (default true), internet, networks, cmd, restart: always|on-failure|never, health: "
                  "{exec, every, retries}, ttl: 30m}}}. Replicas are NAME-SERVICE-1..N; a daemon keeps them so "
@@ -5489,9 +5540,11 @@ def agent_describe(kind, name, text, approve, project=None):
     _LOCAL.node = None  # not a container: never routed to the node of a container of the same name
     if kind == "net":
         n = networks().get(check_name(name))
-        if n is not None and not under(n["project"], project) or n is None and not known_net(name):
+        owner = n["created_by"] if n is not None and under(n["project"], project) else \
+            stack_net_owner(name, project) if n is None else None  # another project's: the same as none
+        if owner is None:
             raise SystemExit(f"no network {name!r}; create it with: terminal-ct net create {name}")
-        if (n or {}).get("created_by") != "agent":
+        if owner != "agent":
             ask(f"your network {name}")
     elif kind == "project":
         if not under(check_project(name), project):
@@ -5499,6 +5552,8 @@ def agent_describe(kind, name, text, approve, project=None):
         if not project:
             ask(f"the project {name}")
     else:
+        if name not in _nodes()["nodes"] or is_host(name) != (kind == "host"):
+            raise SystemExit(f"no {kind} named {name!r} (terminal-ct {kind} ls)")
         ask(f"your {'other PC' if kind == 'host' else 'node'} {name}")
     return describe(kind, name, text)
 
@@ -5642,8 +5697,12 @@ def agent_call(tool, a, approve, project=None):
             raise SystemExit(f"the name {a['new']!r} is not available: choose another")
         if isinstance(node(), NodeRemote):  # a new container on someone's PC: through an approved stack only
             raise SystemExit(f"{name} is on another PC ({node().name}): an agent clones only on this PC")
-        return clone(name, a["new"], created_by="agent", project=where or labels_of(info).get(f"{LABEL}.project"),
-                     internet=False if users else None)
+        desc = check_description(a.get("description") or "")
+        out = clone(name, a["new"], created_by="agent", project=where or labels_of(info).get(f"{LABEL}.project"),
+                    internet=False if users else None)
+        if desc:
+            set_description("container", a["new"], desc)
+        return out
     if tool == "ct_start":
         guard_("start", f"terminal-ct start {name}")
         return quiet(start, name)
@@ -5757,7 +5816,8 @@ def mcp(name=None, project=None):
         elif method == "tools/call":
             p = req.get("params", {})
             tool, a = p.get("name"), dict(p.get("arguments") or {})
-            target = a.get("name") if tool in AGENT_NAMES else a.pop("container", None) or name
+            target = (None if tool == "describe" and a.get("kind") != "container" else a.get("name")) \
+                if tool in AGENT_NAMES else a.pop("container", None) or name
             where = _nodes()["placement"].get(target) if isinstance(target, str) else None
             _LOCAL.node = None
             try:
@@ -6239,6 +6299,8 @@ def main(argv=None):
         return dash(o.project)
     if o.cmd == "infra":
         m = infra(check_project(o.project) if o.project else None)
+        if not o.json and hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")  # a description in a script the console cannot show
         return show_json(m) if o.json else print(infra_text(m))
     if o.cmd == "web": return show_json(web_cli(o.web_args, o.role, not o.no_open, o.project, o.listen, o.port))
     if o.cmd == "agent": return agent(o.listen, o.port, o.rotate)
