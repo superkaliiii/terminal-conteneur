@@ -44,6 +44,7 @@ import importlib.util, ipaddress, http.client, signal, ssl
 
 VERSION = "0.9.0"
 WINDOWS = os.name == "nt"
+MAC = sys.platform == "darwin"
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {}  # the daemon has no console: no flash
 if not WINDOWS:
     import fcntl, termios, tty  # terminal viewer only
@@ -5939,20 +5940,175 @@ def skills(cmd, dest=None):
     print(json.dumps({"installed": os.path.join(dest, "SKILL.md")}))
 
 
-def doctor():
-    checks = []
-    for e in ("podman", "docker"):
-        p = shutil.which(e)
-        ver = subprocess.run([e, "--version"], capture_output=True, text=True).stdout.strip() if p else ""
-        checks.append({"check": e, "ok": bool(p), "detail": ver or "not installed"})
-    try:
-        n = node()
-        n.run(["ps", "-q"])
-        checks.append({"check": "engine", "ok": True, "detail": f"{n.engine} answers"})
-    except SystemExit as e:
-        checks.append({"check": "engine", "ok": False, "detail": str(e)})
-    print(json.dumps(checks, indent=1))
-    if not checks[-1]["ok"]:
+def _pkg(*names):
+    """The command that installs these packages on this system (first package manager found), or None."""
+    for exe, cmd in (("apt-get", "sudo apt-get install -y"), ("dnf", "sudo dnf install -y"), ("zypper", "sudo zypper install -y"),
+                     ("pacman", "sudo pacman -S --noconfirm"), ("apk", "sudo apk add"), ("brew", "brew install")):
+        if shutil.which(exe):
+            return f"{cmd} {' '.join(names)}"
+    return None
+
+
+def _standby_minutes():
+    """Minutes before Windows sleeps on mains power (from WSL too), None when unknown or not Windows."""
+    exe = "powercfg" if WINDOWS else "powercfg.exe" if in_wsl() and shutil.which("powercfg.exe") else None
+    if not exe:
+        return None
+    with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
+        out = subprocess.run([exe, "/query", "SCHEME_CURRENT", "SUB_SLEEP", "STANDBYIDLE"], capture_output=True,
+                             text=True, errors="replace", timeout=10, **NO_WINDOW).stdout  # an OEM code page
+        m = re.findall(r"0x([0-9a-fA-F]{8})", out)
+        return int(m[-2], 16) // 60 if len(m) >= 2 else None  # AC, then DC: seconds
+    return None
+
+
+def doctor_checks():
+    """Each known problem: {check, ok, detail, fix (the exact command), required}."""
+    out = []
+    def check(name, ok, detail, fix=None, required=True):
+        out.append({"check": name, "ok": bool(ok), "detail": detail, **({"fix": fix} if fix and not ok else {}),
+                    "required": required})
+    engines = {e: shutil.which(e) for e in ("podman", "docker")}
+    for e, path in engines.items():
+        ver = ""
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            ver = subprocess.run([e, "--version"], capture_output=True, text=True, timeout=20,
+                                 **NO_WINDOW).stdout.strip() if path else ""
+        check(e, path, ver or "not installed", _pkg(e) if e == "podman" else None, required=False)
+    if not any(engines.values()):
+        check("engine", False, "neither Podman nor Docker is installed",
+              _pkg("podman") or ("winget install RedHat.Podman" if WINDOWS else "brew install podman" if MAC
+                                 else "install Podman"))
+    else:
+        try:
+            n = node()
+            n.run(["ps", "-q"], timeout=60)
+            check("engine", True, f"{n.engine} answers")
+        except (SystemExit, subprocess.TimeoutExpired) as e:
+            msg, fix = str(e), None
+            low = msg.lower()
+            if "permission denied" in low and "docker" in low:
+                fix = "sudo usermod -aG docker $USER   (then log out and in again)"
+            elif "cannot connect to the docker daemon" in low or "is the docker daemon running" in low:
+                fix = "sudo systemctl start docker" if os.path.isdir("/run/systemd/system") else "sudo service docker start"
+            elif "newuidmap" in low or "subuid" in low or "subgid" in low:
+                fix = "sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER; podman system migrate"
+            elif MAC or WINDOWS:
+                fix = "podman machine init; podman machine start   (or start Docker Desktop)"
+            check("engine", False, msg[:300], fix)
+    if engines["podman"] and sys.platform.startswith("linux"):
+        try:
+            import getpass
+            me = getpass.getuser()
+            with open("/etc/subuid", encoding="utf-8") as f:
+                ok = any(l.split(":")[0] == me for l in f)
+        except (OSError, KeyError):
+            ok = False
+        check("podman rootless", ok, "subordinate ids for your user" if ok else "no line for you in /etc/subuid",
+              "sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER; podman system migrate",
+              required=False)
+    check("python", sys.version_info >= (3, 9), sys.version.split()[0], _pkg("python3"))
+    if in_wsl():
+        if engines["podman"]:
+            check("podman in WSL", True, "terminal-ct sets Podman's iptables firewall driver for its own calls (WSL's "
+                  "kernel lacks nftables pieces); for your own podman: add [network] firewall_driver = \"iptables\" "
+                  "to ~/.config/containers/containers.conf", required=False)
+        check("wsl", False, "WSL stops this distribution when no Windows program uses it, and its containers with it",
+              "terminal-ct autostart on   (a logon task keeps it running while containers want to run)",
+              required=False)
+    standby = _standby_minutes()
+    if standby is not None:
+        check("sleep", standby == 0, "this PC never sleeps on mains power" if standby == 0 else
+              f"this PC sleeps after {standby} min idle on mains power: containers and nodes pause with it",
+              "powercfg /change standby-timeout-ac 0", required=False)
+    if any(engines.values()):
+        with contextlib.suppress(SystemExit, OSError, ValueError, subprocess.SubprocessError):
+            free = node().free_bytes(node().host()[2]) / 2 ** 30
+            check("disk", free >= 5, f"{free:.0f} GiB free for images and containers",
+                  "free some space (terminal-ct prune; podman system prune)", required=False)
+    ossl = shutil.which("openssl")
+    check("openssl", ossl, ossl or "not found (agent and web --listen make their certificate with it)",
+          _pkg("openssl") or ("winget install ShiningLight.OpenSSL.Light" if WINDOWS else None), required=False)
+    viewer = shutil.which("vncviewer") or shutil.which("xtigervncviewer")
+    check("window viewer", viewer, viewer or "show NAME opens a desktop in a window with TigerVNC's viewer",
+          _pkg("tigervnc-viewer") if not (WINDOWS or MAC) else "winget install TigerVNC.TigerVNC" if WINDOWS
+          else "brew install --cask tigervnc-viewer", required=False)
+    vm = vm_cli()
+    check("terminal-vm", vm, " ".join(vm) if vm else "not found: nodes (node add) and VMs on the dashboard need it",
+          "install terminal-vm (its install.sh)", required=False)
+    claude = shutil.which("claude")
+    check("claude", claude, claude or "Claude Code not found: declare the MCP server in your agent's own way",
+          required=False)
+    return out
+
+
+_SECRET = re.compile(r"(?i)(token|password|passwd|secret|key)([\"']?\s*[:=]\s*[\"']?)[^\s\"',}]+")
+
+
+def known_secrets():
+    """The secrets this store holds (dashboard and agent tokens, other PCs' tokens): hidden wherever they show."""
+    out = []
+    for path in ("web.token", os.path.join("agent", "token")):
+        with contextlib.suppress(OSError):
+            with open(os.path.join(STORE, path), encoding="utf-8") as f:
+                out.append(f.read().strip())
+    with contextlib.suppress(Exception):
+        out += [h.get("token", "") for h in _hosts().values()]
+    return [x for x in out if len(x) >= 8]
+
+
+def mask(text, secrets=()):
+    """A report safe to attach to a ticket: known secrets, values after token=/password=..., the home folder, user
+    and host names."""
+    import getpass
+    for x in secrets:
+        text = text.replace(x, "<hidden>")
+    text = _SECRET.sub(lambda m: m.group(1) + m.group(2) + "<hidden>", text)
+    for real, alias in ((os.path.expanduser("~"), "~"), (platform.node(), "<host>")):
+        if real and len(real) > 1:
+            text = text.replace(real, alias)
+    with contextlib.suppress(Exception):
+        me = getpass.getuser()
+        if len(me) > 2:
+            text = re.sub(rf"\b{re.escape(me)}\b", "<user>", text)
+    return text
+
+
+def doctor_report():
+    """doctor --report: versions, checks, state and the end of the logs, masked; written to a file to attach."""
+    parts = [f"terminal-ct {VERSION}", f"python {sys.version.split()[0]} on {platform.platform()}"
+             + (" (WSL)" if in_wsl() else ""), "", "== checks", json.dumps(doctor_checks(), indent=1)]
+    with contextlib.suppress(Exception):
+        parts += ["", "== nodes and PCs", json.dumps([{k: n.get(k) for k in ("node", "kind", "status", "engine")}
+                                                      for n in node_ls()], indent=1)]
+    with contextlib.suppress(Exception):
+        parts += ["", "== quota", json.dumps(quota(), indent=1)]
+    with contextlib.suppress(Exception):
+        parts += ["", "== daemon", json.dumps({"running": daemon_alive(), "stacks": stacks()})]
+    for name in ("events.log", "daemon.log", os.path.join(WEB_DIR, "actions.log")):
+        with contextlib.suppress(OSError):
+            with open(os.path.join(STORE, name), encoding="utf-8", errors="replace") as f:
+                parts += ["", f"== {name} (last 60 lines)", "".join(collections.deque(f, 60)).rstrip()]
+    os.makedirs(STORE, exist_ok=True)
+    path = os.path.join(STORE, f"report-{time.strftime('%Y%m%d-%H%M%S')}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(mask("\n".join(parts), known_secrets()) + "\n")
+    return path
+
+
+def doctor(as_json=False, report=False):
+    if report:
+        path = doctor_report()
+        return print(f"report written (secrets, home folder, user and host names masked; read it before sending): "
+                     f"{path}")
+    checks = doctor_checks()
+    if as_json:
+        print(json.dumps(checks, indent=1))
+    else:
+        for c in checks:
+            mark = "ok " if c["ok"] else "ERR" if c["required"] else " - "
+            print(f"[{mark}] {c['check']:<16} {c['detail']}" + (f"\n      fix: {c['fix']}" if c.get("fix") else ""))
+    if not all(c["ok"] for c in checks if c["required"]):
         sys.exit(1)
 
 
@@ -6189,8 +6345,10 @@ def main(argv=None):
     x.add_argument("command", nargs=argparse.REMAINDER)
     im = sub.add_parser("image"); im.add_argument("image_cmd", choices=["ls", "pull", "build", "rm"])
     im.add_argument("ref", nargs="?"); im.add_argument("path", nargs="?")
-    for n in ("ls", "top", "doctor", "help", "version"):
+    for n in ("ls", "top", "help", "version"):
         sub.add_parser(n)
+    dr = sub.add_parser("doctor", help="known problems and their fix; --report: a masked report to attach to a ticket")
+    dr.add_argument("--json", action="store_true"); dr.add_argument("--report", action="store_true")
     o = p.parse_args(argv)
     for k in ("description", "host_desc", "node_desc", "net_desc"):  # refused before anything is made
         if getattr(o, k, None) is not None:
@@ -6254,7 +6412,7 @@ def main(argv=None):
         return print(json.dumps(out, indent=1))
     if o.cmd == "help": return p.print_help()
     if o.cmd == "version": return print(VERSION)
-    if o.cmd == "doctor": return doctor()
+    if o.cmd == "doctor": return doctor(o.json, o.report)
     if o.cmd == "ls": return ls()
     if o.cmd == "create":
         r = create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width,

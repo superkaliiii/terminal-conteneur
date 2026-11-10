@@ -1515,6 +1515,39 @@ class Descriptions(unittest.TestCase):
                           project="lab")
 
 
+class Doctor(unittest.TestCase):
+    """Phase 13.1: known problems with their fix, a masked report."""
+    def setUp(self):
+        self.n = ct.NODE = FakeNode()
+        ct.STORE = tempfile.mkdtemp()
+
+    def test_mask_hides_secrets_home_and_names(self):
+        home = os.path.expanduser("~")
+        text = (f"token=abc123SECRET path {home}/x X-Token: zz9 password: hunter2 "
+                f"{'q' * 43} Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.41")
+        out = ct.mask(text, ["q" * 43])
+        for gone in ("abc123SECRET", home, "zz9", "hunter2", "q" * 43):
+            self.assertNotIn(gone, out)
+        self.assertIn("~/x", out)
+        self.assertIn("microsoft-standard-WSL2", out)                     # not a secret: kept
+
+    def test_doctor_json_and_report(self):
+        with open(os.path.join(ct.STORE, "web.token"), "w") as f:
+            f.write("s" * 43)
+        with open(os.path.join(ct.STORE, "events.log"), "w") as f:
+            f.write(json.dumps({"event": "x", "detail": "s" * 43}) + "\n")
+        with unittest.mock.patch.object(ct.shutil, "which", lambda e: "/usr/bin/" + e if e == "podman" else None):
+            checks = ct.doctor_checks()
+            path = ct.doctor_report()
+        self.assertTrue(all({"check", "ok", "detail", "required"} <= set(c) for c in checks))
+        self.assertTrue(next(c for c in checks if c["check"] == "engine")["ok"])
+        self.assertFalse([c for c in checks if c["ok"] and "fix" in c])   # a fix only where something is wrong
+        with open(path, encoding="utf-8") as f:
+            report = f.read()
+        self.assertNotIn("s" * 43, report)
+        self.assertIn("== events.log", report)
+
+
 class ProjectsAndResume(unittest.TestCase):
     def setUp(self):
         self.n = ct.NODE = FakeNode()
