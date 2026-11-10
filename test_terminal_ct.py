@@ -2178,17 +2178,25 @@ class Hosts(unittest.TestCase):
         self.assertEqual(self.engines["pc1"].objects["tct-web"]["State"]["Status"], "running")
         rows = {c["name"]: c.get("node") for c in self.cli("ls")}
         self.assertEqual(rows, {"web": "pc1"})
-        for argv in (["--host", "pc1", "create", "d", "--desktop"], ["--host", "pc1", "create", "n", "--net", "lab"]):
-            with self.assertRaisesRegex(SystemExit, "phase 11 bis"):
-                self.cli(*argv)
-        with self.assertRaisesRegex(SystemExit, "phase 11 bis"):
+        with self.assertRaisesRegex(SystemExit, "no desktop there yet"):
+            self.cli("--host", "pc1", "create", "d", "--desktop")
+        with self.assertRaisesRegex(SystemExit, "no network 'lab'|net create lab"):  # its networks are its own
+            self.cli("--host", "pc1", "create", "n", "--net", "lab")
+        self.cli("--host", "pc1", "net", "create", "lab")
+        self.assertIn("tct-net-lab", self.engines["pc1"].nets)                   # made there
+        self.assertNotIn("tct-net-lab", self.local.nets)
+        self.cli("--host", "pc1", "create", "n", "--net", "lab", "--ports", "8080")
+        args = next(c for c in self.engines["pc1"].calls if c[:3] == ["create", "--name", "tct-n"])
+        self.assertIn("192.168.1.20:8080:8080", args)                           # on the address pc1 is reached by
+        self.assertEqual(self.cli("--host", "pc1", "net", "ls")["lab"]["members"], ["n"])
+        with self.assertRaisesRegex(SystemExit, "its networks are its own"):
             self.cli("node", "join", "pc1", "lab")
         ct.NODE = None
         with ct.on_node("pc1"), self.assertRaisesRegex(RuntimeError, "another PC"):  # no terminal-ct copied there
             ct.act("web", "screenshot", {})
         ct.NODE = self.local
         self.assertFalse([a for _, a in self.execs if "_act" in a or "mkdir" in " ".join(a)])
-        with self.assertRaisesRegex(SystemExit, "phase 11 bis"):
+        with self.assertRaisesRegex(SystemExit, "no desktop there yet"):
             ct.apply({"stack": "d", "services": {"s": {"image": "alpine:3.20", "node": "pc1",
                                                                              "desktop": True}}})
         self.down.add("pc1")                                                   # that PC gone: left out of ls
@@ -2198,7 +2206,7 @@ class Hosts(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "still has containers"):
             self.cli("host", "rm", "pc1")
         r = self.cli("host", "rm", "pc1", "--force")
-        self.assertEqual(r, {"removed": "pc1", "containers": ["web"]})
+        self.assertEqual(r, {"removed": "pc1", "containers": ["n", "web"]})
         self.assertNotIn("tct-web", self.engines["pc1"].objects)
         self.assertEqual((ct._hosts(), ct._nodes()["nodes"]), ({}, {}))
         with self.assertRaisesRegex(SystemExit, "no host named"):

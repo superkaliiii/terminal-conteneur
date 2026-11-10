@@ -825,6 +825,18 @@ class NodeRemote(NodeVM):
         except SystemExit:  # shortcut: Docker Desktop (a Mac) keeps its store in its own VM, not on that PC: the
             return super().free_bytes("/")  # PC's own disk then; upgrade: read that VM's space (docker system df)
 
+    def address(self):
+        """This PC's address as the central PC reaches it (its agent's, or the SSH host's): where its containers'
+        ports are published, not on every interface of someone's computer."""
+        host = urllib.parse.urlsplit(self.remote["url"]).hostname or ""
+        try:
+            return str(ipaddress.ip_address(host))
+        except ValueError:  # an SSH host name: the address it has from here
+            try:
+                return socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+            except (OSError, IndexError) as e:
+                raise SystemExit(f"host {self.name}: cannot resolve {host} ({e})") from None
+
     def _ssh(self, scp=False):
         try:
             u, port = ssh_target(self.remote["url"])
@@ -1147,7 +1159,8 @@ def node_join(node, net, wait=180):
     """Plug a node into network NET (its VM restarts: network cards change on a stopped VM)."""
     node_named(node)
     if is_host(node):
-        raise SystemExit(f"{node} is another PC: networks across PCs come in phase 11 bis")
+        raise SystemExit(f"{node} is another PC: its networks are its own (terminal-ct --host {node} net create "
+                         "NET); between PCs, a service is reached through the relay")
     check_name(net)
     if net in node_vm_nets(node):
         return {"node": node, "network": net, "already": True}
@@ -1249,7 +1262,7 @@ def node_routes(name, info):
     """A container of a node on networks between nodes AND on the internet bridge: its default route goes to the
     internet bridge, which may not reach those networks; so a route to each network's 10.77.N.0/24 through that
     network's own bridge, set from the node in its namespace (it gets no capability for it). Again at each start."""
-    if not isinstance(node(), NodeVM):
+    if type(node()) is not NodeVM:  # another PC's networks are its engine's own: no routes between nodes
         return
     on = [k[len(NET_PREFIX):] for k in networks_of(info) if k.startswith(NET_PREFIX)]
     if not on or (len(on) == 1 and BRIDGE["docker"] not in networks_of(info)):
@@ -1507,9 +1520,8 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     recover(name)  # an interrupted remake's container is still NAME's: never create over it
     if node().run(["inspect", "--type", "container", PREFIX + name], check=False).returncode == 0:
         raise SystemExit(f"{name!r} already exists (engine name {PREFIX}{name})")
-    if isinstance(node(), NodeRemote) and (desktop or nets or ports):
-        raise SystemExit(f"a container on another PC ({node().name}): no desktop, networks or ports yet "
-                         "(phase 11 bis)")
+    if isinstance(node(), NodeRemote) and desktop:
+        raise SystemExit(f"a container on another PC ({node().name}): no desktop there yet")
     if desktop:
         # shortcut: the VNC unix socket does not cross into Windows, and a node's paths would be Windows ones;
         # run terminal-ct inside WSL there
@@ -1523,10 +1535,11 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     if cpus <= 0 or memory < 0.0625:
         raise SystemExit("--cpus must be > 0 and --memory at least 0.0625 GiB (64 MiB)")
     ports = [int(p) for p in ports or ()]
-    if ports and (not isinstance(node(), NodeVM) or not nets or not all(1 <= p <= 65535 for p in ports)):
-        raise SystemExit("ports (1-65535) are for a container on a network of nodes: published on that node's "
-                         "address of the network (--node N --net NET)")
-    if nets and isinstance(node(), NodeVM):  # the node's networks made so (address, firewall, DNS) first
+    if ports and (not (type(node()) is NodeVM and nets or isinstance(node(), NodeRemote))
+                  or not all(1 <= p <= 65535 for p in ports)):
+        raise SystemExit("ports (1-65535) are for a container on a network of nodes (published on that node's "
+                         "address of the network: --node N --net NET) or on another PC (on its address: --host PC)")
+    if nets and type(node()) is NodeVM:  # the node's networks made so (address, firewall, DNS) first
         joined = ensure_node_nets(node().name)
         missing = [n for n in nets if n not in joined]
         if missing:
@@ -1597,7 +1610,9 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
             node().run(["run", "--rm", "--network", "none", "--user", "0", "--entrypoint", "chown",
                         "-v", f"{volume}:/data", image, f"{uid}:{gid}", "/data"])
         data = ["-v", f"{volume}:/data"]
-    if nets and isinstance(node(), NodeVM):
+    if isinstance(node(), NodeRemote):  # on the address the central PC reaches it by: never all of its interfaces
+        extra += [x for p in spec.get("ports") or () for x in ("-p", f"{node().address()}:{p}:{p}")]
+    if nets and type(node()) is NodeVM:
         joined = ensure_node_nets(node().name)
         for n in nets:
             extra += ["--dns", joined[n]["gateway"], *(x for p in spec.get("ports") or () for x in
@@ -1767,7 +1782,7 @@ def start(name):
             if labels_of(info).get(f"{LABEL}.sandbox") == "1" and (info.get("State") or {}).get("Status") != "created":
                 info = remake(name, info)  # a sandbox starts from its image every time
                 out["fresh"] = True
-            if isinstance(node(), NodeVM) and any(k.startswith(NET_PREFIX) for k in networks_of(info)):
+            if type(node()) is NodeVM and any(k.startswith(NET_PREFIX) for k in networks_of(info)):
                 ensure_node_nets(node().name)  # after a node restart its rules are gone: back before it runs
             node().run(["start", PREFIX + name])
             node_routes(name, info)
@@ -2596,9 +2611,8 @@ def check_stack(s):
             check_name(n)
         if c.get("node") is not None:
             check_name(c["node"])
-            if is_host(c["node"]) and (c.get("desktop") or c.get("networks")):
-                raise SystemExit(f"service {svc}: {c['node']} is another PC: no desktop or networks there yet "
-                                 "(phase 11 bis)")
+            if is_host(c["node"]) and c.get("desktop"):
+                raise SystemExit(f"service {svc}: {c['node']} is another PC: no desktop there yet")
         if c.get("spread") not in (None, "nodes"):
             raise SystemExit(f'service {svc}: spread is "nodes" (its replicas across the nodes)')
         if c.get("node") and c.get("spread"):
@@ -5190,7 +5204,7 @@ def desktop(name):
 def act(name, tool, a):
     """Shared by the CLI and MCP. Coordinates are pixels of the latest screenshot."""
     if isinstance(node(), NodeRemote):  # never terminal-ct copied onto someone's PC
-        raise RuntimeError(f"{name} is on another PC ({node().name}): no desktop there yet (phase 11 bis)")
+        raise RuntimeError(f"{name} is on another PC ({node().name}): no desktop there yet")
     if isinstance(node(), NodeVM):  # the desktop's socket is in the node: terminal-ct there does it
         return node().act(name, tool, a)
     if tool == "ready":

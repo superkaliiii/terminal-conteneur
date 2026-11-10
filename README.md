@@ -203,6 +203,12 @@ runs what it is sent (engine calls, file copies, terminal-vm). Another PC is a n
   Podman 4 or later first, else Docker (`--with` picks one). Kept in `STORE/hosts.json` (owner only). `host ls` shows
   them with whether they answer; `host rm NAME` refuses while containers live there, `--force` removes them first
   (a PC that does not answer keeps its containers running: remove them there).
+- **Networks and ports on another PC**: its networks are its own engine's (`terminal-ct --host PC net create NET`,
+  `net ls`, `net rm`); its containers on them reach each other by name, as here. `--ports N` publishes on the
+  address the central PC reaches that PC by (its agent's, or the SSH host's), never on all of its interfaces. A
+  stack service pinned there (`"node": "PC"`) takes networks too. Real run (WSL, over SSH, Docker there): a client
+  reached `web` by name on that PC's network, and its published port answered on that address only. Containers of
+  different PCs reach each other through the relay (next).
 - **Quota on another PC**: someone's computer, as this one is: by default cores - 1 and 75% of its memory;
   `terminal-ct --host PC quota --cpus N --memory GiB` sets it (`STORE/quota-PC.json`), never this PC's quota.
 - **Failover between PCs**: a stack service with `"spread": "nodes"` uses the other PCs that answer like VM nodes.
