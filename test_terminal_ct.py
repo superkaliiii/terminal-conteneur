@@ -1953,6 +1953,19 @@ class Desktop(unittest.TestCase):
             ct.create("d", image="alpine:3.20", desktop=True)
 
 
+class ExecCli(unittest.TestCase):
+    def test_options_before_the_double_dash(self):
+        """exec NAME --timeout S -- CMD: --timeout is exec's (it ran as the command, found by a real run)."""
+        seen = []
+        with unittest.mock.patch.object(ct, "exec_", lambda n, c, t: seen.append((n, c, t)) or {"exit": 0}):
+            for argv in (["exec", "x", "--timeout", "7", "--", "sleep", "1"], ["exec", "x", "ls", "-la"],
+                         ["exec", "x", "--", "echo", "--timeout"]):
+                with self.assertRaises(SystemExit) as e:
+                    ct.main(argv)
+                self.assertEqual(e.exception.code, 0)
+        self.assertEqual(seen, [("x", ["sleep", "1"], 7.0), ("x", ["ls", "-la"], 60), ("x", ["echo", "--timeout"], 60)])
+
+
 class Keys(unittest.TestCase):
     def test_keysyms(self):
         self.assertEqual(ct.chord("ctrl+shift+t"), [0xFFE3, 0xFFE1, ord("t")])

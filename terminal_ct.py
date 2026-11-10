@@ -7232,6 +7232,10 @@ def main(argv=None):
     if o.cmd == "rm": return rm(o.name)  # from its node, rm forgets where it was
     if o.cmd == "status": return status(o.name)
     if o.cmd == "exec":
+        if cmd_args and o.command:  # exec NAME --timeout S -- CMD: before --, exec's own options (REMAINDER took them)
+            xo = argparse.ArgumentParser(prog="terminal-ct exec NAME")
+            xo.add_argument("--timeout", type=float, default=o.timeout)
+            o.timeout, o.command = xo.parse_args(o.command).timeout, None
         out = exec_(o.name, o.command or cmd_args, o.timeout)
         sys.exit(out["exit"])
     if o.cmd == "image":
