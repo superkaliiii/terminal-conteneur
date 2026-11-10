@@ -1886,11 +1886,11 @@ class ProjectsAndResume(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ct.agent_autostart(True, "pc.lan")                              # an address, never a name
         self.assertEqual(calls[0][:5], ["reg.exe", "add", RUN_KEY, "/v", "terminal-ct-agent"])
-        self.assertTrue(out["runs"].endswith(" agent --listen 10.0.0.5 --port 7173"))
+        self.assertTrue(out["runs"].endswith(" agent --listen 10.0.0.5 --port 7173 --stay"))
         now = calls[1][-1]                                                     # started now too, by Windows
         self.assertEqual(calls[1][0], "powershell.exe")
         self.assertTrue(now.startswith("Start-Process conhost.exe -WindowStyle Hidden -ArgumentList '--headless wsl.exe "))
-        self.assertTrue(now.endswith(" agent --listen 10.0.0.5 --port 7173'"))
+        self.assertTrue(now.endswith(" agent --listen 10.0.0.5 --port 7173 --stay'"))
         self.assertEqual((out["url"], out["fingerprint"]), ("https://10.0.0.5:7173", "ab" * 32))
         for platform in ("linux", "darwin"):
             calls.clear()

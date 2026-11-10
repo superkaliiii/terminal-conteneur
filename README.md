@@ -460,7 +460,7 @@ An agent arriving in the infrastructure learns who does what in one call:
   containers run); on Linux a systemd user service (at login; `loginctl enable-linger` for boot without login).
   `autostart off` removes it, `autostart` alone tells whether it is on.
 - `agent --listen IP [--port N] --autostart on` does the same for this PC's agent, kept running (restarted when
-  it ends: systemd `Restart=on-failure`, launchd `KeepAlive` on macOS) and started now too; it prints the
+  it ends: systemd `Restart=on-failure`, launchd `KeepAlive` on macOS, `agent --stay` under WSL) and started now too; it prints the
   `host add` line for the central PC. `--autostart off` removes it and stops the agent; `--autostart status`.
   Real run (WSL): the agent answered 1 s after `on`, `host add` from a central store, `off` stopped it.
   To turn `autostart` on:

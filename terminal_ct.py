@@ -786,7 +786,23 @@ def agent_serve(listen="127.0.0.1", port=None):
     return srv
 
 
-def agent(listen="127.0.0.1", port=None, rotate=False):
+def agent(listen="127.0.0.1", port=None, rotate=False, stay=False):
+    if stay:  # a logon start under WSL has no service manager: this process starts the agent again when it ends
+        _web_write(_agent_path("pid"), str(os.getpid()), 0o600)  # --autostart off stops this one, and it the agent
+        child = [None]
+
+        def stop(*_):
+            if child[0] is not None:
+                child[0].terminate()
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, stop)
+        argv = [sys.executable, os.path.abspath(__file__), "agent", "--listen", listen,
+                *(["--port", str(port)] if port else []), *(["--rotate"] if rotate else [])]
+        while True:
+            child[0] = subprocess.Popen(argv, env=dict(os.environ, TERMINAL_CT_AGENT_KEPT="1"))
+            child[0].wait()
+            argv = [a for a in argv if a != "--rotate"]  # once
+            time.sleep(5)
     if in_wsl() and shutil.which("podman"):
         Node("podman")  # its WSL fix (iptables, not nftables) for the podman calls the agent runs
     # what it runs finds this terminal-ct (a desktop's screen tools). shortcut: split on spaces there, as
@@ -795,7 +811,8 @@ def agent(listen="127.0.0.1", port=None, rotate=False):
     if rotate:
         agent_credentials(rotate=True)
     srv = agent_serve(listen, port)
-    _web_write(_agent_path("pid"), str(os.getpid()), 0o600)  # agent --autostart off stops this one
+    if not os.environ.get("TERMINAL_CT_AGENT_KEPT"):  # (kept by agent --stay: that one's pid is the file's)
+        _web_write(_agent_path("pid"), str(os.getpid()), 0o600)  # agent --autostart off stops this one
     host = f"[{listen}]" if ":" in listen else listen
     url = f"https://{host}:{srv.server_address[1]}"
     print(json.dumps({"url": url, "fingerprint": srv.fingerprint, "token": srv.token,
@@ -2554,7 +2571,8 @@ def agent_autostart(on=None, listen="127.0.0.1", port=None):
     after a restart. Its address and port as given; its certificate and token stay the same."""
     if WINDOWS:
         raise SystemExit("on Windows the agent runs inside WSL: terminal-ct agent there (install.ps1 sets it up)")
-    args = ["agent", "--listen", str(ipaddress.ip_address(listen)), *(["--port", str(port)] if port else [])]
+    args = ["agent", "--listen", str(ipaddress.ip_address(listen)), *(["--port", str(port)] if port else []),
+            *(["--stay"] if in_wsl() else [])]  # WSL: no service manager to start it again; --stay does
     out = _at_logon(AGENT_TASK, args, on, "this PC's agent for a central PC", server=True)
     if on:
         fp, token = agent_credentials()
@@ -6980,6 +6998,7 @@ def main(argv=None):
     rl.add_argument("--net", dest="relay_net", help="add: the network there")
     ag = sub.add_parser("agent", help="serve this PC to a central PC (HTTPS, pinned certificate + token)")
     ag.add_argument("--listen", default="127.0.0.1"); ag.add_argument("--port", type=int); ag.add_argument("--rotate", action="store_true")
+    ag.add_argument("--stay", action="store_true", help="start the agent again when it ends (a logon start in WSL)")
     ag.add_argument("--autostart", choices=["on", "off", "status"],
                     help="start it at each logon and keep it running (with this --listen and --port)")
     lg = sub.add_parser("logs"); lg.add_argument("name"); lg.add_argument("-n", type=int, default=100)
@@ -7159,7 +7178,7 @@ def main(argv=None):
                          else relay_rm(o.service, o.relay_on))
     if o.cmd == "agent" and o.autostart:
         return show_json(agent_autostart(None if o.autostart == "status" else o.autostart == "on", o.listen, o.port))
-    if o.cmd == "agent": return agent(o.listen, o.port, o.rotate)
+    if o.cmd == "agent": return agent(o.listen, o.port, o.rotate, o.stay)
     if o.cmd == "bench": return show_json(bench(max(1, o.runs), o.desktop))
     if o.cmd == "skills": return skills(o.skill_cmd, o.dir)
     if o.cmd == "logs": return print(logs(o.name, o.n), end="")
