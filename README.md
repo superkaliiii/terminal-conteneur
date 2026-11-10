@@ -114,8 +114,9 @@ A node is a Linux VM made by [terminal-vm](https://github.com/superkaliiii/termi
 (installed alongside: on the PATH, or `TERMINAL_VM="python3 /path/terminal_vm.py"`) that runs Docker: the isolation
 of a VM, the lightness of containers inside it.
 - `node add NAME [--image debian|alpine]` creates it from an official cloud image (`terminal-vm create --image
-  --node`), starts it, has terminal-vm restart it if it falls, and waits for its setup (WSL with KVM: Alpine ready
-  in about 60 s, Debian in about 120 s; it needs the internet the first time).
+  --node`), starts it, has terminal-vm restart it if it falls, and waits for its setup. Nodes are overlays on
+  terminal-vm's node template (built once per kind, with the internet: about 2 min for Alpine, 4 for Debian), so
+  `node add` takes about 19 s (WSL with nested KVM; 61 s for Alpine and ~120 s for Debian before the template).
 - `--node NAME create ...` puts a container there; terminal-ct remembers it (`STORE/nodes.json`), so `start`,
   `stop`, `exec`, `logs`, `status`, `rm` of that container go to its node without `--node`. `--node NAME ls`, `top`,
   `quota` show the node's own containers and capacity.
@@ -133,7 +134,9 @@ of a VM, the lightness of containers inside it.
   `"spread": "nodes"` spreads them over the running nodes, the least loaded first, and moves a node's replicas to
   another when it is down (`failover` events; their `/data` does not follow). When the node is back, the copies left
   there are removed. Real run (WSL, two Alpine nodes, 3 replicas): node killed, its 2 replicas made again and running
-  on the other in 23 s; old copies gone at its return. With networks: see below.
+  on the other in 23 s; old copies gone at its return. Again on template nodes (two Alpine nodes of 1 CPU / 1 GiB):
+  spread 1 + 1 in 27 s, node stopped, its replica running on the other 16 s later, the copy removed 6 s after its
+  return. With networks: see below.
 - Desktops in a node (`--node N create NAME --desktop`, or a stack service): the desktop image is built in the node
   (its context sent there), and the screen tools (`action`, MCP screenshot/click/type/key/wait, dashboard
   thumbnails) are run by a copy of terminal-ct the host puts in the node, next to the desktop's socket (copied again
