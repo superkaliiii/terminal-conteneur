@@ -1577,8 +1577,19 @@ class Installer(unittest.TestCase):
         other = os.path.join(os.path.dirname(self.SH), "..", "terminal-mac-src", "terminal-vm", "install.sh")
         if not os.path.isfile(other):
             self.skipTest("terminal-vm not checked out alongside")
-        body = lambda p: open(p, encoding="utf-8").read().replace("\r\n", "\n").split(self.COMMON)[1]
+        body = lambda p, mark=self.COMMON: open(p, encoding="utf-8").read().replace("\r\n", "\n").split(mark)[1]
         self.assertEqual(body(self.SH), body(other), "the installers' common part differs: copy it to both")
+        ps1 = "# ===== common to terminal-ct and terminal-vm's install.ps1 ====="
+        mine, theirs = self.SH.replace("install.sh", "install.ps1"), other.replace("install.sh", "install.ps1")
+        self.assertEqual(body(mine, ps1), body(theirs, ps1), "the Windows installers' common part differs")
+
+    @unittest.skipUnless(ct.WINDOWS and shutil.which("powershell"), "Windows PowerShell")
+    def test_ps1_parses(self):
+        ps1 = self.SH.replace("install.sh", "install.ps1")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", "$e = $null; [void][System.Management.Automation."
+                            f"Language.Parser]::ParseFile('{ps1}', [ref]$null, [ref]$e); $e.Count"],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.stdout.strip(), "0", r.stdout + r.stderr)
 
 
 class ProjectsAndResume(unittest.TestCase):

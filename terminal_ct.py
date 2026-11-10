@@ -6013,6 +6013,9 @@ def doctor_checks():
     check("python", sys.version_info >= (3, 9), sys.version.split()[0], _pkg("python3"))
     if in_wsl():
         if engines["podman"]:
+            ipt = shutil.which("iptables") or os.path.exists("/usr/sbin/iptables") or os.path.exists("/sbin/iptables")
+            check("iptables", ipt, "for Podman's firewall driver under WSL" if ipt else
+                  "not found: Podman under WSL cannot start a container with a network", _pkg("iptables"))
             check("podman in WSL", True, "terminal-ct sets Podman's iptables firewall driver for its own calls (WSL's "
                   "kernel lacks nftables pieces); for your own podman: add [network] firewall_driver = \"iptables\" "
                   "to ~/.config/containers/containers.conf", required=False)
