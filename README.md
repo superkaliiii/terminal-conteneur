@@ -36,7 +36,7 @@ One Python file, standard library only, on Podman (preferred) or Docker.
 ## Quick start
 
 ```console
-$ sh install.sh                                  # ~/.local/bin/terminal-ct, then doctor
+$ curl -fsSL https://raw.githubusercontent.com/superkaliiii/terminal-conteneur/main/install.sh | sh
 $ terminal-ct create box --desktop               # debian:stable-slim + a desktop
 $ terminal-ct start box
 $ terminal-ct exec box uname -sr
@@ -47,21 +47,32 @@ $ terminal-ct web                                # the web dashboard
 
 ## Install
 
-Python >= 3.9 (standard library only) and Podman (preferred: rootless, no daemon) or Docker.
-Debian/Ubuntu: `sudo apt install podman`.
+Linux, macOS and WSL:
 
 ```sh
-sh install.sh                      # ~/.local/bin/terminal-ct (--prefix DIR elsewhere), then runs doctor
-terminal-ct skills install         # the agent's skill into ~/.claude/skills/terminal-ct
-claude mcp add terminal-ct -- ~/.local/bin/terminal-ct mcp   # MCP server for Claude Code (absolute path: the
-                                                               # client may not have ~/.local/bin on its PATH)
+curl -fsSL https://raw.githubusercontent.com/superkaliiii/terminal-conteneur/main/install.sh | sh
 ```
 
-`mcp NAME` gives the screen tools and `exec` a default container; `--project P` fences the server to a project.
+Windows (terminal-ct in its own WSL distribution, Alpine with Podman, apart from yours):
 
-On a Windows host, put this folder on the PATH (`terminal-ct.cmd`) with Docker Desktop or Podman for Windows, or
-install it inside WSL as above (desktops need Linux or WSL). A one-command, all-in-one installer comes in a later
-phase.
+```powershell
+irm https://raw.githubusercontent.com/superkaliiii/terminal-conteneur/main/install.ps1 | iex
+```
+
+One command does it all: what is missing (Python 3.9+, Podman, openssl; WSL on Windows) after one confirmation,
+`terminal-ct` on the PATH, and, when Claude Code is installed, its MCP server and the [agent skill](#agent-skill).
+Options: `--yes` (no question), `--no-deps`, `--no-mcp`, `--update`, `--uninstall` (the data stays); on Windows
+`-Yes`, `-NoDeps`, ... or `TERMINAL_CT_INSTALL="-Yes"` before `irm`. From a checkout: `sh install.sh`.
+
+Other ways, without the engine: `pipx install terminal-ct` or `uvx terminal-ct`, `npm i -g terminal-ct` or
+`npx terminal-ct`, `.deb` and `.rpm` packages (`packaging/build.sh`), Homebrew (from the first public release).
+Any other MCP client: the server is `terminal-ct mcp` (`mcp NAME`: a default container for the screen tools and
+`exec`; `--project P` fences it to a project).
+
+`terminal-ct doctor` names every known problem with the exact command that fixes it (engine, groups, Podman under
+WSL, sleep, disk...); `doctor --report` writes a report to attach to an issue, with secrets, the home folder, user
+and host names masked. Fedora under WSL cannot run Podman's networks (its netavark has no iptables driver): use
+Debian, Ubuntu or Alpine there.
 
 ## Agent skill
 
@@ -97,7 +108,7 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 | `image ls`, `image pull REF`, `image build NAME DIR`, `image rm NAME` | images (Docker Hub short names are completed for Podman) |
 | `bench [--runs 10] [--desktop]` | measure terminal-ct's operations on this engine, see [Measurements](#measurements) |
 | `skills get\|path\|install [--dir D]` | the agent's skill, see [Agent skill](#agent-skill) |
-| `doctor`, `version`, `help` | checks |
+| `doctor [--json] [--report]`, `version`, `help` | known problems with their fix; a masked report for an issue |
 | `node add NAME [--image debian\|alpine] [--cpus 2] [--memory 2] [--disk 20]`, `node ls`, `node rm NAME [--force]` | nodes: Linux VMs of terminal-vm running Docker, see [Nodes](#nodes) |
 | `agent [--listen IP] [--port 7173] [--rotate]` | serve this PC to a central PC, see [Other PCs](#other-pcs) |
 | `host add NAME https://IP:PORT --fingerprint SHA256 [--with podman\|docker]`, `host add NAME ssh://[user@]host[:port]`, `host ls`, `host rm NAME [--force]` | other PCs as nodes |
