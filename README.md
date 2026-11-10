@@ -1,14 +1,48 @@
+<div align="center">
+
 # terminal-ct
 
-Containers with a desktop and a shell, for people and computer-use agents. The container counterpart of
+**Containers with a desktop and a shell, for people and computer-use agents.**
+
+[![CI](https://github.com/superkaliiii/terminal-conteneur/actions/workflows/ci.yml/badge.svg)](https://github.com/superkaliiii/terminal-conteneur/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.9%2B-3776ab?logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20WSL%20%7C%20Windows%20%7C%20macOS-lightgrey)
+
+[Install](#install) · [Commands](#commands) · [Agents](#agents) · [Stacks](#stacks-desired-state) ·
+[Nodes](#nodes) · [Other PCs](#other-pcs) · [Dashboard](#dashboard) · [Measurements](#measurements)
+
+</div>
+
+The container counterpart of
 [terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm): same command and
 MCP shape, independent of it (each installs and works alone), and able to show its VMs when both are installed.
+One Python file, standard library only, on Podman (preferred) or Docker.
 
-Status: **phase 8** of the plan: container lifecycle, desktops (any Debian/Ubuntu, Fedora, Alpine or Arch
-image), screen tools, terminal viewer, quota and live resources, isolated networks, sandboxes, an MCP server that
-manages containers under agent-authority rules, snapshots, clones and file copies, stacks kept in their desired
-state by a daemon (replicas, restarts, health probes, ttl, events), a terminal dashboard, a web dashboard
-(containers and terminal-vm's VMs), an agent skill, measurements and CI.
+## Highlights
+
+- **A desktop in any container**: Debian/Ubuntu, Fedora, Alpine or Arch images get Xvnc + Openbox + xterm on a
+  unix socket (no TCP port), driven by `screenshot`, `click`, `type`, `key`; watched in the terminal or a window.
+- **Built for agents**: an MCP server with authority rules (what an agent may run without asking), sandboxes,
+  projects with notes and logs, and an [agent skill](#agent-skill).
+- **Fenced resources**: a ceiling per container, a quota for the whole PC, isolated networks, internet on or off.
+- **Desired state**: stacks with replicas, restarts, health probes and ttl, kept by a small daemon.
+- **Beyond one engine**: nodes (Linux VMs of terminal-vm) with networks and DNS between them, and other PCs driven
+  from a central one, with failover.
+- **Dashboards**: a live terminal table and a web page (containers and terminal-vm's VMs), shareable with read-only
+  or full users.
+
+## Quick start
+
+```console
+$ sh install.sh                                  # ~/.local/bin/terminal-ct, then doctor
+$ terminal-ct create box --desktop               # debian:stable-slim + a desktop
+$ terminal-ct start box
+$ terminal-ct exec box uname -sr
+{"exit": 0, "stdout": "Linux 6.6.87.2-microsoft-standard-WSL2\n", "stderr": ""}
+$ terminal-ct view box                           # the desktop inside the terminal (Ctrl+] exits)
+$ terminal-ct web                                # the web dashboard
+```
 
 ## Install
 
@@ -62,9 +96,13 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 | `skills get\|path\|install [--dir D]` | the agent's skill, see [Agent skill](#agent-skill) |
 | `doctor`, `version`, `help` | checks |
 | `node add NAME [--image debian\|alpine] [--cpus 2] [--memory 2] [--disk 20]`, `node ls`, `node rm NAME [--force]` | nodes: Linux VMs of terminal-vm running Docker, see [Nodes](#nodes) |
+| `agent [--listen IP] [--port 7173] [--rotate]` | serve this PC to a central PC, see [Other PCs](#other-pcs) |
+| `host add NAME https://IP:PORT --fingerprint SHA256 [--with podman\|docker]`, `host add NAME ssh://[user@]host[:port]`, `host ls`, `host rm NAME [--force]` | other PCs as nodes |
+| `--host PC vm ARGS [-- CMD]` | terminal-vm on another PC |
+| `web user add NAME [--role read\|full]`, `web user ls`, `web user rm NAME`; `web --listen IP\|off [--port N]` | share the web dashboard, see [Shared session](#shared-session) |
 
 `--engine docker|podman` (or `TERMINAL_CT_ENGINE`) picks the engine; by default Podman if installed, else Docker.
-`--node NAME` runs the command in a node instead.
+`--node NAME` runs the command in a node instead; `--host NAME` is the same option, read better for another PC.
 
 Safety: every container terminal-ct makes is named `tct-NAME` and labelled `terminal-ct.*`; containers without
 those labels are never listed or touched. An image whose default command is a bare shell is kept running with
@@ -95,7 +133,7 @@ of a VM, the lightness of containers inside it.
   `"spread": "nodes"` spreads them over the running nodes, the least loaded first, and moves a node's replicas to
   another when it is down (`failover` events; their `/data` does not follow). When the node is back, the copies left
   there are removed. Real run (WSL, two Alpine nodes, 3 replicas): node killed, its 2 replicas made again and running
-  on the other in 23 s; old copies gone at its return. Not yet with isolated networks (phase 10).
+  on the other in 23 s; old copies gone at its return. With networks: see below.
 - Desktops in a node (`--node N create NAME --desktop`, or a stack service): the desktop image is built in the node
   (its context sent there), and the screen tools (`action`, MCP screenshot/click/type/key/wait, dashboard
   thumbnails) are run by a copy of terminal-ct the host puts in the node, next to the desktop's socket (copied again
@@ -122,6 +160,62 @@ of a VM, the lightness of containers inside it.
   internet never reach the networks between nodes through the internet bridge. Real run (WSL, two Alpine nodes):
   a client on n1 reaches `web` on both nodes by name; a container of another network gets neither the name nor the
   port; with n2 down, `web` answers from n1 at once.
+
+## Other PCs
+
+One central PC drives the others: it keeps all the state (stacks, placement, quotas, approvals); another PC only
+runs what it is sent (engine calls, file copies, terminal-vm). Another PC is a node of `kind: host`: everything of
+[Nodes](#nodes) applies (`--host PC create`, routing of later commands, `ls`, dashboards, MCP, stacks with `node` or
+`spread`) except desktops, networks and ports, which come with networks across PCs (phase 11 bis).
+
+- **Agent** (on the other PC, Linux or macOS; on Windows inside WSL): `terminal-ct agent --listen 192.168.1.20`
+  serves it over HTTPS (port 7173, `TERMINAL_CT_AGENT_PORT`) with a certificate made once (openssl, kept in
+  `STORE/agent/`) and a token (owner only). It prints the URL, the certificate's SHA-256 and the token, and the
+  `host add` line to type on the central PC. Only an IP is accepted for `--listen` (default 127.0.0.1: nothing on the
+  network). It runs commands as its user (argv, no shell), at most a few connections at once, and logs each one to
+  `STORE/agent/agent.log` (bounded). `--rotate` makes a new token: restart a running agent for it to take effect,
+  then `host rm` + `host add` on the central PC. The token is printed: when the agent runs as a service, its log
+  holds it.
+- **SSH** instead: `host add NAME ssh://user@pc` uses your `ssh` and `scp` (keys and `known_hosts` as usual; no agent
+  needed there). Not tried here against a real sshd yet. Podman inside WSL reached by SSH lacks the agent's fix for
+  WSL's kernel (iptables instead of nftables): use the agent there.
+- **`host add NAME https://IP:PORT --fingerprint SHA256`** takes the token from `TERMINAL_CT_AGENT_TOKEN`, else typed
+  (hidden) or piped in, never as an argument (`ps`, shell history); the central PC checks the certificate's
+  fingerprint before sending the token. It checks the PC answers, runs Linux or macOS, and has a working engine:
+  Podman 4 or later first, else Docker (`--with` picks one). Kept in `STORE/hosts.json` (owner only). `host ls` shows
+  them with whether they answer; `host rm NAME` refuses while containers live there, `--force` removes them first
+  (a PC that does not answer keeps its containers running: remove them there).
+- **Quota on another PC**: someone's computer, as this one is: by default cores - 1 and 75% of its memory;
+  `terminal-ct --host PC quota --cpus N --memory GiB` sets it (`STORE/quota-PC.json`), never this PC's quota.
+- **Failover between PCs**: a stack service with `"spread": "nodes"` uses the other PCs that answer like VM nodes.
+  A PC that stops answering (Wi-Fi, sleep, an agent restarting) is given 3 daemon passes before its replicas are made
+  again elsewhere; its copies are removed when it is back. Real run (WSL; central Podman, pc1 an agent with Docker,
+  pc2 an agent with Podman): spread 1 + 1, pc2's agent killed, its replica running on pc1 10 to 37 s later (as `ls`
+  shows it, two runs); the copy left on pc2 removed 16 s after its agent is back.
+- **Agents** (MCP) use another PC only with the user's approval, once per PC for each stack (`approved_hosts`,
+  asked by `ct_apply`); `host rm` forgets it. A stack an agent placed on another PC before that approval existed
+  (made before commit 2fb955b) is taken off that PC at the next pass (its `/data` there removed with it).
+- **VMs of other PCs**: when terminal-vm is installed there (on its login PATH, `~/.local/bin`, or `TERMINAL_VM` in
+  the agent's environment), the web dashboard lists its VMs as `VM@PC` (start, stop, force stop, screenshots) and
+  `terminal-ct --host PC vm ls` (any terminal-vm command, `-- CMD` for `exec`) runs it there; its output shows at the
+  end (not interactive). Real run (WSL): 5 VMs listed in 0.7 s, a screenshot in 0.45 s.
+- Measured (WSL, central Podman, agent Docker): `host add` 0.5 s, `create` 1.9 s, `exec` 0.7 s, `ls` 1.2 s; a
+  stopped agent shows as not answering and `ls` goes on without it.
+- Antivirus: some (Avast) re-sign HTTPS even on 127.0.0.1 on Windows; the pinned fingerprint then refuses the
+  connection on purpose, and the error says so. Run the central PC in WSL, or exclude the agent's port.
+
+### Shared session
+
+The web dashboard can be opened by other people or agents, each with its own token and role:
+- `web user add NAME --role read|full` prints NAME's token once (only its SHA-256 is kept, `STORE/web.users.json`,
+  owner only); `read` sees everything (containers, VMs, logs, screens, events, stacks) and acts on nothing (403),
+  `full` acts too. `web user ls`, `web user rm NAME` (its open tabs are refused from their next call).
+- `web --listen IP [--port N]` shares the dashboard on that address of this PC too, over HTTPS (port 7181 by default:
+  the local port + 10; terminal-vm 7182), with a certificate for that IP whose fingerprint `web user add` prints with
+  the user's URL. 127.0.0.1 keeps serving the owner over HTTP. `web --listen off` stops sharing. Never 0.0.0.0.
+- The page shows who is there (each user's tab reports itself every 30 s: "with bob (read)"), and every action, refusal
+  and failure goes to `STORE/web/actions.log` (who, from where, what). Bad tokens from the network are not logged.
+- Two `web user` commands run at the same moment may lose one of the two changes: run them one after the other.
 
 ## Desktops
 

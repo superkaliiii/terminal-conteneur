@@ -54,7 +54,11 @@ Never try to work around a refusal.
 - Nodes (Linux VMs running Docker, added by the user with `terminal-ct node add`): `ct_list` marks a container in
   one with `node`; every tool on it works the same (screen tools included, ~1.5 s per action). In a stack,
   `"spread": "nodes"` spreads a service's replicas over the running nodes and moves them when one goes down
-  (`failover` events, `/data` not kept); `"node": "N"` keeps them on N. Not yet with isolated networks.
+  (`failover` events, `/data` not kept); `"node": "N"` keeps them on N. A service on a network joined by nodes
+  (`node join`) with `"ports"` is found by name (`web`, `web.STACK`) from that network's containers.
+- Other PCs (added by the user with `terminal-ct host add`) are nodes too (`ct_list` shows `node`). Your stack runs
+  there only after the user approves that PC for it (`ct_apply` asks once per PC); without approval keep it on this
+  PC. No desktops, networks or ports on another PC yet. Their quota is their own (a share of someone's computer).
 - `net_create` + `net_attach` (stopped containers): an isolated network where containers reach each other by name.
 - Stay within `quota`; `ct_resources` asks for the CPUs and memory a task needs, give them back after; `top` and
   `dashboard` show where things stand.
