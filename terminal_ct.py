@@ -1372,7 +1372,16 @@ def allotted(c, unlimited="host"):
 
 def raw_containers(size=False):
     ids = node().run(["ps", "-a", "-q", "--filter", f"label={LABEL}.name"]).stdout.split()
-    infos = node().json(["inspect", "--type", "container", *(["--size"] if size else []), *ids]) if ids else []
+    infos = []
+    if ids:  # one removed between ps and inspect (a stack scaled down, a ttl): left out, the others listed
+        r = node().run(["inspect", "--type", "container", *(["--size"] if size else []), *ids], check=False)
+        try:
+            infos = json.loads(r.stdout.strip() or "[]")
+        except ValueError:
+            infos = None
+        gone = "no such" in (r.stderr or "").lower()
+        if not isinstance(infos, list) or r.returncode and not infos and not gone:  # the engine failing, not one gone
+            raise SystemExit((r.stderr or r.stdout or f"{node().engine} inspect failed").strip())
     return [c for c in infos if not c.get("Name", "").endswith("-OLD")]  # the old one during a remake
 
 

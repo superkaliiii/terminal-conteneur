@@ -121,6 +121,25 @@ class Lifecycle(unittest.TestCase):
         self.n = ct.NODE = FakeNode()
         ct.STORE = tempfile.mkdtemp()
 
+    def test_listing_survives_a_container_removed_meanwhile(self):
+        """Found by the soak test: a replica removed between ps and inspect failed every listing."""
+        quiet(ct.create, "web")
+        real = self.n.run
+        def run(args, check=True, timeout=None, capture=True):
+            if args[:2] == ["ps", "-a"]:
+                return subprocess.CompletedProcess(args, 0, "tct-web\ntct-gone\n", "")
+            if args[0] == "inspect" and "tct-gone" in args:  # what the CLI and the API answer then
+                r = real(args, check=False)
+                return subprocess.CompletedProcess(args, 1, r.stdout, "Error: no such container tct-gone")
+            return real(args, check, timeout, capture)
+        self.n.run = run
+        self.assertEqual([c["name"] for c in ct.containers()], ["web"])
+        self.n.run = lambda args, check=True, timeout=None, capture=True: (
+            subprocess.CompletedProcess(args, 0, "tct-web\n", "") if args[:2] == ["ps", "-a"]
+            else subprocess.CompletedProcess(args, 125, "", "Error: the engine is down"))
+        with self.assertRaisesRegex(SystemExit, "engine is down"):              # a real failure still says so
+            ct.containers()
+
     def test_create_labels_volume_and_keep_alive(self):
         quiet(ct.create, "web", cpus=1, memory=0.5)
         args = next(c for c in self.n.calls if c[0] == "create")
