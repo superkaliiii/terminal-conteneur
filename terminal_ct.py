@@ -851,7 +851,7 @@ def node_add(name, image="debian", cpus=2, memory=2, disk=20, project=None, wait
     made = _vm(["create", name, "--image", image, "--node", "--cpus", str(cpus), "--memory", str(memory),
                 "--max-memory", str(memory),  # a node's ceiling is its size: the quota counts no headroom
                 "--disk", str(disk), *(["--project", check_project(project)] if project else [])], timeout=1800)
-    ready = made.get("ready_file") or "/var/lib/terminal-vm/ready"  # left by cloud-init once Docker answers
+    ready = made.get("ready_file") or "/var/lib/terminal-vm/ready"  # left in the guest once Docker answers
     with quota_lock("nodes"):
         d = _nodes()
         d["nodes"][name] = {"image": image, "added": time.strftime("%Y-%m-%dT%H:%M:%S")}
@@ -867,7 +867,7 @@ def node_add(name, image="debian", cpus=2, memory=2, disk=20, project=None, wait
         if time.monotonic() - t0 > said + 30:
             said = time.monotonic() - t0
             print(f"node {name}: setting up ({int(said)} s)", file=sys.stderr)
-        time.sleep(3)
+        time.sleep(0.5)  # a node from terminal-vm's template is ready ~15 s after its start: seconds count
     raise SystemExit(f"node {name} is not ready after {wait} s (its setup needs the internet): "
                      f"terminal-vm status {name}; remove it with terminal-ct node rm {name}")
 
