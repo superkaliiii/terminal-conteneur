@@ -9,7 +9,7 @@ FILE=terminal_ct.py
 SKILL=skills/terminal-ct/SKILL.md
 SUMMARY="Containers with a desktop and a shell, for people and computer-use agents (CLI + MCP server)"
 HOMEPAGE=https://github.com/superkaliiii/terminal-conteneur
-LICENSE_ID=""                                  # set before publishing
+LICENSE_ID=MIT
 DEB_DEPENDS="python3 (>= 3.9), podman | docker.io"
 DEB_RECOMMENDS="openssl, iptables"
 RPM_REQUIRES="python3 >= 3.9, podman"  # given a choice dnf takes Docker, whose daemon may not run

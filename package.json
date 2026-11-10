@@ -9,7 +9,8 @@
     "terminal_ct.py",
     "skills/terminal-ct/SKILL.md",
     "npm/terminal-ct.js",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "keywords": [
     "containers",
@@ -24,5 +25,6 @@
   "author": "superkaliiii",
   "engines": {
     "node": ">=16"
-  }
+  },
+  "license": "MIT"
 }

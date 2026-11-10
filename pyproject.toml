@@ -8,6 +8,8 @@ dynamic = ["version"]
 description = "Containers with a desktop and a shell, for people and computer-use agents: a CLI and an MCP server."
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "superkaliiii" }]
 keywords = ["containers", "podman", "docker", "mcp", "agents", "computer-use", "desktop"]
 classifiers = ["Programming Language :: Python :: 3", "Environment :: Console", "Topic :: System :: Emulators"]

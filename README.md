@@ -6,6 +6,7 @@
 
 [![CI](https://github.com/superkaliiii/terminal-conteneur/actions/workflows/ci.yml/badge.svg)](https://github.com/superkaliiii/terminal-conteneur/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776ab?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20WSL%20%7C%20Windows%20%7C%20macOS-lightgrey)
 
@@ -467,3 +468,7 @@ TERMINAL_CT_REAL=1 python3 -m unittest test_terminal_ct  # also against the inst
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): unit tests on Linux, Windows and macOS with Python 3.9
 and 3.12; the real tests, a short bench and the install script on Ubuntu with its Docker and Podman. WSL is not
 available on hosted runners: the WSL runs are made by hand (results above).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
