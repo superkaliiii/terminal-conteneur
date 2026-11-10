@@ -5940,10 +5940,13 @@ def skills(cmd, dest=None):
     print(json.dumps({"installed": os.path.join(dest, "SKILL.md")}))
 
 
+SUDO = "" if os.name == "nt" or os.geteuid() == 0 else "sudo "  # in suggested commands: root has none to run
+
+
 def _pkg(*names):
     """The command that installs these packages on this system (first package manager found), or None."""
-    for exe, cmd in (("apt-get", "sudo apt-get install -y"), ("dnf", "sudo dnf install -y"), ("zypper", "sudo zypper install -y"),
-                     ("pacman", "sudo pacman -S --noconfirm"), ("apk", "sudo apk add"), ("brew", "brew install")):
+    for exe, cmd in (("apt-get", f"{SUDO}apt-get install -y"), ("dnf", f"{SUDO}dnf install -y"), ("zypper", f"{SUDO}zypper install -y"),
+                     ("pacman", f"{SUDO}pacman -S --noconfirm"), ("apk", f"{SUDO}apk add"), ("brew", "brew install")):
         if shutil.which(exe):
             return f"{cmd} {' '.join(names)}"
     return None
@@ -5988,15 +5991,15 @@ def doctor_checks():
             msg, fix = str(e), None
             low = msg.lower()
             if "permission denied" in low and "docker" in low:
-                fix = "sudo usermod -aG docker $USER   (then log out and in again)"
+                fix = f"{SUDO}usermod -aG docker $USER   (then log out and in again)"
             elif "cannot connect to the docker daemon" in low or "is the docker daemon running" in low:
-                fix = "sudo systemctl start docker" if os.path.isdir("/run/systemd/system") else "sudo service docker start"
+                fix = f"{SUDO}systemctl start docker" if os.path.isdir("/run/systemd/system") else f"{SUDO}service docker start"
             elif "newuidmap" in low or "subuid" in low or "subgid" in low:
-                fix = "sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER; podman system migrate"
+                fix = f"{SUDO}usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER; podman system migrate"
             elif MAC or WINDOWS:
                 fix = "podman machine init; podman machine start   (or start Docker Desktop)"
             check("engine", False, msg[:300], fix)
-    if engines["podman"] and sys.platform.startswith("linux"):
+    if engines["podman"] and sys.platform.startswith("linux") and os.geteuid() != 0:
         try:
             import getpass
             me = getpass.getuser()
@@ -6005,7 +6008,7 @@ def doctor_checks():
         except (OSError, KeyError):
             ok = False
         check("podman rootless", ok, "subordinate ids for your user" if ok else "no line for you in /etc/subuid",
-              "sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER; podman system migrate",
+              f"{SUDO}usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER; podman system migrate",
               required=False)
     check("python", sys.version_info >= (3, 9), sys.version.split()[0], _pkg("python3"))
     if in_wsl():
