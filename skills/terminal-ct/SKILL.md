@@ -11,8 +11,13 @@ For Windows or macOS desktops, or a full kernel, use terminal-vm instead.
 
 ## Start and end of a session
 
-First call `project_status`: your project's containers and networks (with `want`, what each should be doing), the
-notes earlier sessions left, and their latest actions and errors. Pick up from there instead of rebuilding. Before
+First call `infra`: the map of who runs what where. Each PC and node (reachable, its quota with what is free),
+every container with where it runs, its ceiling and use, networks, ports, description, creator and `managed` (what
+you may run without asking), each network with the names that reach its members, terminal-vm's VMs, the projects.
+Then `project_status`: your project's containers and networks (with `want`, what each should be doing), the
+notes earlier sessions left, and their latest actions and errors. Pick up from there instead of rebuilding. Give
+what you create a one-line `description` (`ct_create`, `net_create`, a stack service's `description` field) or set
+it later with `describe`, so the next agent knows what it is for; describing the user's objects asks them. Before
 you stop, `notes_write` what you set up, what works and what is left. A server started with `--project` shows you
 only that project (and its sub-projects, `lab/web`).
 

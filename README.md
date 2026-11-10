@@ -24,7 +24,8 @@ One Python file, standard library only, on Podman (preferred) or Docker.
 - **A desktop in any container**: Debian/Ubuntu, Fedora, Alpine or Arch images get Xvnc + Openbox + xterm on a
   unix socket (no TCP port), driven by `screenshot`, `click`, `type`, `key`; watched in the terminal or a window.
 - **Built for agents**: an MCP server with authority rules (what an agent may run without asking), sandboxes,
-  projects with notes and logs, and an [agent skill](#agent-skill).
+  projects with notes and logs, an [infra map](#infra-map-and-descriptions) read in one call, a one-line
+  description on every object, and an [agent skill](#agent-skill).
 - **Fenced resources**: a ceiling per container, a quota for the whole PC, isolated networks, internet on or off.
 - **Desired state**: stacks with replicas, restarts, health probes and ttl, kept by a small daemon.
 - **Beyond one engine**: nodes (Linux VMs of terminal-vm) with networks and DNS between them, and other PCs driven
@@ -65,7 +66,7 @@ phase.
 ## Agent skill
 
 [`skills/terminal-ct/SKILL.md`](skills/terminal-ct/SKILL.md) tells an agent how to work with terminal-ct: start
-with `project_status`, prefer `exec` to the screen, the observe → act → verify loop on desktops, what it may run
+with `infra` then `project_status`, describe what it creates, prefer `exec` to the screen, the observe → act → verify loop on desktops, what it may run
 without asking, building sandboxes, stacks and networks, cleaning up. `terminal-ct skills get|path|install`.
 
 ## Commands
@@ -89,6 +90,8 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 | `internet NAME [on\|off]` | show or change internet access (stopped container) |
 | `snapshot NAME save\|load\|rm TAG`, `snapshot NAME ls` | file system and `/data` (load: stopped container), see [Snapshots and clones](#snapshots-and-clones) |
 | `clone SRC NEW [--project P]` | NEW from SRC as it is: its files and a copy of its `/data` |
+| `infra [--project P] [--json]` | the map: PCs and nodes with their quota, what runs where, networks and names, VMs, projects; see [Infra map and descriptions](#infra-map-and-descriptions) |
+| `describe container\|net\|node\|host\|project NAME [TEXT\|--clear]` | one line on what it is for (no TEXT: show it); `--description TEXT` on `create`, `clone`, `net create`, `node add`, `host add` |
 | `push NAME LOCAL PATH`, `pull NAME PATH LOCAL` | copy files in or out (`/data` included), running or stopped |
 | `sandbox NAME on\|off` | make a stopped container a sandbox, or a normal one again (recreated from its image) |
 | `image ls`, `image pull REF`, `image build NAME DIR`, `image rm NAME` | images (Docker Hub short names are completed for Podman) |
@@ -360,15 +363,34 @@ the quota and the latest events. From WSL it opens the Windows browser (WSL forw
   `net_create`, `net_remove`, `net_attach`, `net_detach`, `top`, `quota`;
 - `dashboard` (the `dash` view as text), `ct_logs`;
 - `autostart` (restart after a PC restart; changing it asks the user);
+- `infra` (the map, below), `describe`, and a `description` argument on `ct_create` and `net_create`;
 - `project_status` (where things stand: containers and networks with what each should be doing, notes, latest
-  actions and errors) and `notes_write`; the server tells the agent at connection to start with `project_status`
-  and to leave notes, so the next session picks up from there.
+  actions and errors) and `notes_write`; the server tells the agent at connection to start with `infra`, then
+  `project_status`, to describe what it creates and to leave notes, so the next session picks up from there.
 
 Authority: an agent runs sandboxes and the containers it created (`terminal-ct.created_by=agent`; its creations are
 sandboxes by default). It must ask the user (MCP elicitation; without it, the call fails naming the CLI command to
 run) to: touch one of the user's other containers (screen, shell or lifecycle), delete a sandbox it did not
 create, download or build an image, give internet access, use a network the user created. It never changes the
 quota. Management actions are logged to the project's `agent.log`, a sandbox's screen actions to its `actions.log`.
+
+## Infra map and descriptions
+
+An agent arriving in the infrastructure learns who does what in one call:
+
+- `infra` (CLI, `--json`; MCP tool `infra`): each PC and node, reachable or not, with its quota (limit, used,
+  free), its description and the agent's stacks approved on it; every container with where it runs, its ceiling
+  and real use, networks, ports, description, project, creator and `managed` (what the agent runs without
+  asking); each network with the names that reach its members (a stack's service on nodes' networks also answers
+  as `SERVICE` and `SERVICE.NET`); terminal-vm's VMs (of other PCs too, `VM@PC`); the projects with their
+  descriptions. With `--project P` (or an MCP server's project), only P's objects; PCs and nodes stay listed.
+- A description is one line (at most 200 printable characters) on a container, network, node, other PC or
+  project: `describe KIND NAME TEXT`, `--description` at creation, MCP `describe`; a stack's service takes a
+  `description` field (changing it recreates nothing). They live in `STORE/descriptions.json`, so they are right
+  for containers on nodes and other PCs, can change at any time, and go when the object goes. They show in `ls`,
+  `status`, `stack show`, `net ls`, `node ls`, `host ls`, `project show`, `dash` and the web dashboard.
+- Through MCP an agent describes its own containers and networks (and its server's project) freely; the user's
+  objects, nodes and PCs need their approval; each change is in the project's `agent.log`.
 
 ## Projects
 
