@@ -2710,6 +2710,22 @@ class RemoteAgent(unittest.TestCase):
                              {"service": "web", "for": "pc2", "ports": [port]})
         echo.close()
 
+    def test_host_scan(self):
+        """host scan finds an agent by its certificate alone (no request, nothing in its log); not other servers."""
+        plain = socket.create_server(("127.0.0.1", 0))                       # a port that is no agent
+        log = os.path.join(self.store, "agent", "agent.log")
+        before = os.path.getsize(log) if os.path.exists(log) else 0
+        port = self.srv.server_address[1]
+        r = ct.host_scan("127.0.0.1/32", port)
+        self.assertEqual([(a["url"], a["fingerprint"]) for a in r["agents"]],
+                         [(f"https://127.0.0.1:{port}", self.srv.fingerprint)])
+        self.assertIn(f"--fingerprint {self.srv.fingerprint}", r["agents"][0]["add"])
+        self.assertEqual(ct.host_scan("127.0.0.1/32", plain.getsockname()[1], timeout=0.3)["agents"], [])
+        self.assertEqual(os.path.getsize(log) if os.path.exists(log) else 0, before)  # no line in its log
+        with self.assertRaisesRegex(SystemExit, "at most 4096"):
+            ct.host_scan("10.0.0.0/8")
+        plain.close()
+
     def test_ping_and_exec(self):
         self.assertEqual(ct.agent_request(self.host, "GET", "/ping")["tool"], "terminal-ct")
         n = ct.NodeRemote("pc1", self.host)

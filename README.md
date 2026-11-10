@@ -224,6 +224,10 @@ runs what it is sent (engine calls, file copies, terminal-vm). Another PC is a n
   SERVICE [--on PC]` removes the relay and takes the token back. TCP only; the service's PC needs its agent (SSH has
   no door in). Real run (WSL; central Docker, the other PC an agent with Podman): a client on `lab` read `web`'s
   answer by its name; after `relay rm`, nothing.
+- **Finding agents**: `host scan [--cidr 192.168.1.0/24] [--port 7173]` lists the terminal-ct agents answering on a
+  network (default: this PC's /24) with their address, fingerprint and the `host add` line to run. It only opens a
+  TLS handshake to each address (no token, no request: nothing in their logs); adding stays explicit, with the
+  token, after comparing the fingerprint with the one the agent shows. Real run (WSL): a /24 in 3 s, the agent found.
 - **Quota on another PC**: someone's computer, as this one is: by default cores - 1 and 75% of its memory;
   `terminal-ct --host PC quota --cpus N --memory GiB` sets it (`STORE/quota-PC.json`), never this PC's quota.
 - **Failover between PCs**: a stack service with `"spread": "nodes"` uses the other PCs that answer like VM nodes.

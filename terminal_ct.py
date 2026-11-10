@@ -1291,6 +1291,59 @@ def host_add(name, url, fingerprint=None, token=None, engine=None):
     return {"host": name, "url": h["url"], "os": kind, "engine": h["engine"], "version": version}
 
 
+def host_scan(cidr=None, port=None, timeout=0.6):
+    """terminal-ct agents answering on a network (default: this PC's /24): a TLS handshake to each address, nothing
+    else sent (no token, no request: their logs stay quiet). Adding one stays explicit: host add with its token."""
+    port = port or AGENT_PORT
+    if cidr is None:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+            try:
+                u.connect(("192.0.2.1", 9))  # UDP: no packet sent, only the route's own address chosen
+                cidr = f"{u.getsockname()[0]}/24"
+            except OSError:
+                raise SystemExit("no network address found here: give --cidr (e.g. 192.168.1.0/24)") from None
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        raise SystemExit(f"--cidr: a network such as 192.168.1.0/24, not {cidr!r}") from None
+    if net.num_addresses > 4096:
+        raise SystemExit("--cidr: at most 4096 addresses (a /20) at once")
+    known = {h.get("url") for h in _hosts().values()}
+
+    def probe(a):
+        try:
+            with socket.create_connection((str(a), port), timeout) as raw:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE  # read it, not trust it: the user compares
+                with ctx.wrap_socket(raw) as t:
+                    der = t.getpeercert(True)
+        except (OSError, ValueError):
+            return None
+        if not der or TOOL.encode() not in der:  # its certificate names terminal-ct (CN)
+            return None
+        url, fp = f"https://{'[%s]' % a if a.version == 6 else a}:{port}", hashlib.sha256(der).hexdigest()
+        return {"url": url, "fingerprint": fp, "added": url in known,
+                "add": f"terminal-ct host add NAME {url} --fingerprint {fp}"}
+    addrs = list(net.hosts()) or [net.network_address]
+    found = []
+    lock = threading.Lock()
+
+    def work(chunk):
+        for a in chunk:
+            r = probe(a)
+            if r:
+                with lock:
+                    found.append(r)
+    threads = [threading.Thread(target=work, args=(addrs[i::64],), daemon=True) for i in range(min(64, len(addrs)))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return {"network": str(net), "port": port, "agents": sorted(found, key=lambda r: r["url"]),
+            "note": "compare each fingerprint with the one terminal-ct agent shows on that PC, then host add it "
+                    "(its token typed or piped in)"}
+
+
 def host_alive(name):
     """Whether another PC answers (its agent's ping, or ssh), within a few seconds."""
     try:
@@ -6881,7 +6934,9 @@ def main(argv=None):
     vmp = sub.add_parser("vm", help="terminal-vm on another PC: terminal-ct --host PC vm ARGS")
     vmp.add_argument("vm_args", nargs=argparse.REMAINDER)
     hs = sub.add_parser("host", help="other PCs as nodes (their agent, or SSH)")
-    hs.add_argument("host_cmd", choices=["add", "ls", "rm"]); hs.add_argument("host_name", nargs="?")
+    hs.add_argument("host_cmd", choices=["add", "ls", "rm", "scan"]); hs.add_argument("host_name", nargs="?")
+    hs.add_argument("--cidr", help="scan: the network to look on (default: this PC's /24)")
+    hs.add_argument("--port", dest="scan_port", type=int, help="scan: the agents' port (default 7173)")
     hs.add_argument("url", nargs="?"); hs.add_argument("--fingerprint"); hs.add_argument("--force", action="store_true")
     hs.add_argument("--with", dest="host_engine", choices=["podman", "docker"], help="its engine (else Podman, then Docker)")
     hs.add_argument("--description", dest="host_desc", help="what this PC is for (one line)")
@@ -7020,6 +7075,8 @@ def main(argv=None):
                   file=sys.stderr)
         code = r.get("exit") or 0
         sys.exit(128 - code if code < 0 else code)  # killed by a signal there: 128 + its number, as a shell says
+    if o.cmd == "host" and o.host_cmd == "scan":
+        return print(json.dumps(host_scan(o.cidr, o.scan_port), indent=1))
     if o.cmd == "host":
         if o.host_cmd != "ls" and not o.host_name or o.host_cmd == "add" and not o.url:
             raise SystemExit({"add": "host add NAME https://IP:PORT --fingerprint SHA256 (token: typed, piped, or "
