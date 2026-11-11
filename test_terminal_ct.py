@@ -226,6 +226,16 @@ class Phase3(unittest.TestCase):
         c = ct.normalize(ct.find("s"))
         self.assertEqual((c["cpus"], c["memory_gb"], c["internet"], c["sandbox"]), (1, 1, False, True))
 
+    def test_runtime_named_only(self):
+        quiet(ct.create, "g", sandbox=True, runtime="runsc")
+        args = self.created("g")
+        self.assertEqual(args[args.index("--runtime") + 1], "runsc")
+        self.assertIn('"runtime":"runsc"', next(a for a in args if a.startswith("terminal-ct.spec=")))  # kept on remake
+        quiet(ct.create, "p")
+        self.assertNotIn("--runtime", self.created("p"))
+        with self.assertRaisesRegex(SystemExit, "--runtime: one of"):  # a path would run any binary on the host
+            ct.create("x", runtime="/tmp/evil")
+
     def test_quota_blocks_start_and_resize(self):
         with open(os.path.join(ct.STORE, "quota.json"), "w") as f:
             json.dump({"cpus": 3, "memory_gb": 4}, f)

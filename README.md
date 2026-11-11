@@ -85,7 +85,7 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 
 | Command | Does |
 |---|---|
-| `create NAME [--image IMAGE] [--cpus 1] [--memory 1] [--offline] [--net NET ...] [-- CMD...]` | create a container (default image `debian:stable-slim`, pulled if missing; memory in GiB, no swap beyond it); a named volume keeps `/data` |
+| `create NAME [--image IMAGE] [--cpus 1] [--memory 1] [--offline] [--net NET ...] [--runtime runsc\|kata] [-- CMD...]` | create a container (default image `debian:stable-slim`, pulled if missing; memory in GiB, no swap beyond it); a named volume keeps `/data`; `--runtime`: see [sandboxes](#networks-internet-sandboxes) |
 | `create NAME --sandbox ...` | a sandbox: see below |
 | `create NAME --desktop [--image IMAGE] [--width 1280 --height 800]` | the same image with a desktop: Xvnc + Openbox + xterm added on top (built once per base, cached as `tct-desktop:<base>`) |
 | `action NAME screenshot\|click\|move\|drag\|scroll\|type\|key\|wait\|status ...` | drive the desktop, same arguments as terminal-vm (`screenshot --output`, `click X Y [--button] [--double]`, `drag X Y X2 Y2`, `scroll --dy N`, `type TEXT`, `key CHORD`, `wait --stable --timeout`) |
@@ -306,6 +306,10 @@ The web dashboard can be opened by other people or agents, each with its own tok
 - A **sandbox** (`--sandbox`, `sandbox NAME on`): `--cap-drop ALL`, `no-new-privileges`, 256 processes at most,
   runs as your user (not root, even inside), `/data` in memory, no host mount (a desktop keeps its screen socket),
   offline, and a fresh file system at each start (recreated from its image; `start` says `"fresh": true`).
+- A stronger fence: `--runtime runsc` (gVisor, its own kernel in user space) or `--runtime kata` (a light VM per
+  container), with or without `--sandbox`, when that runtime is installed for the engine (`doctor` checks it;
+  Docker also needs `runsc install`). Names only, never a path. Kept by clones and snapshots. A whole machine of
+  its own: a VM of terminal-vm.
 - Podman in WSL: netavark's nftables rules fail on WSL's kernel, so terminal-ct points its own Podman calls at the
   iptables driver (`CONTAINERS_CONF_OVERRIDE`, unless you set it). Podman: a container on an internal network and
   online resolves only container names (IP access to the internet still works).

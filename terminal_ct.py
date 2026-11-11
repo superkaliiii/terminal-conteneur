@@ -1828,14 +1828,19 @@ def under(p, project):
     return not project or p == project or p.startswith(project + "/")
 DEFAULT_CPUS, DEFAULT_MEMORY = 1, 1  # each container gets a ceiling, so the quota can count it
 SANDBOX_PIDS = 256
+# OCI runtimes --runtime may name: names only, never a path (through MCP, a path would run any binary on the host)
+RUNTIMES = ("runsc", "kata", "kata-runtime", "kata-qemu", "kata-fc", "krun", "crun", "runc", "youki")
 
 
 def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_by="user",
            desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=(), project=None, labels=None,
-           own_volume=False, ports=()):
-    """Internet: on by default for the user's containers; sandboxes and agents' containers start offline.
+           own_volume=False, ports=(), runtime=None):
+    """runtime: the engine's OCI runtime for this container (runsc: gVisor, kata: a light VM), see RUNTIMES.
+    Internet: on by default for the user's containers; sandboxes and agents' containers start offline.
     labels: more terminal-ct.* labels (a stack's service and replica)."""
     check_name(name)
+    if runtime and runtime not in RUNTIMES:
+        raise SystemExit(f"--runtime: one of {', '.join(RUNTIMES)} (installed for {node().engine})")
     project = check_project(project or DEFAULT_PROJECT)
     where = _nodes()["placement"].get(name)  # one NAME across host and nodes: they share STORE/NAME
     if where and not (isinstance(node(), NodeVM) and node().name == where):
@@ -1877,7 +1882,7 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     quota_check({"disk_gb": 0})  # what a container will write is unknown: refuse once the disk quota is reached
     internet = not sandbox and created_by == "user" if internet is None else internet
     spec = {"image": image, "cmd": cmd, "desktop": desktop, "width": width, "height": height, "sandbox": sandbox,
-            **({"ports": ports} if ports else {})}
+            **({"ports": ports} if ports else {}), **({"runtime": runtime} if runtime else {})}
     out = _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=True, labels=labels)
     want(name, "stopped")
     print(json.dumps(out))
@@ -1951,6 +1956,7 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
             "--label", f"{LABEL}.desktop={int(bool(spec.get('desktop')))}",
             "--label", f"{LABEL}.spec={json.dumps(spec, separators=(',', ':'))}",
             *(x for k, v in (labels or {}).items() for x in ("--label", f"{LABEL}.{k}={v}")), *data, *extra,
+            *(["--runtime", spec["runtime"]] if spec.get("runtime") else []),
             "--cpus", f"{cpus:g}", "--memory", str(int(memory * 2 ** 30)), "--memory-swap", str(int(memory * 2 ** 30)),
             image, *(cmd or [])]  # memory-swap = memory: no swap, so the quota's memory is the real ceiling
     try:
@@ -1964,13 +1970,17 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
         except SystemExit:
             node().run(["rm", "-f", PREFIX + name], check=False)  # fail closed: never left online by mistake
             raise
-    except SystemExit:
+    except SystemExit as e:
         if fresh and made_volume:
             node().run(["volume", "rm", volume], check=False)  # else left behind with no container to rm it
+        if spec.get("runtime") and "runtime" in str(e).lower():  # Podman says "default OCI runtime ... not found"
+            raise SystemExit(f"{e}\n--runtime {spec['runtime']} is not installed for {node().engine}: "
+                             "terminal-ct doctor names what to install") from None
         raise
     return {"created": name, "image": image, "id": cid[:12], "project": project, "cpus": cpus, "memory_gb": memory,
             "internet": internet,
             **({"networks": list(nets)} if nets else {}), **({"sandbox": True} if sandbox else {}),
+            **({"runtime": spec["runtime"]} if spec.get("runtime") else {}),
             **({"desktop": f"{spec['width']}x{spec['height']}"} if spec.get("desktop") else {})}
 
 
@@ -6085,7 +6095,7 @@ AGENT_TOOLS = [
      _schema({**_NAME, "image": {"type": "string"}, "desktop": {"type": "boolean"}, "width": {"type": "integer"},
               "height": {"type": "integer"}, "cpus": _N, "memory_gb": _N, "sandbox": {"type": "boolean"},
               "internet": {"type": "boolean"}, "networks": {"type": "array", "items": {"type": "string"}},
-              **_DESC_ARG}, ["name"])),
+              "runtime": {"type": "string", "enum": list(RUNTIMES)}, **_DESC_ARG}, ["name"])),
     ("ct_start", "Start a container, within the host quota (a sandbox starts fresh from its image)." + _MANAGED,
      _schema(_NAME, ["name"])),
     ("ct_stop", "Stop a container.", _schema({**_NAME, "timeout": {"type": "integer"}}, ["name"])),
@@ -6364,7 +6374,7 @@ def agent_call(tool, a, approve, project=None):
         out = quiet(create, name, img, a.get("cpus"), a.get("memory_gb"), created_by="agent", desktop=desk,
                     width=int(a.get("width", 1280)), height=int(a.get("height", 800)),
                     sandbox=a.get("sandbox", True), internet=bool(a.get("internet")), nets=a.get("networks") or (),
-                    project=where)
+                    project=where, runtime=a.get("runtime"))
         if desc:
             set_description("container", name, desc)
         return out
@@ -6772,6 +6782,10 @@ def doctor_checks():
     check("window viewer", viewer, viewer or "show NAME opens a desktop in a window with TigerVNC's viewer",
           _pkg("tigervnc-viewer") if not (WINDOWS or MAC) else "winget install TigerVNC.TigerVNC" if WINDOWS
           else "brew install --cask tigervnc-viewer", required=False)
+    strong = [r for r in ("runsc", "kata-runtime", "containerd-shim-kata-v2") if shutil.which(r)]
+    check("secure runtime", strong, ", ".join(strong) if strong else
+          "none: create --runtime runsc|kata needs gVisor or Kata Containers (Docker: also `runsc install`)",
+          "install gVisor: https://gvisor.dev/docs/user_guide/install/", required=False)
     vm = vm_cli()
     check("terminal-vm", vm, " ".join(vm) if vm else "not found: nodes (node add) and VMs on the dashboard need it",
           "install terminal-vm (its install.sh)", required=False)
@@ -7032,6 +7046,7 @@ def main(argv=None):
     c.add_argument("--desktop", action="store_true", help="Xvnc + Openbox on top of the image")
     c.add_argument("--width", type=int, default=1280); c.add_argument("--height", type=int, default=800)
     c.add_argument("--sandbox", action="store_true"); c.add_argument("--offline", action="store_true")
+    c.add_argument("--runtime", choices=RUNTIMES, help="OCI runtime: runsc (gVisor) or kata for a stronger fence")
     c.add_argument("--net", action="append", default=[], help="an isolated network (repeatable)")
     c.add_argument("--ports", type=int, action="append", default=[],
                    help="with --node and --net: publish it on that node's address of the network (repeatable)")
@@ -7188,7 +7203,7 @@ def main(argv=None):
     if o.cmd == "create":
         r = create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width,
                    height=o.height, sandbox=o.sandbox, internet=False if o.offline else None, nets=o.net,
-                   project=o.project, ports=o.ports)
+                   project=o.project, ports=o.ports, runtime=o.runtime)
         if isinstance(NODE, NodeVM):
             place(o.name, NODE.name)
         described("container", o.name, "description")
