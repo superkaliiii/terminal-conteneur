@@ -953,17 +953,21 @@ def connect(host, port, literal):
 
 
 def pipe(a, b):
-    socks = [a, b]
+    socks = [a, b]  # the ones still sending: a side that is done (busybox wget, after its request) only half-closes
     try:
-        while True:  # TLS sockets may hold decrypted bytes select cannot see
+        while socks:  # TLS sockets may hold decrypted bytes select cannot see
             r = [s for s in socks if getattr(s, "pending", lambda: 0)()] or select.select(socks, [], [], 300)[0]
             if not r:
                 return
             for s in r:
                 d = s.recv(65536)
+                other = b if s is a else a
                 if not d:
-                    return
-                (b if s is a else a).sendall(d)
+                    socks.remove(s)
+                    if not isinstance(other, ssl.SSLSocket):  # its shutdown drops TLS: raw bytes would follow
+                        other.shutdown(socket.SHUT_WR)
+                else:
+                    other.sendall(d)
     except OSError:
         pass
     finally:
@@ -982,9 +986,11 @@ def handle(c):
         method, target = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ")[:2]
         if method == "CONNECT":
             host, _, port = target.rpartition(":")
-        else:  # plain HTTP, absolute form: the upstream is fixed, so later requests on this connection go there too
-            rest = target.split("://", 1)[1].split("/", 1)[0] if target.startswith("http://") else ""
-            host, _, port = rest.rpartition(":") if ":" in rest else (rest, "", "80")
+        else:  # absolute form, http:// or https:// (busybox wget; then the TLS is made here, certificate checked): the
+            # upstream is fixed, so later requests on this connection go there too
+            scheme = target.split("://", 1)[0].lower() if "://" in target else ""
+            rest = target.split("://", 1)[1].split("/", 1)[0] if scheme in ("http", "https") else ""
+            host, _, port = rest.rpartition(":") if ":" in rest else (rest, "", "443" if scheme == "https" else "80")
         host, port = host.strip("[]"), int(port or 0)
         h = allowed(host, port)
         if not h:
@@ -1005,9 +1011,12 @@ def handle(c):
             c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
             s.sendall(body)
         else:
+            if scheme == "https":
+                s = ssl.create_default_context().wrap_socket(s, server_hostname=host)
             s.sendall(head)
         pipe(c, s)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        print(f"error {type(e).__name__}: {e}", flush=True)
         c.close()
 
 
@@ -2259,8 +2268,13 @@ def desktop_image(base):
 def start(name):
     info = find(name)
     out = {"started": name}
-    if _spec(info).get("proxy") and not running(info):  # its only way out, up before it
+    if _spec(info).get("proxy") and not running(info):  # its only way out, up (listening) before it
         quiet(start, f"{name}-egress")
+        for _ in range(50):  # it prints its first line once it listens
+            r = node().run(["logs", "--since", "60s", f"{PREFIX}{name}-egress"], check=False)
+            if "egress proxy for" in r.stdout + r.stderr:
+                break
+            time.sleep(0.2)
     if not running(info):
         if labels_of(info).get(f"{LABEL}.sandbox") == "1" and labels_of(info).get(f"{LABEL}.spec"):
             ensure_image(json.loads(labels_of(info)[f"{LABEL}.spec"]))  # a rebuild takes minutes: not under the lock
