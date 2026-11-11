@@ -564,6 +564,22 @@ class Orchestration(unittest.TestCase):
             shutil.rmtree(l.path); os.mkdir(l.path)                                      # broken and taken by another
         self.assertTrue(os.path.isdir(os.path.join(ct.STORE, ".x.lock")))                 # theirs is left alone
 
+    def test_lock_of_a_dead_holder_is_taken_at_once(self):
+        """A holder killed -9 (a crashed daemon) frees its lock at once, not after 120 s; another namespace's is kept."""
+        p = subprocess.Popen([sys.executable, "-c", "pass"]); p.wait()               # a pid that has ended
+        lock = os.path.join(ct.STORE, ".y.lock")
+        for ns, freed in (("pid:[other]", False), (ct._here(), True)):
+            os.makedirs(lock, exist_ok=True)
+            with open(os.path.join(lock, f"{p.pid}-ab"), "w") as f:
+                f.write(ns)
+            self.assertEqual(ct._holder_gone(lock), freed)
+        t = time.time()
+        with ct.quota_lock("y"):
+            self.assertLess(time.time() - t, 2)
+        self.assertFalse(ct._holder_gone(lock) if os.path.isdir(lock) else False)
+        with ct.quota_lock("z") as l:
+            self.assertFalse(ct._holder_gone(l.path))                                  # its own holder lives
+
     def test_resume_leaves_stacks_to_the_daemon(self):
         ct.apply(self.STACK)
         self.n.run(["stop", "tct-lab-web-1"])

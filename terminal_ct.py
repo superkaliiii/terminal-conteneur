@@ -2305,6 +2305,49 @@ def quota_limits(use):
     return {k: set_.get(k, default[k]) for k in QUOTA_KEYS}, {k: k in set_ for k in QUOTA_KEYS}
 
 
+def _here():
+    """This process's pid namespace: a pid names the same process only within it (WSL distros, containers)."""
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return sys.platform
+
+
+def _pid_gone(pid):
+    if WINDOWS:  # os.kill(pid, 0) would terminate it there
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = wintypes.HANDLE
+        h = k.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not h:
+            return k.GetLastError() == 87  # no such process (access denied: it lives)
+        code = wintypes.DWORD()
+        try:
+            return bool(k.GetExitCodeProcess(h, ctypes.byref(code))) and code.value != 259  # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
+def _holder_gone(lock):
+    """True when the lock's holder was a process of this pid namespace and has ended (a crash, a kill -9)."""
+    try:
+        for t in os.listdir(lock):
+            with open(os.path.join(lock, t)) as f:
+                if f.read() == _here() and _pid_gone(int(t.split("-")[0])):
+                    return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 class quota_lock:
     """Cross-process lock (an atomic mkdir), so two commands cannot both pass the check and then both start.
     what: another lock of the same kind (reconcile)."""
@@ -2318,7 +2361,8 @@ class quota_lock:
             try:
                 os.mkdir(self.path)
                 self.token = os.path.join(self.path, f"{os.getpid()}-{secrets.token_hex(4)}")
-                open(self.token, "w").close()
+                with open(self.token, "w") as f:
+                    f.write(_here())  # with the pid in its name: a holder that died frees it at once
                 self.held = threading.Event()
 
                 def fresh():  # held for long (an image build under it): never "stale" while its holder lives
@@ -2329,7 +2373,7 @@ class quota_lock:
                 return self
             except FileExistsError:
                 with contextlib.suppress(OSError):
-                    if time.time() - os.path.getmtime(self.path) > 120:  # left by a crashed command
+                    if time.time() - os.path.getmtime(self.path) > 120 or _holder_gone(self.path):  # left by a crash
                         # rename first: of two waiters seeing it stale, only one claims it (rmdir alone let the
                         # second remove the first's fresh lock)
                         stale = f"{self.path}.{os.getpid()}"
@@ -3589,9 +3633,10 @@ def _daemon_file(kind):
 def daemon_alive():
     try:
         with open(_daemon_file("beat")) as f:
-            return time.time() - float(f.read().split()[0]) < 5 * TICK
+            beat = time.time() - float(f.read().split()[0]) < 5 * TICK
     except (OSError, ValueError, IndexError):
         return False
+    return beat and not _holder_gone(os.path.join(STORE, ".daemon.lock"))  # a daemon killed -9 beats no more
 
 
 def daemon(cmd="status"):
