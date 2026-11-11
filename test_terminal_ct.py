@@ -1883,7 +1883,7 @@ class ProjectsAndResume(unittest.TestCase):
                 unittest.mock.patch.object(ct, "WINDOWS", False), unittest.mock.patch.object(ct, "in_wsl", lambda: True), \
                 unittest.mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "Debian"}):
             out = ct.agent_autostart(True, "10.0.0.5", 7173)
-            with self.assertRaises(ValueError):
+            with self.assertRaises(SystemExit):
                 ct.agent_autostart(True, "pc.lan")                              # an address, never a name
         self.assertEqual(calls[0][:5], ["reg.exe", "add", RUN_KEY, "/v", "terminal-ct-agent"])
         self.assertTrue(out["runs"].endswith(" agent --listen 10.0.0.5 --port 7173 --stay"))
@@ -2609,6 +2609,9 @@ class WebSession(unittest.TestCase):
             with self.assertRaises(SystemExit, msg=bad):
                 ct.web(False, listen=bad)
         self.assertFalse(os.path.exists(os.path.join(ct.STORE, "web.listen.json")))
+        for bad in ("0.0.0.0", "::", "pc.local"):  # the agent too: never on every network
+            with self.assertRaises(SystemExit, msg=bad):
+                ct.agent_serve(bad, 0)
 
     @unittest.skipUnless(shutil.which("openssl"), "HTTPS needs openssl")
     def test_network_side_is_https_only(self):

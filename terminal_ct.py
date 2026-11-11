@@ -770,9 +770,21 @@ class _AgentHandler(http.server.BaseHTTPRequestHandler):
         self._reply(200, {"path": path, "bytes": n})
 
 
+def one_address(listen):
+    """The agent's --listen: one address of this PC, never 0.0.0.0 or :: (every network) nor a name (as web's)."""
+    try:
+        ip = ipaddress.ip_address(listen)
+    except ValueError:
+        raise SystemExit("--listen: an address of this PC on the network (an IP)") from None
+    if ip.is_unspecified or ip.version == 6 and (ip.ipv4_mapped and ip.ipv4_mapped.is_unspecified or "%" in str(ip)):
+        raise SystemExit("--listen: one address of this PC (not 0.0.0.0 or ::, which would share it on every "
+                         "network; no %zone)")
+    return ip
+
+
 def agent_serve(listen="127.0.0.1", port=None):
     """This PC's agent, HTTPS on listen:port (a thread serves it; serve_forever() to block): the server."""
-    ip = ipaddress.ip_address(listen)  # an address, never a name: what is reachable stays explicit
+    ip = one_address(listen)
     fp, token = agent_credentials()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -2575,7 +2587,7 @@ def agent_autostart(on=None, listen="127.0.0.1", port=None):
     after a restart. Its address and port as given; its certificate and token stay the same."""
     if WINDOWS:
         raise SystemExit("on Windows the agent runs inside WSL: terminal-ct agent there (install.ps1 sets it up)")
-    args = ["agent", "--listen", str(ipaddress.ip_address(listen)), *(["--port", str(port)] if port else []),
+    args = ["agent", "--listen", str(one_address(listen)), *(["--port", str(port)] if port else []),
             *(["--stay"] if in_wsl() else [])]  # WSL: no service manager to start it again; --stay does
     out = _at_logon(AGENT_TASK, args, on, "this PC's agent for a central PC", server=True)
     if on:
@@ -3605,18 +3617,18 @@ def daemon(cmd="status"):
         with contextlib.suppress(OSError):
             os.remove(_daemon_file("stop"))
         os.makedirs(STORE, exist_ok=True)
-        log = open(_daemon_file("log"), "ab")
         args = [sys.executable, os.path.abspath(__file__), "daemon", "run"]
         env = dict(os.environ, TERMINAL_CT_HOME=STORE)  # this store, however it was chosen (else: the default one)
-        if WINDOWS:  # out of the parent's job too: else it dies with the terminal or MCP server that started it
-            base = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-            try:
-                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
-                                 creationflags=base | 0x01000000)  # CREATE_BREAKAWAY_FROM_JOB
-            except OSError:  # a job that forbids breaking away
-                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, creationflags=base)
-        else:
-            subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, start_new_session=True)
+        with open(_daemon_file("log"), "ab") as log:  # closed here: the daemon has its own copy
+            if WINDOWS:  # out of the parent's job too: else it dies with the terminal or MCP server that started it
+                base = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                try:
+                    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
+                                     creationflags=base | 0x01000000)  # CREATE_BREAKAWAY_FROM_JOB
+                except OSError:  # a job that forbids breaking away
+                    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, creationflags=base)
+            else:
+                subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, start_new_session=True)
         return "started"
     if cmd != "run":
         raise SystemExit("daemon run|start|stop|status")
