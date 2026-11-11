@@ -19,6 +19,7 @@ labels; containers without them are never touched.
   net create|rm NET | net ls | net attach|detach NAME NET   isolated networks (containers reach each other by name)
   internet NAME [on|off]  |  sandbox NAME on|off      stopped containers (one made by 0.2 is upgraded, kept as is)
   internet NAME allow HOST...                         not recommended: only these hosts, through a proxy (README)
+  vault NAME set HOST HEADER | ls | rm HOST           not recommended: a secret its proxy adds for HOST (stdin)
   action NAME screenshot|click|move|drag|scroll|type|key|wait|status ...   desktop containers
   mcp [NAME] [--project P]   stdio MCP server: screen tools + exec (on NAME, or `container`), container and
                       network management under the agent-authority rules (sandboxes and its own; the rest asks the
@@ -924,7 +925,7 @@ def _relay_grants():
 # listed hosts. Fail-closed: a program that ignores HTTP(S)_PROXY gets no internet at all.
 EGRESS_PORT = 3128
 EGRESS_CODE = r"""
-import ipaddress, select, socket, sys, threading
+import ipaddress, json, select, socket, ssl, sys, threading
 
 ALLOW = [a.lower() for a in sys.argv[1:] if not a.startswith("@")]
 DNS = [a[1:] for a in sys.argv[1:] if a.startswith("@")]
@@ -954,8 +955,8 @@ def connect(host, port, literal):
 def pipe(a, b):
     socks = [a, b]
     try:
-        while True:
-            r, _, _ = select.select(socks, [], [], 300)
+        while True:  # TLS sockets may hold decrypted bytes select cannot see
+            r = [s for s in socks if getattr(s, "pending", lambda: 0)()] or select.select(socks, [], [], 300)[0]
             if not r:
                 return
             for s in r:
@@ -997,6 +998,9 @@ def handle(c):
         print(f"allow {host}:{port}", flush=True)
         c.settimeout(None)
         body = head.split(b"\r\n\r\n", 1)[1]
+        rule = vault_rule(host) if method == "CONNECT" and port == 443 else None
+        if rule:
+            return vault(c, s, host, rule)
         if method == "CONNECT":
             c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
             s.sendall(body)
@@ -1005,6 +1009,42 @@ def handle(c):
         pipe(c, s)
     except (OSError, ValueError):
         c.close()
+
+
+def vault_rule(host):
+    try:
+        with open("/vault/rules.json") as f:  # read at each connection: vault set needs no restart
+            return json.load(f).get(host)
+    except (OSError, ValueError):
+        return None
+
+
+def vault(c, s, host, rule):
+    # HOST's TLS opened with its certificate from the container's own CA, its first request given the header
+    # (a client's own copy replaced) and Connection: close, then the rest carried as is
+    c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(f"/vault/{host}.pem", f"/vault/{host}.key")
+    ctx.set_alpn_protocols(["http/1.1"])
+    up = ssl.create_default_context()
+    up.set_alpn_protocols(["http/1.1"])
+    tc = ctx.wrap_socket(c, server_side=True)
+    us = up.wrap_socket(s, server_hostname=host)
+    head = b""
+    while b"\r\n\r\n" not in head:
+        d = tc.recv(65536)
+        if not d or len(head) > 65536:
+            return tc.close(), us.close()
+        head += d
+    head, rest = head.split(b"\r\n\r\n", 1)
+    lines = head.split(b"\r\n")
+    name = rule["header"].encode()
+    drop = {name.lower(), b"connection", b"proxy-connection", b"keep-alive"}
+    keep = [l for l in lines[1:] if l.split(b":", 1)[0].strip().lower() not in drop]
+    us.sendall(b"\r\n".join([lines[0], *keep, name + b": " + rule["value"].encode(), b"Connection: close"])
+               + b"\r\n\r\n" + rest)
+    print(f"vault {host}: {rule['header']} given", flush=True)
+    pipe(tc, us)
 
 
 srv = socket.create_server(("0.0.0.0", PORT), backlog=64)
@@ -1815,7 +1855,11 @@ def is_bridged(c):
 
 def online(c):
     if is_bridged(c):
-        return any(b in networks_of(c) for b in BRIDGE.values())  # listed here, it may be another engine's
+        nets = (c.get("NetworkSettings") or {}).get("Networks") or {}
+        # Podman lists a never-started container with no network at all as on "bridge" (NetworkID "bridge"); Docker's
+        # real bridge has a hex id
+        return any(b in nets and not (b == "bridge" and (nets[b] or {}).get("NetworkID") == "bridge")
+                   for b in BRIDGE.values())  # listed here, it may be another engine's
     return (c.get("HostConfig") or {}).get("NetworkMode") != "none"
 
 
@@ -1936,7 +1980,7 @@ RUNTIMES = ("runsc", "kata", "kata-runtime", "kata-qemu", "kata-fc", "krun", "cr
 
 def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_by="user",
            desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=(), project=None, labels=None,
-           own_volume=False, ports=(), runtime=None, on_start=None):
+           own_volume=False, ports=(), runtime=None, on_start=None, mounts=()):
     """runtime: the engine's OCI runtime for this container (runsc: gVisor, kata: a light VM), see RUNTIMES.
     on_start: a shell command run in it at each start (its setup); a failure stops it.
     Internet: on by default for the user's containers; sandboxes and agents' containers start offline.
@@ -1986,7 +2030,7 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     internet = not sandbox and created_by == "user" if internet is None else internet
     spec = {"image": image, "cmd": cmd, "desktop": desktop, "width": width, "height": height, "sandbox": sandbox,
             **({"ports": ports} if ports else {}), **({"runtime": runtime} if runtime else {}),
-            **({"on_start": on_start} if on_start else {})}
+            **({"on_start": on_start} if on_start else {}), **({"mounts": [list(m) for m in mounts]} if mounts else {})}
     out = _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=True, labels=labels)
     want(name, "stopped")
     print(json.dumps(out))
@@ -2046,6 +2090,10 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
         data = ["-v", f"{volume}:/data"]
     if isinstance(node(), NodeRemote):  # on the address the central PC reaches it by: never all of its interfaces
         extra += [x for p in spec.get("ports") or () for x in ("-p", f"{node().address()}:{p}:{p}")]
+    extra += [x for src, dst in spec.get("mounts") or () for x in ("-v", f"{src}:{dst}:ro")]
+    if spec.get("vault"):  # trust the vault's CA too: the bundle is made at each start (start)
+        extra += [x for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO")
+                  for x in ("-e", f"{k}={VAULT_BUNDLE}")] + ["-e", f"NODE_EXTRA_CA_CERTS={VAULT_CA_IN}"]
     if spec.get("proxy"):  # an allowlist: its proxy is the only way out (internet NAME allow)
         extra += [x for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy") for x in ("-e", f"{k}={spec['proxy']}")]
         extra += ["-e", "NO_PROXY=localhost,127.0.0.1", "-e", "no_proxy=localhost,127.0.0.1"]
@@ -2230,6 +2278,8 @@ def start(name):
                 ensure_node_nets(node().name)  # after a node restart its rules are gone: back before it runs
             node().run(["start", PREFIX + name])
             node_routes(name, info)
+        if _spec(info).get("vault"):
+            quiet(exec_, name, ["sh", "-c", VAULT_BUNDLE_SH, VAULT_BUNDLE, VAULT_CA_IN], 30)
         hook = _spec(info).get("on_start")
         if hook:  # its setup, each start (a sandbox starts fresh), outside the quota lock: it may take minutes
             t0 = time.time()
@@ -2823,7 +2873,8 @@ def internet_allow(name, hosts):
     quiet(create, proxy, image=RELAY_IMAGE, cpus=0.25, memory=0.125, internet=True, nets=[proxy],
           cmd=["python3", "-c", EGRESS_CODE, *hosts,
                *("@" + d for d in (host_resolvers() if node().engine == "podman" else ()))],
-          labels={"egress_for": name}, project=labels_of(info).get(f"{LABEL}.project"))
+          labels={"egress_for": name}, project=labels_of(info).get(f"{LABEL}.project"),
+          mounts=[[os.path.join(vault_dir(name), "proxy"), "/vault"]])
     if NET_PREFIX + proxy not in networks_of(info):
         node().run(["network", "connect", "--alias", name, NET_PREFIX + proxy, PREFIX + name])
     remake(name, find(name), internet=False, proxy=f"http://{proxy}:{EGRESS_PORT}", allow=hosts)
@@ -2844,6 +2895,106 @@ def host_resolvers():
     return out
 
 
+# ---------- vault (not recommended) ----------
+# A secret kept on this PC and given by NAME's egress proxy as a header of its HTTPS requests to one host: the
+# container never holds it. The proxy opens that host's TLS with a certificate from a CA of NAME's own (its key stays
+# here); NAME trusts that CA through SSL_CERT_FILE & co.
+VAULT_CA_IN, VAULT_BUNDLE = "/etc/tct-vault-ca.pem", "/tmp/.tct-ca-bundle.pem"
+_HEADER = re.compile(r"[A-Za-z0-9-]{1,64}")
+VAULT_WARNING = ("not recommended unless you know what you are doing: the container trusts a CA of its own for these "
+                 "hosts, a program with its own CA list fails there, and anything it sends to the host is sent with "
+                 "the secret")
+VAULT_BUNDLE_SH = ('for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do '
+                   '[ -f "$f" ] && cat "$f" && break; done > "$0.new"; cat "$1" >> "$0.new" && mv "$0.new" "$0"')
+
+
+def _openssl(*args):
+    exe = shutil.which("openssl")
+    if not exe:
+        raise SystemExit("the vault needs openssl on this PC, to make its certificates (terminal-ct doctor)")
+    r = subprocess.run([exe, *args], capture_output=True, text=True, **NO_WINDOW)
+    if r.returncode:
+        raise SystemExit(f"openssl: {r.stderr.strip()[-300:]}")
+
+
+def vault_dir(name):
+    d = os.path.join(ct_dir(name), "vault")
+    os.makedirs(os.path.join(d, "proxy"), mode=0o700, exist_ok=True)
+    return d
+
+
+def _vault_rules(name):
+    with contextlib.suppress(OSError, ValueError):
+        with open(os.path.join(vault_dir(name), "proxy", "rules.json"), encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _vault_write(name, rules):
+    path = os.path.join(vault_dir(name), "proxy", "rules.json")
+    fd = os.open(f"{path}.new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(rules, f)
+    os.replace(f"{path}.new", path)
+
+
+def vault_set(name, host, header, value):
+    """HOST's HTTPS requests from NAME get HEADER: VALUE from its proxy (NAME stopped the first time)."""
+    host = host.lower()
+    if not _ALLOW.fullmatch(host) or host.startswith("*.") or ":" in host:
+        raise SystemExit("vault set NAME HOST HEADER: one host name (api.example.com), no wildcard or port")
+    if not _HEADER.fullmatch(header or ""):
+        raise SystemExit("HEADER: a header name (Authorization, X-Api-Key)")
+    if not value or any(ch in value for ch in "\r\n\0"):
+        raise SystemExit("the value: one line, given on standard input")
+    info = find(name)
+    allow = _spec(info).get("allow") or []
+    if not any(a == host or a.startswith("*.") and (host.endswith(a[1:]) or host == a[2:]) for a in allow):
+        raise SystemExit(f"{host} is not in {name}'s allowlist: terminal-ct internet {name} allow ... {host}")
+    d = vault_dir(name)
+    ca, ca_key = os.path.join(d, "ca.pem"), os.path.join(d, "ca.key")
+    if not os.path.isfile(ca):
+        _openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "825", "-subj", f"/CN=terminal-ct vault {name}",
+                 "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign",
+                 "-keyout", ca_key, "-out", ca)
+        os.chmod(ca_key, 0o600)
+    leaf, key, csr, ext = (os.path.join(d, "proxy", f"{host}.{x}") for x in ("pem", "key", "csr", "ext"))
+    with open(ext, "w") as f:
+        f.write(f"subjectAltName=DNS:{host}\nextendedKeyUsage=serverAuth\n")
+    try:
+        _openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", f"/CN={host}", "-keyout", key, "-out", csr)
+        _openssl("x509", "-req", "-in", csr, "-CA", ca, "-CAkey", ca_key, "-set_serial", str(int(secrets.token_hex(8), 16)),
+                 "-days", "825", "-extfile", ext, "-out", leaf)
+    finally:
+        for x in (csr, ext):
+            with contextlib.suppress(OSError):
+                os.remove(x)
+    os.chmod(key, 0o600)
+    rules = _vault_rules(name)
+    rules[host] = {"header": header, "value": value}
+    _vault_write(name, rules)
+    if not _spec(info).get("vault"):  # first secret: the proxy reads them, NAME trusts its CA
+        stopped(name, "vault")
+        internet_allow(name, allow)
+        remake(name, find(name), vault=True, mounts=[[ca, VAULT_CA_IN]])
+    return {"name": name, "host": host, "header": header, "warning": VAULT_WARNING}
+
+
+def vault_ls(name):
+    return {"name": name, "secrets": {h: r["header"] for h, r in sorted(_vault_rules(name).items())}}
+
+
+def vault_rm(name, host):
+    rules = _vault_rules(name)
+    if rules.pop(host.lower(), None) is None:
+        raise SystemExit(f"no secret for {host} in {name}")
+    _vault_write(name, rules)
+    for x in ("pem", "key"):
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(vault_dir(name), "proxy", f"{host.lower()}.{x}"))
+    return {"name": name, "removed": host.lower()}
+
+
 def _egress_off(name, info, on):
     """The allowlist gone: its proxy and network removed, the proxy settings out of NAME."""
     proxy = f"{name}-egress"
@@ -2853,7 +3004,8 @@ def _egress_off(name, info, on):
         node().run(["network", "disconnect", NET_PREFIX + proxy, PREFIX + name])
     node().run(["network", "rm", NET_PREFIX + proxy], check=False)
     set_description("net", proxy, "")
-    return remake(name, find(name), internet=on, proxy=None, allow=None)
+    shutil.rmtree(os.path.join(STORE, name, "vault"), ignore_errors=True)  # its secrets go with the allowlist
+    return remake(name, find(name), internet=on, proxy=None, allow=None, vault=None, mounts=None)
 
 
 def sandbox(name, on):
@@ -5704,6 +5856,9 @@ def clone(src, new, created_by="user", project=None, internet=None):
                          f"or remove it: {node().engine} volume rm {PREFIX}{new}-data")
     lab = labels_of(info)
     spec = json.loads(lab.get(f"{LABEL}.spec") or "null") or legacy_spec(info)
+    if spec.get("proxy"):  # SRC's proxy and secrets are SRC's: the clone starts offline without them
+        spec = {k: v for k, v in spec.items() if k not in ("proxy", "allow", "vault", "mounts")}
+        internet = False
     sandbox = lab.get(f"{LABEL}.sandbox") == "1"
     cpus, mem = allotted(info, None)
     project = check_project(project or lab.get(f"{LABEL}.project") or DEFAULT_PROJECT)
@@ -7370,6 +7525,9 @@ def main(argv=None):
     c.add_argument("--ports", type=int, action="append", default=[],
                    help="with --node and --net: publish it on that node's address of the network (repeatable)")
     c.add_argument("--project"); c.add_argument("--description", help="what it is for (one line)")
+    vt = sub.add_parser("vault", help="NAME set HOST HEADER (value on stdin) | NAME ls | NAME rm HOST: not recommended")
+    vt.add_argument("name"); vt.add_argument("vault_cmd", choices=["set", "ls", "rm"])
+    vt.add_argument("host", nargs="?"); vt.add_argument("header", nargs="?")
     rs = sub.add_parser("resume"); rs.add_argument("--stay", action="store_true")
     ap = sub.add_parser("apply"); ap.add_argument("file"); ap.add_argument("--project")
     sk = sub.add_parser("stack"); sk.add_argument("stack_cmd", choices=["ls", "show", "rm"]); sk.add_argument("stack", nargs="?")
@@ -7655,6 +7813,14 @@ def main(argv=None):
     if o.cmd == "rm": return rm(o.name)  # from its node, rm forgets where it was
     if o.cmd == "status": return status(o.name)
     if o.cmd == "job": return job(o.name, o.id, o.kill, o.tail)
+    if o.cmd == "vault":
+        if o.vault_cmd == "ls": return show_json(vault_ls(o.name))
+        if not o.host or o.vault_cmd == "set" and not o.header:
+            raise SystemExit("vault NAME set HOST HEADER  (the value on standard input) | vault NAME rm HOST")
+        if o.vault_cmd == "rm": return show_json(vault_rm(o.name, o.host))
+        import getpass
+        value = getpass.getpass(f"{o.header} for {o.host}: ") if sys.stdin.isatty() else sys.stdin.readline().rstrip("\r\n")
+        return show_json(vault_set(o.name, o.host, o.header, value))
     if o.cmd == "exec":
         if o.command and o.command[0].startswith("--"):  # exec NAME --timeout S [--] CMD: REMAINDER took the options
             xo = argparse.ArgumentParser(prog="terminal-ct exec NAME")

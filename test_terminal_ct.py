@@ -248,6 +248,14 @@ class Phase3(unittest.TestCase):
         f = ct.fences(pod)["fences"]
         self.assertEqual((f["capabilities"], f["runtime"]), (0, "runsc"))
 
+    def test_offline_never_started_podman_container_is_offline(self):
+        fake = {"HostConfig": {"NetworkMode": "bridge"},
+                "NetworkSettings": {"Networks": {"bridge": {"NetworkID": "bridge", "EndpointID": ""}}}}
+        self.assertFalse(ct.online(fake))  # Podman's placeholder for "no network"
+        real = {"HostConfig": {"NetworkMode": "bridge"},
+                "NetworkSettings": {"Networks": {"bridge": {"NetworkID": "5f2c9a0e"}}}}
+        self.assertTrue(ct.online(real))   # Docker's bridge, stopped or not
+
     def test_on_start_runs_at_each_start_and_a_failure_stops(self):
         quiet(ct.create, "h", on_start="apt-get install -y git")
         quiet(ct.start, "h")

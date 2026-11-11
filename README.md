@@ -102,6 +102,7 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 | `net create NET`, `net rm NET`, `net ls`, `net attach NAME NET`, `net detach NAME NET` | isolated networks: no LAN, no internet; containers on one reach each other by name |
 | `internet NAME [on\|off]` | show or change internet access (stopped container) |
 | `internet NAME allow HOST...` | **not recommended**, off by default: only these hosts, through a proxy (see [allowlist](#networks-internet-sandboxes)) |
+| `vault NAME set HOST HEADER`, `vault NAME ls`, `vault NAME rm HOST` | **not recommended**, off by default: a secret kept on this PC that the allowlist's proxy adds to NAME's HTTPS requests to HOST; the value is read from standard input, never an argument (see [vault](#networks-internet-sandboxes)) |
 | `snapshot NAME save\|load\|rm TAG`, `snapshot NAME ls` | file system and `/data` (load: stopped container), see [Snapshots and clones](#snapshots-and-clones) |
 | `clone SRC NEW [--project P]` | NEW from SRC as it is: its files and a copy of its `/data` |
 | `infra [--project P] [--json]` | the map: PCs and nodes with their quota, what runs where, networks and names, VMs, projects; see [Infra map and descriptions](#infra-map-and-descriptions) |
@@ -317,6 +318,16 @@ The web dashboard can be opened by other people or agents, each with its own tok
   data out (an upload to a code host or a paste site). `logs NAME-egress` lists what was allowed and denied.
   `internet NAME on|off` ends it (the proxy and its network go); the proxy starts and stops with NAME, `rm` removes
   it. This PC's containers only; not offered to agents through MCP.
+- **Vault (not recommended unless you know what you are doing; off by default).** With an allowlist,
+  `printf 'Bearer %s' "$TOKEN" | terminal-ct vault NAME set api.example.com Authorization` keeps the value on this
+  PC (`STORE/NAME/vault`, owner only): the proxy opens that host's HTTPS with a certificate from a CA made for
+  NAME alone (its private key never leaves this PC) and gives the header to each request, replacing the
+  container's own; the container never holds the secret, and it trusts that CA through `SSL_CERT_FILE`,
+  `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO` (its system CAs plus NAME's, made at each start) and
+  `NODE_EXTRA_CA_CERTS`. Other allowed hosts stay end-to-end. Why it is not recommended: a program with its own
+  CA list fails on those hosts, the header goes with whatever the program sends there, and one request per
+  connection (HTTP/1.1). `internet NAME on|off` and `rm` delete the secrets; a clone starts offline without them.
+  Needs openssl on this PC. Not offered through MCP.
 - `status NAME` reads back what the engine really enforces, not what was asked: `fences` (user, capabilities left,
   `no_new_privileges`, process limit, privileged, runtime, internet, whether the engine runs without root) and
   `warnings`: a sandbox missing one of its fences, root in a rootful engine (root on the host if it escapes), a
