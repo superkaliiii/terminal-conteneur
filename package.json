@@ -1,6 +1,6 @@
 {
   "name": "terminal-ct",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Containers with a desktop and a shell, for people and computer-use agents: a CLI and an MCP server.",
   "bin": {
     "terminal-ct": "npm/terminal-ct.js"

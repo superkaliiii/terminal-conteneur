@@ -20,6 +20,11 @@ The container counterpart of
 MCP shape, independent of it (each installs and works alone), and able to show its VMs when both are installed.
 One Python file, standard library only, on Podman (preferred) or Docker.
 
+> [!NOTE]
+> **macOS: not tested on real Mac hardware yet.** Linux, WSL and Windows are tested for real; macOS runs in CI only (unit tests on GitHub's macOS
+> runners); nothing has been tried on a physical Mac. Reports from Mac users are very welcome: open an issue with
+> what worked and what did not (`doctor --report` output helps).
+
 ## Highlights
 
 - **A desktop in any container**: Debian/Ubuntu, Fedora, Alpine or Arch images get Xvnc + Openbox + xterm on a

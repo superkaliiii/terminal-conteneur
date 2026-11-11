@@ -45,7 +45,7 @@ import argparse, base64, calendar, collections, contextlib, hashlib, http.server
     shlex, shutil, socket, socketserver, struct, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, webbrowser, zlib
 import importlib.util, ipaddress, http.client, signal, ssl
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 WINDOWS = os.name == "nt"
 MAC = sys.platform == "darwin"
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {}  # the daemon has no console: no flash
