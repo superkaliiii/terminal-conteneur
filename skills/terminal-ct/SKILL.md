@@ -44,7 +44,8 @@ returns a job id at once; `job` gives its exit code or `running` and the end of 
 ## What you may run
 
 `ct_list` marks with `managed: true` what you run without asking: the containers you created, and sandboxes
-(offline ones: a sandbox the user put online is theirs). The
+(offline ones: a sandbox the user put online is theirs). Its `fences` say what the engine really enforces; a
+`warnings` entry means a fence is missing: tell the user before running untrusted code there. The
 user's other containers, internet for a container, a network the user made, loading a snapshot of theirs, or
 `autostart` need their approval: the client may ask them, otherwise the error names the command for them to run.
 Never try to work around a refusal.

@@ -2172,7 +2172,70 @@ def rm(name):
 
 
 def status(name):
-    print(json.dumps(normalize(find(name))))
+    c = find(name)
+    print(json.dumps(dict(normalize(c), **fences(c))))
+
+
+def engine_rootless():
+    """The engine runs without root on its host (Podman rootless, Docker rootless): a container's root is not root
+    there. Asked once per node."""
+    n = node()
+    if getattr(n, "_rootless", None) is None:
+        if n.engine == "podman":
+            r = n.run(["info", "--format", "{{.Host.Security.Rootless}}"], check=False)
+            n._rootless = r.stdout.strip() == "true" if r.returncode == 0 else getattr(n, "rootless", None)
+        else:
+            r = n.run(["info", "--format", "{{json .SecurityOptions}}"], check=False)
+            n._rootless = "rootless" in r.stdout if r.returncode == 0 else None
+    return n._rootless
+
+
+# Podman's default capabilities (containers.conf); its API lists them one by one where `--cap-drop ALL` was asked.
+# shortcut: a containers.conf with more defaults shows "engine default" for a sandbox (a false warning, never a miss)
+PODMAN_CAPS = {"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "NET_BIND_SERVICE", "SETFCAP", "SETGID",
+               "SETPCAP", "SETUID", "SYS_CHROOT"}
+
+
+def _spec(c):
+    with contextlib.suppress(ValueError):
+        return json.loads(labels_of(c).get(f"{LABEL}.spec") or "{}") or {}
+    return {}
+
+
+def fences(c):
+    """What the engine actually enforces on a container, read from its inspect (not from what terminal-ct asked), and
+    the warnings: a sandbox missing one of its fences, root in a rootful engine."""
+    hc, cfg = c.get("HostConfig") or {}, c.get("Config") or {}
+    dropped = {x.upper().removeprefix("CAP_") for x in hc.get("CapDrop") or []}
+    if "EffectiveCaps" in c:  # Podman's own inspect: the capabilities left
+        caps = len(c.get("EffectiveCaps") or [])
+    elif not hc.get("CapAdd") and ("ALL" in dropped or dropped >= PODMAN_CAPS):  # Podman's API lists ALL one by one
+        caps = 0
+    else:
+        caps = "engine default"
+    user = cfg.get("User") or ""
+    root = user in ("", "0", "root") or user.startswith(("0:", "root:"))
+    pids = hc.get("PidsLimit") or 0
+    out = {"user": "root" if root else user, "capabilities": caps,
+           "no_new_privileges": any(o.startswith("no-new-privileges") and not o.endswith(":false")
+                                    for o in hc.get("SecurityOpt") or []),
+           "pids_limit": pids if pids > 0 else "unlimited", "privileged": bool(hc.get("Privileged")),
+           # Podman's API says "oci" for any runtime: then the one terminal-ct asked for
+           "runtime": c.get("OCIRuntime") or (hc.get("Runtime") if hc.get("Runtime") not in (None, "", "oci") else
+                                              _spec(c).get("runtime") or "default"), "internet": online(c),
+           "engine_rootless": engine_rootless()}
+    warn = []
+    if labels_of(c).get(f"{LABEL}.sandbox") == "1":
+        for k, ok in (("not root", not root), ("no capabilities", caps == 0),
+                      ("no-new-privileges", out["no_new_privileges"]), ("process limit", pids > 0),
+                      ("offline", not out["internet"])):
+            if not ok:
+                warn.append(f"sandbox without {k}")
+    if root and out["engine_rootless"] is False:
+        warn.append("root inside a rootful engine: root on the host if it escapes")
+    if out["privileged"]:
+        warn.append("privileged: no isolation from the host")
+    return {"fences": out, **({"warnings": warn} if warn else {})}
 
 
 def everywhere():
@@ -6369,7 +6432,8 @@ def agent_call(tool, a, approve, project=None):
     if name and project and tool not in ("ct_create", "describe"):  # reads too: another project's containers are not this agent's business
         in_scope(find(name), project, name)
     if tool == "ct_list":
-        return [dict(normalize(c), managed=managed(c), **({"node": where} if where else {}))
+        # shortcut: fences for this PC's containers only (a node's engine is asked there), `status` on the node shows them
+        return [dict(normalize(c), managed=managed(c), **({"node": where} if where else fences(c)))
                 for where, cs in everywhere() for c in cs if mine(labels_of(c).get(f"{LABEL}.project") or DEFAULT_PROJECT)]
     if tool == "top":
         t = top()

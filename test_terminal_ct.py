@@ -226,6 +226,28 @@ class Phase3(unittest.TestCase):
         c = ct.normalize(ct.find("s"))
         self.assertEqual((c["cpus"], c["memory_gb"], c["internet"], c["sandbox"]), (1, 1, False, True))
 
+    def test_fences_read_from_inspect(self):
+        self.n._rootless = False  # a rootful Docker
+        sandbox = {"Config": {"User": "1000:1000", "Labels": {"terminal-ct.sandbox": "1"}},
+                   "HostConfig": {"CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"], "PidsLimit": 256,
+                                  "NetworkMode": "bridge", "Runtime": "runc"}, "NetworkSettings": {"Networks": {}}}
+        self.assertEqual(ct.fences(sandbox), {"fences": {
+            "user": "1000:1000", "capabilities": 0, "no_new_privileges": True, "pids_limit": 256, "privileged": False,
+            "runtime": "runc", "internet": False, "engine_rootless": False}})
+        # a sandbox whose fences went missing (made by hand, or an engine that dropped an option) says so
+        weak = {"Config": {"User": "", "Labels": {"terminal-ct.sandbox": "1"}},
+                "HostConfig": {"NetworkMode": "bridge"}, "NetworkSettings": {"Networks": {"bridge": {}}}}
+        self.assertEqual(ct.fences(weak)["warnings"], [
+            "sandbox without not root", "sandbox without no capabilities", "sandbox without no-new-privileges",
+            "sandbox without process limit", "sandbox without offline",
+            "root inside a rootful engine: root on the host if it escapes"])
+        # Podman's API: --cap-drop ALL listed one by one, runtime "oci" (then the asked one)
+        pod = {"Config": {"User": "1000", "Labels": {"terminal-ct.spec": '{"runtime": "runsc"}'}},
+               "HostConfig": {"CapDrop": ["CAP_" + x for x in ct.PODMAN_CAPS], "Runtime": "oci", "NetworkMode": "bridge"},
+               "NetworkSettings": {"Networks": {}}}
+        f = ct.fences(pod)["fences"]
+        self.assertEqual((f["capabilities"], f["runtime"]), (0, "runsc"))
+
     def test_runtime_named_only(self):
         quiet(ct.create, "g", sandbox=True, runtime="runsc")
         args = self.created("g")

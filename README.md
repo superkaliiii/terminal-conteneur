@@ -93,7 +93,7 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 | `show NAME` | native window: TigerVNC's viewer on the desktop's unix socket |
 | `mcp [NAME]` | stdio MCP server, see [Agents](#agents) |
 | `start NAME`, `stop NAME [--timeout 10]`, `rm NAME` | lifecycle; `start` checks the quota; `rm` also deletes the `/data` volume |
-| `ls`, `status NAME` | JSON state of terminal-ct's containers (ceilings, internet, networks, sandbox) |
+| `ls`, `status NAME` | JSON state of terminal-ct's containers (ceilings, internet, networks, sandbox); `status` adds the [fences](#networks-internet-sandboxes) the engine really enforces, and warnings |
 | `exec NAME [--timeout 60] CMD...` | run a command: JSON with exit code, stdout, stderr (the CLI exits with the command's code) |
 | `exec NAME --background CMD...`, `job NAME [ID] [--kill] [--tail BYTES]` | start a job and return its id at once (builds, tests, servers: no timeout); `job` gives its exit code or state (`running`, `lost`) and the end of its output, `--kill` stops its process group; no ID: the jobs. They live in the container (`/tmp`), so they outlive terminal-ct and end with the container |
 | `resources NAME [--cpus N] [--memory GiB]` | show, or change at once, even while it runs (`update`) |
@@ -307,6 +307,10 @@ The web dashboard can be opened by other people or agents, each with its own tok
 - A **sandbox** (`--sandbox`, `sandbox NAME on`): `--cap-drop ALL`, `no-new-privileges`, 256 processes at most,
   runs as your user (not root, even inside), `/data` in memory, no host mount (a desktop keeps its screen socket),
   offline, and a fresh file system at each start (recreated from its image; `start` says `"fresh": true`).
+- `status NAME` reads back what the engine really enforces, not what was asked: `fences` (user, capabilities left,
+  `no_new_privileges`, process limit, privileged, runtime, internet, whether the engine runs without root) and
+  `warnings`: a sandbox missing one of its fences, root in a rootful engine (root on the host if it escapes), a
+  privileged container. MCP: `ct_list` carries the same for this PC's containers.
 - A stronger fence: `--runtime runsc` (gVisor, its own kernel in user space) or `--runtime kata` (a light VM per
   container), with or without `--sandbox`, when that runtime is installed for the engine (`doctor` checks it;
   Docker also needs `runsc install`). Names only, never a path. Kept by clones and snapshots. A whole machine of
