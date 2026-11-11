@@ -95,6 +95,7 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 | `start NAME`, `stop NAME [--timeout 10]`, `rm NAME` | lifecycle; `start` checks the quota; `rm` also deletes the `/data` volume |
 | `ls`, `status NAME` | JSON state of terminal-ct's containers (ceilings, internet, networks, sandbox) |
 | `exec NAME [--timeout 60] CMD...` | run a command: JSON with exit code, stdout, stderr (the CLI exits with the command's code) |
+| `exec NAME --background CMD...`, `job NAME [ID] [--kill] [--tail BYTES]` | start a job and return its id at once (builds, tests, servers: no timeout); `job` gives its exit code or state (`running`, `lost`) and the end of its output, `--kill` stops its process group; no ID: the jobs. They live in the container (`/tmp`), so they outlive terminal-ct and end with the container |
 | `resources NAME [--cpus N] [--memory GiB]` | show, or change at once, even while it runs (`update`) |
 | `top` | real CPU % (of one core), memory and processes of each running container next to its ceiling, and the quota |
 | `quota [--cpus N] [--memory GiB] [--disk GiB] [--containers N]` | show the host quota and its use, or set it |

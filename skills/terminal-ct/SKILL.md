@@ -28,6 +28,8 @@ container the server was started for (`terminal-ct mcp NAME`); a server started 
 `container: NAME` on every call. Prefer `exec` over the screen for anything a command
 can do (install, build, run tests, read files). Read the exit code before going on. `ct_logs` shows what the
 container's main process printed.
+Anything that may outlast `exec`'s timeout (long builds, test suites, a server): `exec` with `background: true`
+returns a job id at once; `job` gives its exit code or `running` and the end of its output, `kill: true` stops it.
 
 ## Screen loop (desktop containers): observe -> act -> verify
 

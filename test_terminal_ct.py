@@ -2943,6 +2943,44 @@ class RealEngines(unittest.TestCase):
                 quiet(ct.rm, name)
                 self.assertNotIn(name, [c["name"] for c in ct.containers()])
 
+    def test_background_jobs(self):
+        for engine in REAL_ENGINES:
+            if not shutil.which(engine):
+                continue
+            for image in ("alpine:3.20", "debian:stable-slim"):  # busybox, then coreutils (setsid, tail)
+                with self.subTest(engine=engine, image=image):
+                    ct.NODE = ct.Node(engine)
+                    name = f"j-{engine}"
+                    subprocess.run([engine, "rm", "-f", "tct-" + name], capture_output=True)
+                    quiet(ct.create, name, image=image, sandbox=True)
+                    try:
+                        quiet(ct.start, name)
+                        done = quiet(ct.exec_background, name, ["sh", "-c", "echo out; echo err >&2; exit 3"])["job"]
+                        slow = quiet(ct.exec_background, name, ["sh", "-c", "sleep 300 & sleep 300; echo never"])["job"]
+                        for _ in range(50):
+                            r = quiet(ct.job, name, done)
+                            if "exit" in r:
+                                break
+                            time.sleep(0.1)
+                        self.assertEqual((r["exit"], r["stdout"], r["stderr"]), (3, "out\n", "err\n"))
+                        self.assertEqual(quiet(ct.job, name, slow)["state"], "running")
+                        self.assertEqual(sorted(quiet(ct.job, name)["jobs"]), sorted([done, slow]))
+                        quiet(ct.job, name, slow, kill=True)
+                        for _ in range(50):
+                            r = quiet(ct.job, name, slow)
+                            if "exit" in r:
+                                break
+                            time.sleep(0.1)
+                        self.assertEqual(r["exit"], 143)  # TERM
+                        left = quiet(ct.exec_, name, ["sh", "-c", "ps -o comm= 2>/dev/null || ps"])["stdout"]
+                        self.assertNotIn("sleep", left)  # its process group went too
+                        with self.assertRaisesRegex(SystemExit, "no job"):
+                            quiet(ct.job, name, "0" * 8)
+                        with self.assertRaisesRegex(SystemExit, "8 hex"):
+                            quiet(ct.job, name, "../x")
+                    finally:
+                        quiet(ct.rm, name)
+
     def test_phase4(self):
         """Snapshot of files and /data, load back, clone with a copy of /data, push and pull."""
         sh = lambda n, c: quiet(ct.exec_, n, ["sh", "-c", c])["stdout"].strip()

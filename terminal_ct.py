@@ -13,6 +13,7 @@ labels; containers without them are never touched.
   ls | status NAME | top | doctor | help | version
   start NAME | stop NAME [--timeout 10] | rm NAME     rm also deletes the container's /data volume
   exec NAME [--timeout 60] CMD...                     run a command, JSON reply (exit code, stdout, stderr)
+  exec NAME --background CMD... | job NAME [ID] [--kill]   start a job, then its state and output
   resources NAME [--cpus N] [--memory GiB]            show, or change at once (even running), within the quota
   quota [--cpus N] [--memory GiB] [--disk GiB] [--containers N]   show, or set, the host quota
   net create|rm NET | net ls | net attach|detach NAME NET   isolated networks (containers reach each other by name)
@@ -2203,6 +2204,60 @@ def exec_(name, cmd, timeout=60):
     except subprocess.TimeoutExpired:
         raise SystemExit(f"command still running after {timeout} s (raise --timeout)")
     out = {"exit": r.returncode, "stdout": r.stdout, "stderr": r.stderr}
+    print(json.dumps(out))
+    return out
+
+
+# Background jobs live in the container (its /tmp), so they outlive this process and work on nodes and other PCs.
+# setsid (when the image has it) gives the job its own process group, so kill reaches its children too.
+# shortcut: finished jobs' output stays in the container's /tmp until it is removed (a sandbox: until its next start)
+JOBS, _JOB_ID = "/tmp/.tct-jobs", re.compile(r"[0-9a-f]{8}")
+_JOB_RUN = ('d=$0; command -v setsid >/dev/null && set -- setsid "$@"; "$@" >"$d/out" 2>"$d/err" </dev/null & '
+            'echo $! >"$d/pid"; wait $!; echo $? >"$d/exit.new" && mv "$d/exit.new" "$d/exit"')
+_JOB_STATE = ('d=$0; if [ -f "$d/exit" ]; then cat "$d/exit"; elif [ ! -d "$d" ]; then echo gone; '
+              'elif [ ! -f "$d/pid" ]; then echo starting; elif kill -0 "$(cat "$d/pid")" 2>/dev/null; '
+              'then echo running; else echo lost; fi; printf %s "$1"; tail -c "$2" "$d/out" 2>/dev/null; '
+              'printf %s "$1"; tail -c "$2" "$d/err" 2>/dev/null')
+
+
+def exec_background(name, cmd):
+    """Start CMD and return at once with its job id; `job NAME ID` follows it."""
+    if not cmd:
+        raise SystemExit("exec needs a command: terminal-ct exec NAME --background CMD...")
+    if find(name).get("State", {}).get("Status") != "running":
+        raise SystemExit(f"{name} is not running; start it: terminal-ct start {name}")
+    jid = secrets.token_hex(4)
+    node().run(["exec", PREFIX + name, "mkdir", "-p", f"{JOBS}/{jid}"])  # here, not in the job: a failure shows now
+    node().run(["exec", "-d", PREFIX + name, "sh", "-c", _JOB_RUN, f"{JOBS}/{jid}", *cmd])
+    out = {"job": jid, "state": "running"}
+    print(json.dumps(out))
+    return out
+
+
+def job(name, jid=None, kill=False, tail=65536):
+    """A background job's state (running, an exit code, lost if its shell died) and the end of its output; no ID:
+    the container's jobs."""
+    if find(name).get("State", {}).get("Status") != "running":
+        raise SystemExit(f"{name} is not running: its jobs ended with it")
+    if jid is None:
+        r = node().run(["exec", PREFIX + name, "sh", "-c", f"ls {JOBS} 2>/dev/null"], check=False)
+        out = {"jobs": sorted(j for j in r.stdout.split() if _JOB_ID.fullmatch(j))}
+        print(json.dumps(out))
+        return out
+    if not _JOB_ID.fullmatch(jid):
+        raise SystemExit("a job id is 8 hex digits, as exec --background printed it")
+    d = f"{JOBS}/{jid}"
+    if kill:  # the job's group first (setsid), else the command alone
+        node().run(["exec", PREFIX + name, "sh", "-c", 'p=$(cat "$0/pid" 2>/dev/null) || exit 0; '
+                    'kill -TERM -"$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; true', d], check=False)
+    mark = f"--tct-{secrets.token_hex(8)}--"  # splits state, stdout and stderr; no output can guess it
+    r = node().run(["exec", PREFIX + name, "sh", "-c", _JOB_STATE, d, mark, str(int(tail))], check=False)
+    parts = r.stdout.split(mark)
+    if len(parts) != 3 or parts[0].strip() == "gone":
+        raise SystemExit(f"no job {jid} in {name} (a sandbox's jobs end at its stop)")
+    state = parts[0].strip()
+    out = {"job": jid, **({"exit": int(state)} if state.isdigit() else {"state": state}),
+           "stdout": parts[1], "stderr": parts[2]}
     print(json.dumps(out))
     return out
 
@@ -6075,8 +6130,12 @@ TOOLS = [
     ("status", "Container state and screen size.", _schema({})),
     ("wait", "Wait until the screen stops changing, then return a screenshot. stable: seconds without change "
              "(default 1); timeout: default 30. A blinking cursor can keep it from settling.", _schema({"stable": _N, "timeout": _N})),
-    ("exec", "Run a shell command in the container (sh -c) and return its exit code, stdout and stderr.",
-     _schema({"command": {"type": "string"}, "timeout": _N}, ["command"])),
+    ("exec", "Run a shell command in the container (sh -c) and return its exit code, stdout and stderr. "
+             "background: return at once with a job id (builds, tests, servers: no timeout), then follow it with job.",
+     _schema({"command": {"type": "string"}, "timeout": _N, "background": {"type": "boolean"}}, ["command"])),
+    ("job", "A background job of exec: its exit code (or state: running, lost) and the end of its stdout and stderr. "
+            "kill: stop it (its process group). No job: the container's job ids.",
+     _schema({"job": {"type": "string"}, "kill": {"type": "boolean"}, "tail": {"type": "integer"}})),
 ]
 INPUT_TOOLS = {"click", "move", "drag", "scroll", "type", "key"}
 _CT = {"container": {"type": "string", "description": "Another container (default: this server's own)"}}
@@ -6569,7 +6628,14 @@ def mcp(name=None, project=None):
                         guard(target, approve, "use the screen and shell of", f"terminal-ct mcp {target}",
                               project=project)
                         allowed.add(target)
-                    if tool == "exec":
+                    if tool == "exec" and a.get("background"):
+                        out = quiet(exec_background, target, ["sh", "-c", a["command"]])
+                        content = [{"type": "text", "text": json.dumps(out)}]
+                    elif tool == "job":
+                        out = quiet(job, target, a.get("job"), bool(a.get("kill")),
+                                    max(1, min(int(a.get("tail", 65536)), 1 << 20)))
+                        content = [{"type": "text", "text": json.dumps(out)}]
+                    elif tool == "exec":
                         out = quiet(exec_, target, ["sh", "-c", a["command"]],
                                     max(1.0, min(float(a.get("timeout", 60)), 600)))
                         content = [{"type": "text", "text": json.dumps(out)}]
@@ -7113,6 +7179,9 @@ def main(argv=None):
         sub.add_parser(n).add_argument("name")
     s = sub.add_parser("stop"); s.add_argument("name"); s.add_argument("--timeout", type=int, default=10)
     x = sub.add_parser("exec"); x.add_argument("name"); x.add_argument("--timeout", type=float, default=60)
+    x.add_argument("--background", action="store_true", help="return at once with a job id (see job)")
+    jb = sub.add_parser("job"); jb.add_argument("name"); jb.add_argument("id", nargs="?")
+    jb.add_argument("--kill", action="store_true"); jb.add_argument("--tail", type=int, default=65536, help="bytes")
     x.add_argument("command", nargs=argparse.REMAINDER)
     im = sub.add_parser("image"); im.add_argument("image_cmd", choices=["ls", "pull", "build", "rm"])
     im.add_argument("ref", nargs="?"); im.add_argument("path", nargs="?")
@@ -7326,11 +7395,18 @@ def main(argv=None):
     if o.cmd == "stop": return stop(o.name, o.timeout)
     if o.cmd == "rm": return rm(o.name)  # from its node, rm forgets where it was
     if o.cmd == "status": return status(o.name)
+    if o.cmd == "job": return job(o.name, o.id, o.kill, o.tail)
     if o.cmd == "exec":
-        if cmd_args and o.command:  # exec NAME --timeout S -- CMD: before --, exec's own options (REMAINDER took them)
+        if o.command and o.command[0].startswith("--"):  # exec NAME --timeout S [--] CMD: REMAINDER took the options
             xo = argparse.ArgumentParser(prog="terminal-ct exec NAME")
             xo.add_argument("--timeout", type=float, default=o.timeout)
-            o.timeout, o.command = xo.parse_args(o.command).timeout, None
+            xo.add_argument("--background", action="store_true", default=o.background)
+            if not cmd_args:  # no --: the command follows the options
+                xo.add_argument("rest", nargs=argparse.REMAINDER)
+            xa = xo.parse_args(o.command)
+            o.timeout, o.background, o.command = xa.timeout, xa.background, getattr(xa, "rest", None)
+        if o.background:
+            return exec_background(o.name, o.command or cmd_args)
         out = exec_(o.name, o.command or cmd_args, o.timeout)
         sys.exit(out["exit"])
     if o.cmd == "image":
