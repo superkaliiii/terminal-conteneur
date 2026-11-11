@@ -16,7 +16,7 @@
 </div>
 
 The container counterpart of
-[terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm): same command and
+[terminal-vm](https://github.com/superkaliiii/terminal-vm): same command and
 MCP shape, independent of it (each installs and works alone), and able to show its VMs when both are installed.
 One Python file, standard library only, on Podman (preferred) or Docker.
 
@@ -133,7 +133,7 @@ those labels are never listed or touched. An image whose default command is a ba
 
 ## Nodes
 
-A node is a Linux VM made by [terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm)
+A node is a Linux VM made by [terminal-vm](https://github.com/superkaliiii/terminal-vm)
 (installed alongside: on the PATH, or `TERMINAL_VM="python3 /path/terminal_vm.py"`) that runs Docker: the isolation
 of a VM, the lightness of containers inside it.
 - `node add NAME [--image debian|alpine]` creates it from an official cloud image (`terminal-vm create --image

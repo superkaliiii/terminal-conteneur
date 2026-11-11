@@ -31,4 +31,4 @@ Out of scope: escapes through the container engine or the kernel themselves (rep
 kernel), and anything that needs an account already allowed to run terminal-ct or the engine on that PC.
 
 A container is not a virtual machine: for untrusted code that must not reach the host kernel, use a VM of
-[terminal-vm](https://github.com/superkaliiii/terminal-mac-inspection/tree/unified/terminal-vm).
+[terminal-vm](https://github.com/superkaliiii/terminal-vm).
