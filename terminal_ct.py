@@ -826,7 +826,7 @@ def agent(listen="127.0.0.1", port=None, rotate=False, stay=False):
 # then a token for that service's ports alone, from the central PC); that agent joins it to the published port.
 RELAY_IMAGE = "python:3.12-alpine"
 RELAY_CODE = r"""
-import hashlib, select, socket, ssl, sys, threading
+import hashlib, select, socket, ssl, sys, threading, time
 
 
 def _relay_pipe(a, b):
@@ -868,10 +868,14 @@ def relay_one(c, p, host, port, fp, token):
 
 
 def relay_main(host, port, fp, token, name, *ports):
-    try:
-        bind = socket.gethostbyname(name)  # its own address on the service's network: not the internet bridge
-    except OSError:
-        bind = ""
+    for _ in range(40):  # its own address on the service's network, never every interface (the internet bridge)
+        try:
+            bind = socket.gethostbyname(name)
+            break
+        except OSError:  # the network's DNS not ready yet
+            time.sleep(0.5)
+    else:
+        sys.exit("relay: no address of its own on the network: not listening")
     def serve(p):
         ls = socket.create_server((bind, p))
         while True:
