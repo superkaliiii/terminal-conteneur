@@ -1929,14 +1929,16 @@ def under(p, project):
     return not project or p == project or p.startswith(project + "/")
 DEFAULT_CPUS, DEFAULT_MEMORY = 1, 1  # each container gets a ceiling, so the quota can count it
 SANDBOX_PIDS = 256
+ON_START_TIMEOUT = 600  # seconds for a container's --on-start command (installing packages can take minutes)
 # OCI runtimes --runtime may name: names only, never a path (through MCP, a path would run any binary on the host)
 RUNTIMES = ("runsc", "kata", "kata-runtime", "kata-qemu", "kata-fc", "krun", "crun", "runc", "youki")
 
 
 def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_by="user",
            desktop=False, width=1280, height=800, sandbox=False, internet=None, nets=(), project=None, labels=None,
-           own_volume=False, ports=(), runtime=None):
+           own_volume=False, ports=(), runtime=None, on_start=None):
     """runtime: the engine's OCI runtime for this container (runsc: gVisor, kata: a light VM), see RUNTIMES.
+    on_start: a shell command run in it at each start (its setup); a failure stops it.
     Internet: on by default for the user's containers; sandboxes and agents' containers start offline.
     labels: more terminal-ct.* labels (a stack's service and replica)."""
     check_name(name)
@@ -1983,7 +1985,8 @@ def create(name, image=DEFAULT_IMAGE, cpus=None, memory=None, cmd=None, created_
     quota_check({"disk_gb": 0})  # what a container will write is unknown: refuse once the disk quota is reached
     internet = not sandbox and created_by == "user" if internet is None else internet
     spec = {"image": image, "cmd": cmd, "desktop": desktop, "width": width, "height": height, "sandbox": sandbox,
-            **({"ports": ports} if ports else {}), **({"runtime": runtime} if runtime else {})}
+            **({"ports": ports} if ports else {}), **({"runtime": runtime} if runtime else {}),
+            **({"on_start": on_start} if on_start else {})}
     out = _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=True, labels=labels)
     want(name, "stopped")
     print(json.dumps(out))
@@ -2227,6 +2230,18 @@ def start(name):
                 ensure_node_nets(node().name)  # after a node restart its rules are gone: back before it runs
             node().run(["start", PREFIX + name])
             node_routes(name, info)
+        hook = _spec(info).get("on_start")
+        if hook:  # its setup, each start (a sandbox starts fresh), outside the quota lock: it may take minutes
+            t0 = time.time()
+            try:
+                r = quiet(exec_, name, ["sh", "-c", hook], ON_START_TIMEOUT)
+            except SystemExit as e:
+                r = {"exit": None, "stderr": str(e)}
+            if r["exit"] != 0:  # stopped, never left half ready (and not wanted running: resume leaves it)
+                node().run(["stop", "-t", "2", PREFIX + name], check=False)
+                raise SystemExit(f"{name}: its --on-start command failed (exit {r['exit']}), it is stopped: "
+                                 f"{(r.get('stderr') or r.get('stdout') or '').strip()[-500:]}")
+            out["on_start"] = {"exit": 0, "seconds": round(time.time() - t0, 1)}
     want(name, "running")
     if labels_of(info).get(f"{LABEL}.desktop") == "1":
         with contextlib.suppress(RuntimeError):
@@ -6388,7 +6403,9 @@ AGENT_TOOLS = [
      _schema({**_NAME, "image": {"type": "string"}, "desktop": {"type": "boolean"}, "width": {"type": "integer"},
               "height": {"type": "integer"}, "cpus": _N, "memory_gb": _N, "sandbox": {"type": "boolean"},
               "internet": {"type": "boolean"}, "networks": {"type": "array", "items": {"type": "string"}},
-              "runtime": {"type": "string", "enum": list(RUNTIMES)}, **_DESC_ARG}, ["name"])),
+              "runtime": {"type": "string", "enum": list(RUNTIMES)},
+              "on_start": {"type": "string", "description": "shell command run in it at each start (a sandbox "
+                           "starts fresh: install what it needs here); a failure stops it"}, **_DESC_ARG}, ["name"])),
     ("ct_start", "Start a container, within the host quota (a sandbox starts fresh from its image)." + _MANAGED,
      _schema(_NAME, ["name"])),
     ("ct_stop", "Stop a container.", _schema({**_NAME, "timeout": {"type": "integer"}}, ["name"])),
@@ -6668,7 +6685,7 @@ def agent_call(tool, a, approve, project=None):
         out = quiet(create, name, img, a.get("cpus"), a.get("memory_gb"), created_by="agent", desktop=desk,
                     width=int(a.get("width", 1280)), height=int(a.get("height", 800)),
                     sandbox=a.get("sandbox", True), internet=bool(a.get("internet")), nets=a.get("networks") or (),
-                    project=where, runtime=a.get("runtime"))
+                    project=where, runtime=a.get("runtime"), on_start=a.get("on_start"))
         if desc:
             set_description("container", name, desc)
         return out
@@ -7348,6 +7365,7 @@ def main(argv=None):
     c.add_argument("--width", type=int, default=1280); c.add_argument("--height", type=int, default=800)
     c.add_argument("--sandbox", action="store_true"); c.add_argument("--offline", action="store_true")
     c.add_argument("--runtime", choices=RUNTIMES, help="OCI runtime: runsc (gVisor) or kata for a stronger fence")
+    c.add_argument("--on-start", help="a shell command run in it at each start (its setup); a failure stops it")
     c.add_argument("--net", action="append", default=[], help="an isolated network (repeatable)")
     c.add_argument("--ports", type=int, action="append", default=[],
                    help="with --node and --net: publish it on that node's address of the network (repeatable)")
@@ -7509,7 +7527,7 @@ def main(argv=None):
     if o.cmd == "create":
         r = create(o.name, o.image, o.cpus, o.memory, cmd_args or None, desktop=o.desktop, width=o.width,
                    height=o.height, sandbox=o.sandbox, internet=False if o.offline else None, nets=o.net,
-                   project=o.project, ports=o.ports, runtime=o.runtime)
+                   project=o.project, ports=o.ports, runtime=o.runtime, on_start=o.on_start)
         if isinstance(NODE, NodeVM):
             place(o.name, NODE.name)
         described("container", o.name, "description")

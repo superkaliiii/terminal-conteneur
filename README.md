@@ -85,7 +85,7 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 
 | Command | Does |
 |---|---|
-| `create NAME [--image IMAGE] [--cpus 1] [--memory 1] [--offline] [--net NET ...] [--runtime runsc\|kata] [-- CMD...]` | create a container (default image `debian:stable-slim`, pulled if missing; memory in GiB, no swap beyond it); a named volume keeps `/data`; `--runtime`: see [sandboxes](#networks-internet-sandboxes) |
+| `create NAME [--image IMAGE] [--cpus 1] [--memory 1] [--offline] [--net NET ...] [--runtime runsc\|kata] [--on-start CMD] [-- CMD...]` | create a container (default image `debian:stable-slim`, pulled if missing; memory in GiB, no swap beyond it); a named volume keeps `/data`; `--runtime`: see [sandboxes](#networks-internet-sandboxes); `--on-start`: a shell command run in it at each start, its setup (a sandbox starts fresh: install what it needs there); `start` reports its time, and a failure (exit code, 10 min at most) stops it again |
 | `create NAME --sandbox ...` | a sandbox: see below |
 | `create NAME --desktop [--image IMAGE] [--width 1280 --height 800]` | the same image with a desktop: Xvnc + Openbox + xterm added on top (built once per base, cached as `tct-desktop:<base>`) |
 | `action NAME screenshot\|click\|move\|drag\|scroll\|type\|key\|wait\|status ...` | drive the desktop, same arguments as terminal-vm (`screenshot --output`, `click X Y [--button] [--double]`, `drag X Y X2 Y2`, `scroll --dy N`, `type TEXT`, `key CHORD`, `wait --stable --timeout`) |

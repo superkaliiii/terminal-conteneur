@@ -54,7 +54,8 @@ Never try to work around a refusal.
 
 - `ct_create` (sandboxed by default: not root, no capabilities, process limit, `/data` in memory, fresh at each
   start, offline; `sandbox: false` for a normal container whose `/data` volume persists), `desktop: true` for a
-  screen, `runtime: "runsc"` (gVisor) for untrusted code when the user installed it, then `ct_start`.
+  screen, `runtime: "runsc"` (gVisor) for untrusted code when the user installed it, `on_start` for its setup
+  (a sandbox starts fresh each time: the tools it needs are installed again there), then `ct_start`.
   `ct_clone` a prepared container instead of setting one up again (seconds).
 - `ct_snapshot` save before a risky step, load to go back (stopped container), not for sandboxes.
 - Stacks: `ct_apply` a desired state (`services` with `image`, `replicas`, `cpus`, `memory_gb`, `restart`,

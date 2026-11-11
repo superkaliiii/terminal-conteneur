@@ -248,6 +248,17 @@ class Phase3(unittest.TestCase):
         f = ct.fences(pod)["fences"]
         self.assertEqual((f["capabilities"], f["runtime"]), (0, "runsc"))
 
+    def test_on_start_runs_at_each_start_and_a_failure_stops(self):
+        quiet(ct.create, "h", on_start="apt-get install -y git")
+        quiet(ct.start, "h")
+        self.assertIn(["exec", "tct-h", "sh", "-c", "apt-get install -y git"], self.n.calls)
+        quiet(ct.stop, "h")
+        self.n.exec_code = 7
+        with self.assertRaisesRegex(SystemExit, "on-start command failed \\(exit 7\\), it is stopped"):
+            quiet(ct.start, "h")
+        self.assertEqual(self.n.calls[-1][:2], ["stop", "-t"])
+        self.assertEqual(ct.wanted("h"), "stopped")  # resume leaves it so
+
     def test_egress_proxy_rules(self):
         ns = {}  # the rules, without writing resolv.conf or serving
         code = ct.EGRESS_CODE.split("\nsrv = ")[0].replace("if DNS:", "if False:")
