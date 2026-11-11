@@ -18,6 +18,7 @@ labels; containers without them are never touched.
   quota [--cpus N] [--memory GiB] [--disk GiB] [--containers N]   show, or set, the host quota
   net create|rm NET | net ls | net attach|detach NAME NET   isolated networks (containers reach each other by name)
   internet NAME [on|off]  |  sandbox NAME on|off      stopped containers (one made by 0.2 is upgraded, kept as is)
+  internet NAME allow HOST...                         not recommended: only these hosts, through a proxy (README)
   action NAME screenshot|click|move|drag|scroll|type|key|wait|status ...   desktop containers
   mcp [NAME] [--project P]   stdio MCP server: screen tools + exec (on NAME, or `container`), container and
                       network management under the agent-authority rules (sandboxes and its own; the rest asks the
@@ -916,6 +917,105 @@ def _relay_grants():
         return g if isinstance(g, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+# An allowlist (internet NAME allow ...; not recommended): NAME is unplugged from the internet and joined, on its own
+# internal network NAME-egress, to a proxy container of that name (EGRESS_CODE, stdlib only) that reaches only the
+# listed hosts. Fail-closed: a program that ignores HTTP(S)_PROXY gets no internet at all.
+EGRESS_PORT = 3128
+EGRESS_CODE = r"""
+import ipaddress, select, socket, sys, threading
+
+ALLOW = [a.lower() for a in sys.argv[1:] if not a.startswith("@")]
+DNS = [a[1:] for a in sys.argv[1:] if a.startswith("@")]
+if DNS:  # Podman: its resolver, first here, answers only container names: the host's resolvers instead
+    with open("/etc/resolv.conf", "w") as f:
+        f.write("".join(f"nameserver {d}\n" for d in DNS))
+
+
+def allowed(host, port):
+    host = host.lower().rstrip(".")
+    for a in ALLOW:
+        h, _, p = a.partition(":")
+        if (int(p) != port) if p else port not in (80, 443):
+            continue
+        if host == h or h.startswith("*.") and (host.endswith(h[1:]) or host == h[2:]):
+            return h
+    return None
+
+
+def connect(host, port, literal):
+    for fam, typ, proto, _, addr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        if literal or ipaddress.ip_address(addr[0].split("%")[0]).is_global:  # a listed name never reaches the LAN
+            return socket.create_connection(addr[:2], 10)
+    raise OSError("only private addresses")
+
+
+def pipe(a, b):
+    socks = [a, b]
+    try:
+        while True:
+            r, _, _ = select.select(socks, [], [], 300)
+            if not r:
+                return
+            for s in r:
+                d = s.recv(65536)
+                if not d:
+                    return
+                (b if s is a else a).sendall(d)
+    except OSError:
+        pass
+    finally:
+        a.close(); b.close()
+
+
+def handle(c):
+    try:
+        c.settimeout(30)
+        head = b""
+        while b"\r\n\r\n" not in head:
+            d = c.recv(4096)
+            if not d or len(head) > 65536:
+                return c.close()
+            head += d
+        method, target = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ")[:2]
+        if method == "CONNECT":
+            host, _, port = target.rpartition(":")
+        else:  # plain HTTP, absolute form: the upstream is fixed, so later requests on this connection go there too
+            rest = target.split("://", 1)[1].split("/", 1)[0] if target.startswith("http://") else ""
+            host, _, port = rest.rpartition(":") if ":" in rest else (rest, "", "80")
+        host, port = host.strip("[]"), int(port or 0)
+        h = allowed(host, port)
+        if not h:
+            print(f"deny {host}:{port}", flush=True)
+            return c.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") or c.close()
+        try:
+            s = connect(host, port, literal=h == host and h.replace(".", "").isdigit())
+        except OSError as e:
+            print(f"fail {host}:{port} {e}", flush=True)
+            return c.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") or c.close()
+        print(f"allow {host}:{port}", flush=True)
+        c.settimeout(None)
+        body = head.split(b"\r\n\r\n", 1)[1]
+        if method == "CONNECT":
+            c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            s.sendall(body)
+        else:
+            s.sendall(head)
+        pipe(c, s)
+    except (OSError, ValueError):
+        c.close()
+
+
+srv = socket.create_server(("0.0.0.0", PORT), backlog=64)
+print("egress proxy for", " ".join(ALLOW), *(["(dns", *DNS, ")"] if DNS else []), flush=True)
+while True:
+    conn, _ = srv.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+""".replace("PORT", str(EGRESS_PORT))
+_ALLOW = re.compile(r"(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?")
+EGRESS_WARNING = ("not recommended unless you know what you are doing: only programs that honor HTTP(S)_PROXY get "
+                  "out, and an allowed host can still carry any data out (uploads, a code host, a paste site)")
 
 
 def relay_add(service, on=None, net=None):
@@ -1943,6 +2043,9 @@ def _make(name, spec, created_by, cpus, memory, internet, nets, project, fresh=F
         data = ["-v", f"{volume}:/data"]
     if isinstance(node(), NodeRemote):  # on the address the central PC reaches it by: never all of its interfaces
         extra += [x for p in spec.get("ports") or () for x in ("-p", f"{node().address()}:{p}:{p}")]
+    if spec.get("proxy"):  # an allowlist: its proxy is the only way out (internet NAME allow)
+        extra += [x for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy") for x in ("-e", f"{k}={spec['proxy']}")]
+        extra += ["-e", "NO_PROXY=localhost,127.0.0.1", "-e", "no_proxy=localhost,127.0.0.1"]
     if nets and type(node()) is NodeVM:
         joined = ensure_node_nets(node().name)
         for n in nets:
@@ -2105,6 +2208,8 @@ def desktop_image(base):
 def start(name):
     info = find(name)
     out = {"started": name}
+    if _spec(info).get("proxy") and not running(info):  # its only way out, up before it
+        quiet(start, f"{name}-egress")
     if not running(info):
         if labels_of(info).get(f"{LABEL}.sandbox") == "1" and labels_of(info).get(f"{LABEL}.spec"):
             ensure_image(json.loads(labels_of(info)[f"{LABEL}.spec"]))  # a rebuild takes minutes: not under the lock
@@ -2150,6 +2255,8 @@ def stop(name, timeout=10):
     find(name)
     want(name, "stopped")  # first: stopped by request, resume leaves it so
     node().run(["stop", "-t", str(timeout), PREFIX + name])
+    if _spec(find(name)).get("proxy"):
+        node().run(["stop", "-t", "2", f"{PREFIX}{name}-egress"], check=False)
     print(json.dumps({"stopped": name}))
 
 
@@ -2158,6 +2265,10 @@ def rm(name):
     node().run(["rm", "-f", PREFIX + name])
     node().run(["rm", "-f", PREFIX + name + "-OLD"], check=False)  # it would keep the volume in use
     node().run(["volume", "rm", f"{PREFIX}{name}-data"], check=False)  # absent if never created
+    if _spec(info).get("proxy"):
+        node().run(["rm", "-f", f"{PREFIX}{name}-egress"], check=False)
+        node().run(["volume", "rm", f"{PREFIX}{name}-egress-data"], check=False)
+        node().run(["network", "rm", f"{NET_PREFIX}{name}-egress"], check=False)
     node().run(["image", "rm", f"{KEEP}{name}:latest"], check=False)  # its committed file system, if any
     for tag in snapshots(name):
         node().run(["image", "rm", f"{SNAP}{name}:{tag}"], check=False)
@@ -2662,12 +2773,72 @@ def net_attach(name, net, attach=True):
     return {"name": name, "networks": normalize(find(name))["networks"]}
 
 
-def internet(name, on=None):
+def internet(name, on=None, allow=None):
+    """Show, or set, internet access; allow: a list of hosts instead (not recommended, see EGRESS_WARNING)."""
+    if allow is not None:
+        return internet_allow(name, allow)
     info = find(name) if on is None else stopped(name, "internet")
+    if on is not None and _spec(info).get("allow"):
+        info = _egress_off(name, info, on)
     if on is not None and on != online(info):
         node().run(["network", "connect" if on else "disconnect", BRIDGE[node().engine], PREFIX + name])
         info = find(name)
-    return {"name": name, "internet": online(info)}
+    allow = _spec(info).get("allow")
+    return {"name": name, "internet": "allowlist" if allow else online(info), **({"allow": allow} if allow else {})}
+
+
+def internet_allow(name, hosts):
+    """NAME offline, its HTTP(S) going through a proxy container (NAME-egress) that reaches only HOSTS (pypi.org,
+    *.github.com, host:port; ports 80 and 443 when none is given). Replaces an earlier list."""
+    hosts = [h.lower() for h in hosts]
+    bad = [h for h in hosts if not _ALLOW.fullmatch(h) or ":" in h and not 0 < int(h.rsplit(":", 1)[1]) < 65536]
+    if not hosts or bad:
+        raise SystemExit(f"internet NAME allow HOST...: host names (pypi.org, *.github.com, host:port){', not ' + ', '.join(bad) if bad else ''}")
+    if type(node()) is not Node:  # shortcut: the proxy and its network are made with this PC's engine only
+        raise SystemExit("an allowlist is for containers of this PC (not on nodes or other PCs yet)")
+    info = stopped(name, "internet")
+    if labels_of(info).get(f"{LABEL}.egress_for"):
+        raise SystemExit(f"{name} is an egress proxy")
+    proxy = f"{name}-egress"
+    check_name(proxy)
+    node().run(["rm", "-f", PREFIX + proxy], check=False)  # a new list: a new proxy
+    node().run(["volume", "rm", f"{PREFIX}{proxy}-data"], check=False)
+    if proxy not in networks():
+        net_create(proxy, "user", labels_of(info).get(f"{LABEL}.project"))
+    quiet(create, proxy, image=RELAY_IMAGE, cpus=0.25, memory=0.125, internet=True, nets=[proxy],
+          cmd=["python3", "-c", EGRESS_CODE, *hosts,
+               *("@" + d for d in (host_resolvers() if node().engine == "podman" else ()))],
+          labels={"egress_for": name}, project=labels_of(info).get(f"{LABEL}.project"))
+    if NET_PREFIX + proxy not in networks_of(info):
+        node().run(["network", "connect", "--alias", name, NET_PREFIX + proxy, PREFIX + name])
+    remake(name, find(name), internet=False, proxy=f"http://{proxy}:{EGRESS_PORT}", allow=hosts)
+    return {"name": name, "internet": "allowlist", "allow": hosts, "proxy": proxy, "warning": EGRESS_WARNING}
+
+
+def host_resolvers():
+    """This PC's DNS servers a container can reach: Podman's resolver answers only container names to a container
+    that is also on an internal network, so the proxy uses these instead."""
+    out = []
+    for path in ("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"):  # the second: behind 127.0.0.53
+        with contextlib.suppress(OSError):
+            with open(path, encoding="utf-8") as f:
+                out = [l.split()[1] for l in f if l.startswith("nameserver") and len(l.split()) > 1]
+            out = [a for a in out if not a.startswith("127.") and a != "::1"]
+            if out:
+                return out
+    return out
+
+
+def _egress_off(name, info, on):
+    """The allowlist gone: its proxy and network removed, the proxy settings out of NAME."""
+    proxy = f"{name}-egress"
+    node().run(["rm", "-f", PREFIX + proxy], check=False)
+    node().run(["volume", "rm", f"{PREFIX}{proxy}-data"], check=False)
+    if NET_PREFIX + proxy in networks_of(info):
+        node().run(["network", "disconnect", NET_PREFIX + proxy, PREFIX + name])
+    node().run(["network", "rm", NET_PREFIX + proxy], check=False)
+    set_description("net", proxy, "")
+    return remake(name, find(name), internet=on, proxy=None, allow=None)
 
 
 def sandbox(name, on):
@@ -7229,7 +7400,9 @@ def main(argv=None):
     nt.add_argument("--description", dest="net_desc", help="create: what it is for (one line)")
     for n in ("internet", "sandbox"):
         t = sub.add_parser(n); t.add_argument("name"); t.add_argument("state", nargs="?" if n == "internet" else None,
-                                                                       choices=["on", "off"])
+                                                                       choices=["on", "off", "allow"][:3 if n == "internet" else 2])
+        if n == "internet":
+            t.add_argument("hosts", nargs="*", help="with allow (not recommended): the only hosts it reaches, through a proxy")
     a = sub.add_parser("action"); a.add_argument("name")
     a.add_argument("tool", choices=["screenshot", "click", "move", "drag", "scroll", "type", "key", "wait", "status"])
     a.add_argument("args", nargs="*"); a.add_argument("--output"); a.add_argument("--button", default="left")
@@ -7416,7 +7589,11 @@ def main(argv=None):
     if o.cmd == "quota":
         return show_json(quota({"cpus": o.cpus, "memory_gb": o.memory, "disk_gb": o.disk, "containers": o.containers}))
     if o.cmd == "top": return show_json(top())
-    if o.cmd == "internet": return show_json(internet(o.name, None if o.state is None else o.state == "on"))
+    if o.cmd == "internet":
+        if o.state != "allow" and o.hosts:
+            raise SystemExit("internet NAME allow HOST...: hosts go with allow")
+        return show_json(internet(o.name, None if o.state in (None, "allow") else o.state == "on",
+                                  o.hosts if o.state == "allow" else None))
     if o.cmd == "sandbox": return show_json(sandbox(o.name, o.state == "on"))
     if o.cmd == "net":
         want = {"create": 1, "rm": 1, "ls": 0, "attach": 2, "detach": 2}[o.net_cmd]

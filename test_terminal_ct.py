@@ -248,6 +248,26 @@ class Phase3(unittest.TestCase):
         f = ct.fences(pod)["fences"]
         self.assertEqual((f["capabilities"], f["runtime"]), (0, "runsc"))
 
+    def test_egress_proxy_rules(self):
+        ns = {}  # the rules, without writing resolv.conf or serving
+        code = ct.EGRESS_CODE.split("\nsrv = ")[0].replace("if DNS:", "if False:")
+        with unittest.mock.patch.object(sys, "argv", ["x", "pypi.org", "*.github.com", "git.example.org:2222", "@10.0.0.1"]):
+            exec(code, ns)
+        allowed = ns["allowed"]
+        self.assertEqual(ns["DNS"], ["10.0.0.1"])
+        self.assertEqual(allowed("PyPI.org.", 443), "pypi.org")
+        self.assertIsNone(allowed("pypi.org", 22))                     # 80 and 443 only, unless a port is listed
+        self.assertEqual(allowed("api.github.com", 443), "*.github.com")
+        self.assertEqual(allowed("github.com", 80), "*.github.com")
+        self.assertIsNone(allowed("evilgithub.com", 443))               # a suffix match is on a dot
+        self.assertEqual(allowed("git.example.org", 2222), "git.example.org")
+        self.assertIsNone(allowed("git.example.org", 443))
+        with self.assertRaisesRegex(OSError, "private"):                # a listed name never reaches the LAN
+            ns["connect"]("localhost", 80, literal=False)
+        for bad in ([], ["http://x"], ["a b"], ["x.org:0"], ["x.org:99999"]):
+            with self.assertRaisesRegex(SystemExit, "allow HOST"):
+                ct.internet_allow("c", bad)
+
     def test_runtime_named_only(self):
         quiet(ct.create, "g", sandbox=True, runtime="runsc")
         args = self.created("g")

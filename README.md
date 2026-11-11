@@ -101,6 +101,7 @@ without asking, building sandboxes, stacks and networks, cleaning up. `terminal-
 | `quota [--cpus N] [--memory GiB] [--disk GiB] [--containers N]` | show the host quota and its use, or set it |
 | `net create NET`, `net rm NET`, `net ls`, `net attach NAME NET`, `net detach NAME NET` | isolated networks: no LAN, no internet; containers on one reach each other by name |
 | `internet NAME [on\|off]` | show or change internet access (stopped container) |
+| `internet NAME allow HOST...` | **not recommended**, off by default: only these hosts, through a proxy (see [allowlist](#networks-internet-sandboxes)) |
 | `snapshot NAME save\|load\|rm TAG`, `snapshot NAME ls` | file system and `/data` (load: stopped container), see [Snapshots and clones](#snapshots-and-clones) |
 | `clone SRC NEW [--project P]` | NEW from SRC as it is: its files and a copy of its `/data` |
 | `infra [--project P] [--json]` | the map: PCs and nodes with their quota, what runs where, networks and names, VMs, projects; see [Infra map and descriptions](#infra-map-and-descriptions) |
@@ -307,6 +308,15 @@ The web dashboard can be opened by other people or agents, each with its own tok
 - A **sandbox** (`--sandbox`, `sandbox NAME on`): `--cap-drop ALL`, `no-new-privileges`, 256 processes at most,
   runs as your user (not root, even inside), `/data` in memory, no host mount (a desktop keeps its screen socket),
   offline, and a fresh file system at each start (recreated from its image; `start` says `"fresh": true`).
+- **Allowlist (not recommended unless you know what you are doing; off by default).** `internet NAME allow
+  pypi.org '*.github.com' host:port` unplugs NAME from the internet and puts it, on its own internal network
+  `NAME-egress`, next to a proxy container of that name that reaches only those hosts (ports 80 and 443 unless a
+  port is given; a listed name that resolves to a private address is refused). NAME gets `HTTP(S)_PROXY`. It
+  fails closed: a program that ignores the proxy gets no internet at all. Its limits are why it is not
+  recommended: only programs that honor the proxy variables get out, and an allowed host can still carry any
+  data out (an upload to a code host or a paste site). `logs NAME-egress` lists what was allowed and denied.
+  `internet NAME on|off` ends it (the proxy and its network go); the proxy starts and stops with NAME, `rm` removes
+  it. This PC's containers only; not offered to agents through MCP.
 - `status NAME` reads back what the engine really enforces, not what was asked: `fences` (user, capabilities left,
   `no_new_privileges`, process limit, privileged, runtime, internet, whether the engine runs without root) and
   `warnings`: a sandbox missing one of its fences, root in a rootful engine (root on the host if it escapes), a
