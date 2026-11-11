@@ -1049,6 +1049,18 @@ class Nodes(unittest.TestCase):
             self.assertLess(kinds.index(("reconcile_failed", "lab-app-3")),         # ...and the pass went on
                             max(i for i, k in enumerate(kinds) if k[1] == "lab-app-4"))
 
+    def test_unresponsive_vm_node_waits_three_passes(self):
+        """A frozen VM (QEMU alive, its monitor silent) is not a stopped one: left as it is twice, down at the third."""
+        with unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"):
+            self.cli("node", "add", "n1"); self.cli("node", "add", "n2")
+            ct.apply({"stack": "lab", "services": {"app": {"image": "alpine:3.20", "replicas": 2, "spread": "nodes"}}})
+            self.vms["n1"] = "unresponsive"
+            for _ in range(2):
+                ct._UP.clear()
+                self.assertEqual([e for e in ct.reconcile("lab") if e["event"] == "failover"], [])
+            ct._UP.clear()
+            self.assertEqual([e["container"] for e in ct.reconcile("lab") if e["event"] == "failover"], ["lab-app-1"])
+
     def test_pending_said_once_and_rm_forgets_placement(self):
         with unittest.mock.patch.object(ct, "daemon", lambda cmd="status": "test"):
             self.cli("node", "add", "n1")

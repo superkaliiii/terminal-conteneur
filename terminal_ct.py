@@ -3101,8 +3101,8 @@ def nodes_up():
         end = time.monotonic() + 8  # all together: a silent PC costs one wait, not one each
         for t in threads:
             t.join(max(0, end - time.monotonic()))
-        _UP.update(t=time.time(), up={n: alive.get(n, False) if n in hosts else vms.get(n) == "running"
-                                      for n in names})
+        _UP.update(t=time.time(), up={n: alive.get(n, False) if n in hosts else  # None: a frozen VM, QEMU alive
+                                      {"running": True, "unresponsive": None}.get(vms.get(n), False) for n in names})
     return dict(_UP["up"])
 
 
@@ -3253,8 +3253,8 @@ def _reconcile(s, st, now):
                     have[k].append((c, n))
             except SystemExit:  # VM running, its agent or Docker not answering: a hiccup, or frozen
                 up[n] = False if miss(n) >= 3 else None  # None: left as it is this pass; down from the third
-        elif ok is False and is_host(n):  # another PC not answering: Wi-Fi, sleep, an agent restarting, until the
-            up[n] = False if miss(n) >= 3 else None  # third pass in a row (moving a replica starts it with an empty /data)
+        elif ok is None or is_host(n):  # a frozen VM, or another PC not answering (Wi-Fi, sleep, an agent restarting):
+            up[n] = False if miss(n) >= 3 else None  # until the third pass in a row (a moved replica has an empty /data)
     hosts = {n for n, i in _nodes()["nodes"].items() if i.get("kind") == "host"}
     may = up if owner != "agent" else {n: v for n, v in up.items()  # an agent: other PCs the user approved only
                                        if n not in hosts or n in s.get("approved_hosts", ())}
